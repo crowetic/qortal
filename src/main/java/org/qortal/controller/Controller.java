@@ -543,8 +543,8 @@ public class Controller extends Thread {
 		LOGGER.info("Starting synchronizer");
 		Synchronizer.getInstance().start();
 
-		//LOGGER.info("Starting synchronizer over Reticulum");
-		//RNSSynchronizer.getInstance().start();
+		LOGGER.info("Starting synchronizer over Reticulum");
+		RNSSynchronizer.getInstance().start();
 
 		LOGGER.info("Starting block minter");
 		blockMinter = new BlockMinter();
