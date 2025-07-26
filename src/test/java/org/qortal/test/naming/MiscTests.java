@@ -1,6 +1,7 @@
 package org.qortal.test.naming;
 
 import org.apache.commons.lang3.reflect.FieldUtils;
+import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
 import org.qortal.account.PrivateKeyAccount;
@@ -8,6 +9,7 @@ import org.qortal.api.AmountTypeAdapter;
 import org.qortal.block.BlockChain;
 import org.qortal.block.BlockChain.UnitFeesByTimestamp;
 import org.qortal.controller.BlockMinter;
+import org.qortal.data.naming.NameData;
 import org.qortal.data.transaction.PaymentTransactionData;
 import org.qortal.data.transaction.RegisterNameTransactionData;
 import org.qortal.data.transaction.TransactionData;
@@ -28,6 +30,7 @@ import org.qortal.utils.NTP;
 
 import java.util.Arrays;
 import java.util.List;
+import java.util.Optional;
 
 import static org.junit.Assert.*;
 
@@ -120,6 +123,8 @@ public class MiscTests extends Common {
 			TransactionData transactionData = new RegisterNameTransactionData(TestTransaction.generateBase(alice), name, data);
 			transactionData.setFee(new RegisterNameTransaction(null, null).getUnitFee(transactionData.getTimestamp()));
 			TransactionUtils.signAndMint(repository, transactionData, alice);
+
+			BlockUtils.mintBlocks(repository, BlockChain.getInstance().getMultipleNamesPerAccountHeight());
 
 			// Register another name that we will later attempt to rename to first name (above)
 			String otherName = "new-name";
@@ -335,6 +340,8 @@ public class MiscTests extends Common {
 	public void testRegisterNameFeeIncrease() throws Exception {
 		try (final Repository repository = RepositoryManager.getRepository()) {
 
+			BlockUtils.mintBlocks(repository, BlockChain.getInstance().getMultipleNamesPerAccountHeight());
+
 			// Add original fee to nameRegistrationUnitFees
 			UnitFeesByTimestamp originalFee = new UnitFeesByTimestamp();
 			originalFee.timestamp = 0L;
@@ -517,4 +524,168 @@ public class MiscTests extends Common {
 		}
 	}
 
+	@Test
+	public void testPrimaryNameEmpty() throws DataException {
+
+		try (final Repository repository = RepositoryManager.getRepository()) {
+
+			PrivateKeyAccount alice = Common.getTestAccount(repository, "alice");
+
+			// mint passed the feature trigger block
+			BlockUtils.mintBlocks(repository, BlockChain.getInstance().getMultipleNamesPerAccountHeight());
+
+			Optional<String> primaryName = repository.getNameRepository().getPrimaryName(alice.getAddress());
+
+			Assert.assertNotNull(primaryName);
+			Assert.assertTrue(primaryName.isEmpty());
+		}
+	}
+
+	@Test
+	public void testPrimaryNameSingle() throws DataException {
+
+		try (final Repository repository = RepositoryManager.getRepository()) {
+			String name = "alice 1";
+			PrivateKeyAccount alice = Common.getTestAccount(repository, "alice");
+
+			// register name 1
+			RegisterNameTransactionData transactionData1 = new RegisterNameTransactionData(TestTransaction.generateBase(alice), name, "{}");
+			transactionData1.setFee(new RegisterNameTransaction(null, null).getUnitFee(transactionData1.getTimestamp()));
+			TransactionUtils.signAndMint(repository, transactionData1, alice);
+
+			String name1 = transactionData1.getName();
+
+			// check name does exist
+			assertTrue(repository.getNameRepository().nameExists(name1));
+
+
+			// mint passed the feature trigger block
+			BlockUtils.mintBlocks(repository, BlockChain.getInstance().getMultipleNamesPerAccountHeight() + 1);
+
+			Optional<String> primaryName = repository.getNameRepository().getPrimaryName(alice.getAddress());
+
+			Assert.assertNotNull(primaryName);
+			Assert.assertTrue(primaryName.isPresent());
+			Assert.assertEquals(name, primaryName.get());
+		}
+	}
+
+	@Test
+	public void testPrimaryNameSingleAfterFeature() throws DataException {
+
+		try (final Repository repository = RepositoryManager.getRepository()) {
+			String name = "alice 1";
+			PrivateKeyAccount alice = Common.getTestAccount(repository, "alice");
+
+			// mint passed the feature trigger block
+			BlockUtils.mintBlocks(repository, BlockChain.getInstance().getMultipleNamesPerAccountHeight());
+
+			// register name 1
+			RegisterNameTransactionData transactionData1 = new RegisterNameTransactionData(TestTransaction.generateBase(alice), name, "{}");
+			transactionData1.setFee(new RegisterNameTransaction(null, null).getUnitFee(transactionData1.getTimestamp()));
+			TransactionUtils.signAndMint(repository, transactionData1, alice);
+
+			String name1 = transactionData1.getName();
+
+			// check name does exist
+			assertTrue(repository.getNameRepository().nameExists(name1));
+
+
+			Optional<String> primaryName = repository.getNameRepository().getPrimaryName(alice.getAddress());
+
+			Assert.assertNotNull(primaryName);
+			Assert.assertTrue(primaryName.isPresent());
+			Assert.assertEquals(name, primaryName.get());
+
+			BlockUtils.orphanLastBlock(repository);
+
+			Optional<String> primaryNameOrpaned = repository.getNameRepository().getPrimaryName(alice.getAddress());
+
+			Assert.assertNotNull(primaryNameOrpaned);
+			Assert.assertTrue(primaryNameOrpaned.isEmpty());
+		}
+	}
+
+	@Test
+	public void testUpdateNameMultiple() throws DataException {
+
+		try (final Repository repository = RepositoryManager.getRepository()) {
+			String name = "alice 1";
+			PrivateKeyAccount alice = Common.getTestAccount(repository, "alice");
+
+			// register name 1
+			RegisterNameTransactionData transactionData1 = new RegisterNameTransactionData(TestTransaction.generateBase(alice), name, "{}");
+			transactionData1.setFee(new RegisterNameTransaction(null, null).getUnitFee(transactionData1.getTimestamp()));
+			TransactionUtils.signAndMint(repository, transactionData1, alice);
+
+			String name1 = transactionData1.getName();
+
+			// check name does exist
+			assertTrue(repository.getNameRepository().nameExists(name1));
+
+			// register another name, second registered name should fail before the feature trigger
+			final String name2 = "another name";
+			RegisterNameTransactionData transactionData2 = new RegisterNameTransactionData(TestTransaction.generateBase(alice), name2, "{}");
+			Transaction.ValidationResult resultBeforeFeatureTrigger = TransactionUtils.signAndImport(repository, transactionData2, alice);
+
+			// check that that multiple names is forbidden
+			assertTrue(Transaction.ValidationResult.MULTIPLE_NAMES_FORBIDDEN.equals(resultBeforeFeatureTrigger));
+
+			// mint passed the feature trigger block
+			BlockUtils.mintBlocks(repository, BlockChain.getInstance().getMultipleNamesPerAccountHeight());
+
+			// register again, now that we are passed the feature trigger
+			RegisterNameTransactionData transactionData3 = new RegisterNameTransactionData(TestTransaction.generateBase(alice), name2, "{}");
+			Transaction.ValidationResult resultAfterFeatureTrigger = TransactionUtils.signAndImport(repository, transactionData3, alice);
+
+			// check that multiple names is ok
+			assertTrue(Transaction.ValidationResult.OK.equals(resultAfterFeatureTrigger));
+
+			// mint block, confirm transaction
+			BlockUtils.mintBlock(repository);
+
+			// check name does exist
+			assertTrue(repository.getNameRepository().nameExists(name2));
+
+			// check that there are 2 names for one account
+			List<NameData> namesByOwner = repository.getNameRepository().getNamesByOwner(alice.getAddress(), 0, 0, false);
+
+			assertEquals(2, namesByOwner.size());
+
+			// check that the order is correct
+			assertEquals(name1, namesByOwner.get(0).getName());
+
+			String newestName = "newest-name";
+			String newestReducedName = "newest-name";
+			String newestData = "newest-data";
+			TransactionData newestTransactionData = new UpdateNameTransactionData(TestTransaction.generateBase(alice), name2, newestName, newestData);
+			TransactionUtils.signAndMint(repository, newestTransactionData, alice);
+
+			// Check previous name no longer exists
+			assertFalse(repository.getNameRepository().nameExists(name2));
+
+			// Check newest name exists
+			assertTrue(repository.getNameRepository().nameExists(newestName));
+
+			Optional<String> alicePrimaryName1 = alice.getPrimaryName();
+
+			assertTrue( alicePrimaryName1.isPresent() );
+			assertEquals( name1, alicePrimaryName1.get() );
+
+			// orphan and recheck
+			BlockUtils.orphanLastBlock(repository);
+
+			Optional<String> alicePrimaryName2 = alice.getPrimaryName();
+
+			assertTrue( alicePrimaryName2.isPresent() );
+			assertEquals( name1, alicePrimaryName2.get() );
+
+			// Check newest name no longer exists
+			assertFalse(repository.getNameRepository().nameExists(newestName));
+			assertNull(repository.getNameRepository().fromReducedName(newestReducedName));
+
+			// Check previous name exists again
+			assertTrue(repository.getNameRepository().nameExists(name2));
+		}
+	}
 }

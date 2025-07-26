@@ -6,6 +6,7 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.ciyam.at.*;
 import org.qortal.account.Account;
+import org.qortal.api.resource.CrossChainUtils;
 import org.qortal.asset.Asset;
 import org.qortal.at.QortalFunctionCode;
 import org.qortal.crypto.Crypto;
@@ -21,6 +22,7 @@ import org.qortal.utils.BitTwiddling;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
 import java.util.List;
+import java.util.OptionalLong;
 
 import static org.ciyam.at.OpCode.calcOffset;
 
@@ -566,7 +568,14 @@ public class DogecoinACCTv1 implements ACCT {
 	@Override
 	public CrossChainTradeData populateTradeData(Repository repository, ATData atData) throws DataException {
 		ATStateData atStateData = repository.getATRepository().getLatestATState(atData.getATAddress());
-		return populateTradeData(repository, atData.getCreatorPublicKey(), atData.getCreation(), atStateData);
+		return populateTradeData(repository, atData.getCreatorPublicKey(), atData.getCreation(), atStateData, OptionalLong.empty());
+	}
+
+	@Override
+	public List<CrossChainTradeData> populateTradeDataList(Repository repository, List<ATData> atDataList) throws DataException {
+		List<CrossChainTradeData> crossChainTradeDataList = CrossChainUtils.populateTradeDataList(repository, this, atDataList);
+
+		return crossChainTradeDataList;
 	}
 
 	/**
@@ -575,13 +584,14 @@ public class DogecoinACCTv1 implements ACCT {
 	@Override
 	public CrossChainTradeData populateTradeData(Repository repository, ATStateData atStateData) throws DataException {
 		ATData atData = repository.getATRepository().fromATAddress(atStateData.getATAddress());
-		return populateTradeData(repository, atData.getCreatorPublicKey(), atData.getCreation(), atStateData);
+		return populateTradeData(repository, atData.getCreatorPublicKey(), atData.getCreation(), atStateData, OptionalLong.empty());
 	}
 
 	/**
 	 * Returns CrossChainTradeData with useful info extracted from AT.
 	 */
-	public CrossChainTradeData populateTradeData(Repository repository, byte[] creatorPublicKey, long creationTimestamp, ATStateData atStateData) throws DataException {
+	@Override
+	public CrossChainTradeData populateTradeData(Repository repository, byte[] creatorPublicKey, long creationTimestamp, ATStateData atStateData, OptionalLong optionalBalance) throws DataException {
 		byte[] addressBytes = new byte[25]; // for general use
 		String atAddress = atStateData.getATAddress();
 
@@ -594,8 +604,13 @@ public class DogecoinACCTv1 implements ACCT {
 		tradeData.qortalCreator = Crypto.toAddress(creatorPublicKey);
 		tradeData.creationTimestamp = creationTimestamp;
 
-		Account atAccount = new Account(repository, atAddress);
-		tradeData.qortBalance = atAccount.getConfirmedBalance(Asset.QORT);
+		if(optionalBalance.isPresent()) {
+			tradeData.qortBalance = optionalBalance.getAsLong();
+		}
+		else {
+			Account atAccount = new Account(repository, atAddress);
+			tradeData.qortBalance = atAccount.getConfirmedBalance(Asset.QORT);
+		}
 
 		byte[] stateData = atStateData.getStateData();
 		ByteBuffer dataByteBuffer = ByteBuffer.wrap(stateData);

@@ -33,6 +33,7 @@ import javax.ws.rs.*;
 import javax.ws.rs.core.Context;
 import javax.ws.rs.core.MediaType;
 import java.util.List;
+import java.util.Optional;
 import java.util.stream.Collectors;
 
 @Path("/names")
@@ -99,6 +100,45 @@ public class NamesResource {
 			}
 
 			return names.stream().map(NameSummary::new).collect(Collectors.toList());
+		} catch (DataException e) {
+			throw ApiExceptionFactory.INSTANCE.createException(request, ApiError.REPOSITORY_ISSUE, e);
+		}
+	}
+
+	@GET
+	@Path("/primary/{address}")
+	@Operation(
+			summary = "primary name owned by address",
+			responses = {
+					@ApiResponse(
+							description = "registered primary name info",
+							content = @Content(
+									mediaType = MediaType.APPLICATION_JSON,
+									schema = @Schema(implementation = NameSummary.class)
+							)
+					)
+			}
+	)
+	@ApiErrors({ApiError.INVALID_ADDRESS, ApiError.REPOSITORY_ISSUE, ApiError.UNAUTHORIZED})
+	public NameSummary getPrimaryNameByAddress(@PathParam("address") String address) {
+		if (!Crypto.isValidAddress(address))
+			throw ApiExceptionFactory.INSTANCE.createException(request, ApiError.INVALID_ADDRESS);
+
+		try (final Repository repository = RepositoryManager.getRepository()) {
+
+			if (Settings.getInstance().isLite()) {
+				throw ApiExceptionFactory.INSTANCE.createException(request, ApiError.UNAUTHORIZED);
+			}
+			else {
+				Optional<String> primaryName = repository.getNameRepository().getPrimaryName(address);
+
+				if(primaryName.isPresent()) {
+					return new NameSummary(new NameData(primaryName.get(), address));
+				}
+				else {
+					return new NameSummary((new NameData(null, address)));
+				}
+			}
 		} catch (DataException e) {
 			throw ApiExceptionFactory.INSTANCE.createException(request, ApiError.REPOSITORY_ISSUE, e);
 		}

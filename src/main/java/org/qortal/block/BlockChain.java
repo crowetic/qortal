@@ -92,7 +92,9 @@ public class BlockChain {
 		adminsReplaceFoundersHeight,
 		nullGroupMembershipHeight,
 		ignoreLevelForRewardShareHeight,
-		adminQueryFixHeight
+		adminQueryFixHeight,
+		multipleNamesPerAccountHeight,
+		mintedBlocksAdjustmentRemovalHeight
 	}
 
 	// Custom transaction fees
@@ -112,7 +114,8 @@ public class BlockChain {
 	/** Whether to use legacy, broken RIPEMD160 implementation when converting public keys to addresses. */
 	private boolean useBrokenMD160ForAddresses = false;
 
-	/** Whether only one registered name is allowed per account. */
+	/** This should get ignored and overwritten in the oneNamePerAccount(int blockchainHeight) method,
+	 * because it is based on block height, not based on the genesis block.*/
 	private boolean oneNamePerAccount = false;
 
 	/** Checkpoints */
@@ -474,8 +477,9 @@ public class BlockChain {
 		return this.useBrokenMD160ForAddresses;
 	}
 
-	public boolean oneNamePerAccount() {
-		return this.oneNamePerAccount;
+	public boolean oneNamePerAccount(int blockchainHeight) {
+		// this is not set on a simple blockchain setting, it is based on a feature trigger height
+		return blockchainHeight < this.getMultipleNamesPerAccountHeight();
 	}
 
 	public List<Checkpoint> getCheckpoints() {
@@ -686,6 +690,14 @@ public class BlockChain {
 
 	public int getAdminQueryFixHeight() {
 		return this.featureTriggers.get(FeatureTrigger.adminQueryFixHeight.name()).intValue();
+	}
+
+	public int getMultipleNamesPerAccountHeight() {
+		return this.featureTriggers.get(FeatureTrigger.multipleNamesPerAccountHeight.name()).intValue();
+	}
+
+	public int getMintedBlocksAdjustmentRemovalHeight() {
+		return this.featureTriggers.get(FeatureTrigger.mintedBlocksAdjustmentRemovalHeight.name()).intValue();
 	}
 
 	// More complex getters for aspects that change by height or timestamp

@@ -6,6 +6,9 @@ import org.qortal.data.crosschain.CrossChainTradeData;
 import org.qortal.repository.DataException;
 import org.qortal.repository.Repository;
 
+import java.util.List;
+import java.util.OptionalLong;
+
 public interface ACCT {
 
 	public byte[] getCodeBytesHash();
@@ -16,7 +19,11 @@ public interface ACCT {
 
 	public CrossChainTradeData populateTradeData(Repository repository, ATData atData) throws DataException;
 
+	public List<CrossChainTradeData> populateTradeDataList(Repository respository, List<ATData> atDataList) throws DataException;
+
 	public CrossChainTradeData populateTradeData(Repository repository, ATStateData atStateData) throws DataException;
+
+	CrossChainTradeData populateTradeData(Repository repository, byte[] creatorPublicKey, long creationTimestamp, ATStateData atStateData, OptionalLong optionalBalance) throws DataException;
 
 	public byte[] buildCancelMessage(String creatorQortalAddress);
 

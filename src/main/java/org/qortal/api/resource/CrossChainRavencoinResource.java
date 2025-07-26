@@ -502,10 +502,10 @@ public class CrossChainRavencoinResource {
 	}
 
 	@GET
-	@Path("/feeceiling")
+	@Path("/feerequired")
 	@Operation(
-			summary = "Returns Ravencoin fee per Kb.",
-			description = "Returns Ravencoin fee per Kb.",
+			summary = "The total fee required for unlocking RVN to the trade offer creator.",
+			description = "This is in sats for a transaction that is approximately 300 kB in size.",
 			responses = {
 					@ApiResponse(
 							content = @Content(
@@ -516,17 +516,17 @@ public class CrossChainRavencoinResource {
 					)
 			}
 	)
-	public String getRavencoinFeeCeiling() {
+	public String getRavencoinFeeRequired() {
 		Ravencoin ravencoin = Ravencoin.getInstance();
 
-		return String.valueOf(ravencoin.getFeeCeiling());
+		return String.valueOf(ravencoin.getFeeRequired());
 	}
 
 	@POST
-	@Path("/updatefeeceiling")
+	@Path("/updatefeerequired")
 	@Operation(
-			summary = "Sets Ravencoin fee ceiling.",
-			description = "Sets Ravencoin fee ceiling.",
+			summary = "The total fee required for unlocking RVN to the trade offer creator.",
+			description = "This is in sats for a transaction that is approximately 300 kB in size.",
 			requestBody = @RequestBody(
 					required = true,
 					content = @Content(
@@ -545,13 +545,13 @@ public class CrossChainRavencoinResource {
 			}
 	)
 	@ApiErrors({ApiError.INVALID_PRIVATE_KEY, ApiError.INVALID_CRITERIA})
-	public String setRavencoinFeeCeiling(@HeaderParam(Security.API_KEY_HEADER) String apiKey, String fee) {
+	public String setRavencoinFeeRequired(@HeaderParam(Security.API_KEY_HEADER) String apiKey, String fee) {
 		Security.checkApiCallAllowed(request);
 
 		Ravencoin ravencoin = Ravencoin.getInstance();
 
 		try {
-			return CrossChainUtils.setFeeCeiling(ravencoin, fee);
+			return CrossChainUtils.setFeeRequired(ravencoin, fee);
 		}
 		catch (IllegalArgumentException e) {
 			throw ApiExceptionFactory.INSTANCE.createException(request, ApiError.INVALID_CRITERIA);

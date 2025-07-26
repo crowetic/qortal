@@ -304,11 +304,11 @@ public class BitcoinyTBDRequest {
     private String networkName;
 
     /**
-     * Fee Ceiling
+     * Fee Required
      *
-     *  web search, LTC fee ceiling = 1000L
+     *  web search, LTC fee required = 1000L
      */
-    private long feeCeiling;
+    private long feeRequired;
 
     /**
      * Extended Public Key
@@ -570,8 +570,8 @@ public class BitcoinyTBDRequest {
         return this.networkName;
     }
 
-    public long getFeeCeiling() {
-        return this.feeCeiling;
+    public long getFeeRequired() {
+        return this.feeRequired;
     }
 
     public String getExtendedPublicKey() {
@@ -671,7 +671,7 @@ public class BitcoinyTBDRequest {
                 ", minimumOrderAmount=" + minimumOrderAmount +
                 ", feePerKb=" + feePerKb +
                 ", networkName='" + networkName + '\'' +
-                ", feeCeiling=" + feeCeiling +
+                ", feeRequired=" + feeRequired +
                 ", extendedPublicKey='" + extendedPublicKey + '\'' +
                 ", sendAmount=" + sendAmount +
                 ", sendingFeePerByte=" + sendingFeePerByte +

@@ -1053,6 +1053,12 @@ public class HSQLDBDatabaseUpdates {
 					stmt.execute("UPDATE Accounts SET blocks_minted_penalty = -5000000 WHERE blocks_minted_penalty < 0");
 					break;
 
+				case 50:
+					// Primary name for a Qortal Address, 0-1 for any address
+					stmt.execute("CREATE TABLE PrimaryNames (owner QortalAddress, name RegisteredName, "
+							+ "PRIMARY KEY (owner), FOREIGN KEY (name) REFERENCES Names (name) ON DELETE CASCADE)");
+					break;
+
 				default:
 					// nothing to do
 					return false;

@@ -8,6 +8,7 @@ import org.qortal.account.PrivateKeyAccount;
 import org.qortal.api.model.crosschain.TradeBotCreateRequest;
 import org.qortal.controller.Controller;
 import org.qortal.controller.Synchronizer;
+import org.qortal.controller.arbitrary.PeerMessage;
 import org.qortal.controller.tradebot.AcctTradeBot.ResponseResult;
 import org.qortal.crosschain.*;
 import org.qortal.crypto.Crypto;
@@ -37,7 +38,12 @@ import org.qortal.utils.NTP;
 import java.awt.TrayIcon.MessageType;
 import java.security.SecureRandom;
 import java.util.*;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Function;
 import java.util.function.Supplier;
+import java.util.stream.Collectors;
 
 /**
  * Performing cross-chain trading steps on behalf of user.
@@ -118,6 +124,9 @@ public class TradeBot implements Listener {
 	private Map<String, Long> validTrades = new HashMap<>();
 
 	private TradeBot() {
+
+		tradePresenceMessageScheduler.scheduleAtFixedRate( this::processTradePresencesMessages, 60, 1, TimeUnit.SECONDS);
+
 		EventBus.INSTANCE.addListener(event -> TradeBot.getInstance().listen(event));
 	}
 
@@ -551,77 +560,139 @@ public class TradeBot implements Listener {
 		}
 	}
 
+	// List to collect messages
+	private final List<PeerMessage> tradePresenceMessageList = new ArrayList<>();
+	// Lock to synchronize access to the list
+	private final Object tradePresenceMessageLock = new Object();
+
+	// Scheduled executor service to process messages every second
+	private final ScheduledExecutorService tradePresenceMessageScheduler = Executors.newScheduledThreadPool(1);
+
 	public void onTradePresencesMessage(Peer peer, Message message) {
-		TradePresencesMessage tradePresencesMessage = (TradePresencesMessage) message;
 
-		List<TradePresenceData> peersTradePresences = tradePresencesMessage.getTradePresences();
+		synchronized (tradePresenceMessageLock) {
+			tradePresenceMessageList.add(new PeerMessage(peer, message));
+		}
+	}
 
-		long now = NTP.getTime();
-		// Timestamps before this are too far into the past
-		long pastThreshold = now;
-		// Timestamps after this are too far into the future
-		long futureThreshold = now + PRESENCE_LIFETIME;
+	public void processTradePresencesMessages() {
 
-		Map<ByteArray, Supplier<ACCT>> acctSuppliersByCodeHash = SupportedBlockchain.getAcctMap();
+		try {
+			List<PeerMessage> messagesToProcess;
+			synchronized (tradePresenceMessageLock) {
+				messagesToProcess = new ArrayList<>(tradePresenceMessageList);
+				tradePresenceMessageList.clear();
+			}
 
-		int newCount = 0;
+			if( messagesToProcess.isEmpty() ) return;
 
-		try (final Repository repository = RepositoryManager.getRepository()) {
-			for (TradePresenceData peersTradePresence : peersTradePresences) {
-				long timestamp = peersTradePresence.getTimestamp();
+			Map<Peer, List<TradePresenceData>> tradePresencesByPeer = new HashMap<>(messagesToProcess.size());
 
-				// Ignore if timestamp is out of bounds
-				if (timestamp < pastThreshold || timestamp > futureThreshold) {
-					if (timestamp < pastThreshold)
-						LOGGER.trace("Ignoring trade presence {} from peer {} as timestamp {} is too old vs {}",
-								peersTradePresence.getAtAddress(), peer, timestamp, pastThreshold
-								);
-					else
-						LOGGER.trace("Ignoring trade presence {} from peer {} as timestamp {} is too new vs {}",
-								peersTradePresence.getAtAddress(), peer, timestamp, pastThreshold
+			// map all trade presences from the messages to their peer
+			for( PeerMessage peerMessage : messagesToProcess ) {
+				TradePresencesMessage tradePresencesMessage = (TradePresencesMessage) peerMessage.getMessage();
+
+				List<TradePresenceData> peersTradePresences = tradePresencesMessage.getTradePresences();
+
+				tradePresencesByPeer.put(peerMessage.getPeer(), peersTradePresences);
+			}
+
+			long now = NTP.getTime();
+			// Timestamps before this are too far into the past
+			long pastThreshold = now;
+			// Timestamps after this are too far into the future
+			long futureThreshold = now + PRESENCE_LIFETIME;
+
+			Map<ByteArray, Supplier<ACCT>> acctSuppliersByCodeHash = SupportedBlockchain.getAcctMap();
+
+			int newCount = 0;
+
+			Map<String, List<Peer>> peersByAtAddress = new HashMap<>(tradePresencesByPeer.size());
+			Map<String, TradePresenceData> tradePresenceByAtAddress = new HashMap<>(tradePresencesByPeer.size());
+
+			// for each batch of trade presence data from a peer, validate and populate the maps declared above
+			for ( Map.Entry<Peer, List<TradePresenceData>> entry: tradePresencesByPeer.entrySet()) {
+
+				Peer peer = entry.getKey();
+
+				for( TradePresenceData peersTradePresence : entry.getValue() ) {
+					// TradePresenceData peersTradePresence
+					long timestamp = peersTradePresence.getTimestamp();
+
+					// Ignore if timestamp is out of bounds
+					if (timestamp < pastThreshold || timestamp > futureThreshold) {
+						if (timestamp < pastThreshold)
+							LOGGER.trace("Ignoring trade presence {} from peer {} as timestamp {} is too old vs {}",
+									peersTradePresence.getAtAddress(), peer, timestamp, pastThreshold
+							);
+						else
+							LOGGER.trace("Ignoring trade presence {} from peer {} as timestamp {} is too new vs {}",
+									peersTradePresence.getAtAddress(), peer, timestamp, pastThreshold
+							);
+
+						continue;
+					}
+
+					ByteArray pubkeyByteArray = ByteArray.wrap(peersTradePresence.getPublicKey());
+
+					// Ignore if we've previously verified this timestamp+publickey combo or sent timestamp is older
+					TradePresenceData existingTradeData = this.safeAllTradePresencesByPubkey.get(pubkeyByteArray);
+					if (existingTradeData != null && timestamp <= existingTradeData.getTimestamp()) {
+						if (timestamp == existingTradeData.getTimestamp())
+							LOGGER.trace("Ignoring trade presence {} from peer {} as we have verified timestamp {} before",
+									peersTradePresence.getAtAddress(), peer, timestamp
+							);
+						else
+							LOGGER.trace("Ignoring trade presence {} from peer {} as timestamp {} is older than latest {}",
+									peersTradePresence.getAtAddress(), peer, timestamp, existingTradeData.getTimestamp()
+							);
+
+						continue;
+					}
+
+					// Check timestamp signature
+					byte[] timestampSignature = peersTradePresence.getSignature();
+					byte[] timestampBytes = Longs.toByteArray(timestamp);
+					byte[] publicKey = peersTradePresence.getPublicKey();
+					if (!Crypto.verify(publicKey, timestampSignature, timestampBytes)) {
+						LOGGER.trace("Ignoring trade presence {} from peer {} as signature failed to verify",
+								peersTradePresence.getAtAddress(), peer
 						);
 
-					continue;
+						continue;
+					}
+
+					peersByAtAddress.computeIfAbsent(peersTradePresence.getAtAddress(), address -> new ArrayList<>()).add(peer);
+					tradePresenceByAtAddress.put(peersTradePresence.getAtAddress(), peersTradePresence);
 				}
+			}
 
-				ByteArray pubkeyByteArray = ByteArray.wrap(peersTradePresence.getPublicKey());
+			if( tradePresenceByAtAddress.isEmpty() ) return;
 
-				// Ignore if we've previously verified this timestamp+publickey combo or sent timestamp is older
-				TradePresenceData existingTradeData = this.safeAllTradePresencesByPubkey.get(pubkeyByteArray);
-				if (existingTradeData != null && timestamp <= existingTradeData.getTimestamp()) {
-					if (timestamp == existingTradeData.getTimestamp())
-						LOGGER.trace("Ignoring trade presence {} from peer {} as we have verified timestamp {} before",
-								peersTradePresence.getAtAddress(), peer, timestamp
-						);
-					else
-						LOGGER.trace("Ignoring trade presence {} from peer {} as timestamp {} is older than latest {}",
-								peersTradePresence.getAtAddress(), peer, timestamp, existingTradeData.getTimestamp()
-						);
+			List<ATData> atDataList;
+			try (final Repository repository = RepositoryManager.getRepository()) {
+				atDataList = repository.getATRepository().fromATAddresses( new ArrayList<>(tradePresenceByAtAddress.keySet()) );
+			} catch (DataException e) {
+				LOGGER.error("Couldn't process TRADE_PRESENCES message due to repository issue", e);
+				return;
+			}
 
-					continue;
-				}
+			Map<String, Supplier<ACCT>> supplierByAtAddress = new HashMap<>(atDataList.size());
 
-				// Check timestamp signature
-				byte[] timestampSignature = peersTradePresence.getSignature();
-				byte[] timestampBytes = Longs.toByteArray(timestamp);
-				byte[] publicKey = peersTradePresence.getPublicKey();
-				if (!Crypto.verify(publicKey, timestampSignature, timestampBytes)) {
-					LOGGER.trace("Ignoring trade presence {} from peer {} as signature failed to verify",
-							peersTradePresence.getAtAddress(), peer
-					);
+			List<ATData> validatedAtDataList = new ArrayList<>(atDataList.size());
 
-					continue;
-				}
+			// for each trade
+			for( ATData atData : atDataList ) {
 
-				ATData atData = repository.getATRepository().fromATAddress(peersTradePresence.getAtAddress());
+				TradePresenceData peersTradePresence = tradePresenceByAtAddress.get(atData.getATAddress());
 				if (atData == null || atData.getIsFrozen() || atData.getIsFinished()) {
 					if (atData == null)
-						LOGGER.trace("Ignoring trade presence {} from peer {} as AT doesn't exist",
-								peersTradePresence.getAtAddress(), peer
+						LOGGER.trace("Ignoring trade presence {} from peer as AT doesn't exist",
+								peersTradePresence.getAtAddress()
 						);
 					else
-						LOGGER.trace("Ignoring trade presence {} from peer {} as AT is frozen or finished",
-								peersTradePresence.getAtAddress(), peer
+						LOGGER.trace("Ignoring trade presence {} from peer as AT is frozen or finished",
+								peersTradePresence.getAtAddress()
 						);
 
 					continue;
@@ -630,51 +701,87 @@ public class TradeBot implements Listener {
 				ByteArray atCodeHash = ByteArray.wrap(atData.getCodeHash());
 				Supplier<ACCT> acctSupplier = acctSuppliersByCodeHash.get(atCodeHash);
 				if (acctSupplier == null) {
-					LOGGER.trace("Ignoring trade presence {} from peer {} as AT isn't a known ACCT?",
-							peersTradePresence.getAtAddress(), peer
+					LOGGER.trace("Ignoring trade presence {} from peer as AT isn't a known ACCT?",
+							peersTradePresence.getAtAddress()
 					);
 
 					continue;
 				}
-
-				CrossChainTradeData tradeData = acctSupplier.get().populateTradeData(repository, atData);
-				if (tradeData == null) {
-					LOGGER.trace("Ignoring trade presence {} from peer {} as trade data not found?",
-							peersTradePresence.getAtAddress(), peer
-					);
-
-					continue;
-				}
-
-				// Convert signer's public key to address form
-				String signerAddress = peersTradePresence.getTradeAddress();
-
-				// Signer's public key (in address form) must match Bob's / Alice's trade public key (in address form)
-				if (!signerAddress.equals(tradeData.qortalCreatorTradeAddress) && !signerAddress.equals(tradeData.qortalPartnerAddress)) {
-					LOGGER.trace("Ignoring trade presence {} from peer {} as signer isn't Alice or Bob?",
-							peersTradePresence.getAtAddress(), peer
-					);
-
-					continue;
-				}
-
-				// This is new to us
-				this.allTradePresencesByPubkey.put(pubkeyByteArray, peersTradePresence);
-				++newCount;
-
-				LOGGER.trace("Added trade presence {} from peer {} with timestamp {}",
-						peersTradePresence.getAtAddress(), peer, timestamp
-				);
-
-				EventBus.INSTANCE.notify(new TradePresenceEvent(peersTradePresence));
+				validatedAtDataList.add(atData);
 			}
-		} catch (DataException e) {
-			LOGGER.error("Couldn't process TRADE_PRESENCES message due to repository issue", e);
-		}
 
-		if (newCount > 0) {
-			LOGGER.debug("New trade presences: {}, all trade presences: {}", newCount, allTradePresencesByPubkey.size());
-			rebuildSafeAllTradePresences();
+			// populated data for each trade
+			List<CrossChainTradeData> crossChainTradeDataList;
+
+			// validated trade data grouped by code (cross chain coin)
+			Map<ByteArray, List<ATData>> atDataByCodeHash
+				= validatedAtDataList.stream().collect(
+					Collectors.groupingBy(data -> ByteArray.wrap(data.getCodeHash())));
+
+			try (final Repository repository = RepositoryManager.getRepository()) {
+
+				crossChainTradeDataList = new ArrayList<>();
+
+				// for each code (cross chain coin), get each trade, then populate trade data
+				for( Map.Entry<ByteArray, List<ATData>> entry : atDataByCodeHash.entrySet() ) {
+
+					Supplier<ACCT> acctSupplier = acctSuppliersByCodeHash.get(entry.getKey());
+
+					crossChainTradeDataList.addAll(
+						acctSupplier.get().populateTradeDataList(
+								repository,
+								entry.getValue()
+						)
+						.stream().filter( data -> data != null )
+						.collect(Collectors.toList())
+					);
+				}
+			} catch (DataException e) {
+				LOGGER.error("Couldn't process TRADE_PRESENCES message due to repository issue", e);
+				return;
+			}
+
+			// for each populated trade data, validate and fire event
+			for( CrossChainTradeData tradeData : crossChainTradeDataList ) {
+
+				List<Peer> peers = peersByAtAddress.get(tradeData.qortalAtAddress);
+
+				for( Peer peer : peers ) {
+
+					TradePresenceData peersTradePresence = tradePresenceByAtAddress.get(tradeData.qortalAtAddress);
+
+					// Convert signer's public key to address form
+					String signerAddress = peersTradePresence.getTradeAddress();
+
+					// Signer's public key (in address form) must match Bob's / Alice's trade public key (in address form)
+					if (!signerAddress.equals(tradeData.qortalCreatorTradeAddress) && !signerAddress.equals(tradeData.qortalPartnerAddress)) {
+						LOGGER.trace("Ignoring trade presence {} from peer {} as signer isn't Alice or Bob?",
+								peersTradePresence.getAtAddress(), peer
+						);
+
+						continue;
+					}
+
+					ByteArray pubkeyByteArray = ByteArray.wrap(peersTradePresence.getPublicKey());
+
+					// This is new to us
+					this.allTradePresencesByPubkey.put(pubkeyByteArray, peersTradePresence);
+					++newCount;
+
+					LOGGER.trace("Added trade presence {} from peer {} with timestamp {}",
+							peersTradePresence.getAtAddress(), peer, tradeData.creationTimestamp
+					);
+
+					EventBus.INSTANCE.notify(new TradePresenceEvent(peersTradePresence));
+				}
+			}
+
+			if (newCount > 0) {
+				LOGGER.info("New trade presences: {}, all trade presences: {}", newCount, allTradePresencesByPubkey.size());
+				rebuildSafeAllTradePresences();
+			}
+		} catch (Exception e) {
+			LOGGER.error(e.getMessage(), e);
 		}
 	}
 

@@ -1,6 +1,7 @@
 package org.qortal.test.group;
 
 import org.junit.After;
+import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
 import org.qortal.account.PrivateKeyAccount;
@@ -366,6 +367,105 @@ public class DevGroupAdminTests extends Common {
 
 			// 2 out of 3 has signed, so it should be approved, because it is more than 40%
 			assertEquals( Transaction.ApprovalStatus.APPROVED, addChloeAsGroupAdminStatus3);
+		}
+	}
+
+	@Test
+	public void testOrphanSecondInviteApproval() throws DataException {
+
+		try (final Repository repository = RepositoryManager.getRepository()) {
+
+			Block block = BlockUtils.mintBlocks(repository, NULL_GROUP_MEMBERSHIP_HEIGHT);
+			assertEquals(NULL_GROUP_MEMBERSHIP_HEIGHT + 1, block.getBlockData().getHeight().intValue());
+
+			// establish accounts
+			PrivateKeyAccount alice = Common.getTestAccount(repository, ALICE);
+			PrivateKeyAccount bob = Common.getTestAccount(repository, BOB);
+			PrivateKeyAccount chloe = Common.getTestAccount(repository, CHLOE);
+			PrivateKeyAccount dilbert = Common.getTestAccount(repository, DILBERT);
+
+			// assert admin statuses
+			assertEquals(2, repository.getGroupRepository().countGroupAdmins(DEV_GROUP_ID).intValue());
+			assertTrue(isAdmin(repository, Group.NULL_OWNER_ADDRESS, DEV_GROUP_ID));
+			assertTrue(isAdmin(repository, alice.getAddress(), DEV_GROUP_ID));
+			assertFalse(isAdmin(repository, bob.getAddress(), DEV_GROUP_ID));
+			assertFalse(isAdmin(repository, chloe.getAddress(), DEV_GROUP_ID));
+			assertFalse(isAdmin(repository, dilbert.getAddress(), DEV_GROUP_ID));
+
+			// confirm Bob is not a member
+			assertFalse(isMember(repository, bob.getAddress(), DEV_GROUP_ID));
+
+			// alice invites bob, alice signs which is 50% approval while 40% is needed
+			TransactionData createInviteTransactionData = createGroupInviteForGroupApproval(repository, alice, DEV_GROUP_ID, bob.getAddress(), 3600);
+			Transaction.ApprovalStatus bobsInviteStatus = signForGroupApproval(repository, createInviteTransactionData, List.of(alice));
+
+			// assert approval
+			assertEquals(Transaction.ApprovalStatus.APPROVED, bobsInviteStatus);
+
+			// bob joins
+			joinGroup(repository, bob, DEV_GROUP_ID);
+
+			// confirm Bob is a member now, but still not an admin
+			assertTrue(isMember(repository, bob.getAddress(), DEV_GROUP_ID));
+			assertFalse(isAdmin(repository, bob.getAddress(), DEV_GROUP_ID));
+
+			// bob creates transaction to add himself as an admin
+			TransactionData addGroupAdminTransactionData1 = addGroupAdmin(repository, bob, DEV_GROUP_ID, bob.getAddress());
+
+			// bob creates add admin transaction for himself, alice signs which is 50% approval while 40% is needed
+			signForGroupApproval(repository, addGroupAdminTransactionData1, List.of(alice));
+
+			// assert 3 admins in group and bob is an admin now
+			assertEquals(3, repository.getGroupRepository().countGroupAdmins(DEV_GROUP_ID).intValue());
+			assertTrue(isAdmin(repository, bob.getAddress(), DEV_GROUP_ID));
+
+			// bob invites chloe, bob signs which is 33% approval while 40% is needed
+			TransactionData chloeInvite1 = createGroupInviteForGroupApproval(repository, bob, DEV_GROUP_ID, chloe.getAddress(), 3600);
+			Transaction.ApprovalStatus chloeInvite1Status = signForGroupApproval(repository, chloeInvite1, List.of(bob));
+
+			// assert invite 1 pending
+			assertEquals(Transaction.ApprovalStatus.PENDING, chloeInvite1Status);
+
+			// bob invites chloe again, bob signs which is 33% approval while 40% is needed
+			// since chloe is not a member yet, this invite is valie
+			TransactionData chloeInvite2 = createGroupInviteForGroupApproval(repository, bob, DEV_GROUP_ID, chloe.getAddress(), 3600);
+			Transaction.ApprovalStatus chloeInvite2Status = signForGroupApproval(repository, chloeInvite2, List.of(bob));
+
+			// assert invite 2 is pending
+			assertEquals(Transaction.ApprovalStatus.PENDING, chloeInvite2Status);
+
+			// alice signs which is 66% approval while 40% is needed
+			chloeInvite1Status = signForGroupApproval(repository, chloeInvite1, List.of(alice));
+
+			// assert invite 1 approval
+			assertEquals(Transaction.ApprovalStatus.APPROVED, chloeInvite1Status);
+
+			// chloe joins
+			joinGroup(repository, chloe, DEV_GROUP_ID);
+
+			// assert chloe is in the group
+			assertTrue(isMember(repository, bob.getAddress(), DEV_GROUP_ID));
+
+			// alice signs invite 2 which is 66% approval while 40% is needed
+			chloeInvite2Status = signForGroupApproval(repository, chloeInvite2, List.of(alice));
+
+			// assert invite 2 approval
+			assertEquals(Transaction.ApprovalStatus.APPROVED, chloeInvite2Status);
+
+			boolean exceptionThrown = false;
+
+			try {
+				// confront the bug by orphaning the block of the second approval, approval after the join
+				// prior to the fix, this would raise an exception
+				BlockUtils.orphanLastBlock(repository);
+			} catch (DataException e) {
+				exceptionThrown = true;
+			}
+
+			Assert.assertFalse(exceptionThrown);
+
+			// assert chloe is still a member
+			assertTrue(isMember(repository, bob.getAddress(), DEV_GROUP_ID));
 		}
 	}
 

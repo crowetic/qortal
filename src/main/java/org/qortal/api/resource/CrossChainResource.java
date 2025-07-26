@@ -10,6 +10,8 @@ import io.swagger.v3.oas.annotations.parameters.RequestBody;
 import io.swagger.v3.oas.annotations.responses.ApiResponse;
 import io.swagger.v3.oas.annotations.security.SecurityRequirement;
 import io.swagger.v3.oas.annotations.tags.Tag;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.glassfish.jersey.media.multipart.ContentDisposition;
 import org.qortal.api.ApiError;
 import org.qortal.api.ApiErrors;
@@ -18,6 +20,7 @@ import org.qortal.api.Security;
 import org.qortal.api.model.CrossChainCancelRequest;
 import org.qortal.api.model.CrossChainTradeLedgerEntry;
 import org.qortal.api.model.CrossChainTradeSummary;
+import org.qortal.controller.ForeignFeesManager;
 import org.qortal.controller.tradebot.TradeBot;
 import org.qortal.crosschain.ACCT;
 import org.qortal.crosschain.AcctMode;
@@ -29,6 +32,8 @@ import org.qortal.data.at.ATData;
 import org.qortal.data.at.ATStateData;
 import org.qortal.data.crosschain.CrossChainTradeData;
 import org.qortal.data.crosschain.TransactionSummary;
+import org.qortal.data.crosschain.ForeignFeeDecodedData;
+import org.qortal.data.crosschain.ForeignFeeEncodedData;
 import org.qortal.data.transaction.BaseTransactionData;
 import org.qortal.data.transaction.MessageTransactionData;
 import org.qortal.data.transaction.TransactionData;
@@ -63,6 +68,8 @@ import java.util.stream.Collectors;
 @Path("/crosschain")
 @Tag(name = "Cross-Chain")
 public class CrossChainResource {
+
+	private static final Logger LOGGER = LogManager.getLogger(CrossChainResource.class);
 
 	@Context
 	HttpServletRequest request;
@@ -358,6 +365,101 @@ public class CrossChainResource {
 		} catch (DataException e) {
 			throw ApiExceptionFactory.INSTANCE.createException(request, ApiError.REPOSITORY_ISSUE, e);
 		}
+	}
+
+	@POST
+	@Path("/signedfees")
+	@Operation(
+		summary = "",
+		description = "",
+		requestBody = @RequestBody(
+			required = true,
+				content = @Content(
+					mediaType = MediaType.APPLICATION_JSON,
+					array = @ArraySchema(
+						schema = @Schema(
+								implementation = ForeignFeeEncodedData.class
+						)
+					)
+				)
+		),
+		responses = {
+			@ApiResponse(
+				description = "true on success",
+				content = @Content(
+					mediaType = MediaType.TEXT_PLAIN,
+					schema = @Schema(
+							type = "boolean"
+					)
+				)
+			)
+		}
+	)
+	public String postSignedForeignFees(List<ForeignFeeEncodedData> signedFees) {
+
+		LOGGER.info("signedFees = " + signedFees);
+
+		try {
+			ForeignFeesManager.getInstance().addSignedFees(signedFees);
+
+			return "true";
+		}
+		catch( Exception e ) {
+
+			LOGGER.error(e.getMessage(), e);
+
+			return "false";
+		}
+	}
+
+	@GET
+	@Path("/unsignedfees/{address}")
+	@Operation(
+		summary = "",
+		description = "",
+		responses = {
+			@ApiResponse(
+				content = @Content(
+					array = @ArraySchema(
+						schema = @Schema(
+							implementation = ForeignFeeEncodedData.class
+						)
+					)
+				)
+			)
+		}
+	)
+	@ApiErrors({ApiError.INVALID_CRITERIA, ApiError.REPOSITORY_ISSUE})
+	public List<ForeignFeeEncodedData> getUnsignedFees(@PathParam("address") String address) {
+
+		List<ForeignFeeEncodedData> unsignedFeesForAddress = ForeignFeesManager.getInstance().getUnsignedFeesForAddress(address);
+
+		LOGGER.info("address = " + address);
+		LOGGER.info("returning unsigned = " + unsignedFeesForAddress);
+		return unsignedFeesForAddress;
+	}
+
+	@GET
+	@Path("/signedfees")
+	@Operation(
+		summary = "",
+		description = "",
+		responses = {
+			@ApiResponse(
+				content = @Content(
+					array = @ArraySchema(
+						schema = @Schema(
+							implementation = ForeignFeeDecodedData.class
+						)
+					)
+				)
+			)
+		}
+	)
+	@ApiErrors({ApiError.INVALID_CRITERIA, ApiError.REPOSITORY_ISSUE})
+	public List<ForeignFeeDecodedData> getSignedFees() {
+
+		return ForeignFeesManager.getInstance().getSignedFees();
 	}
 
 	/**

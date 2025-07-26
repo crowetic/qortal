@@ -45,6 +45,7 @@ function parseUrl(url) {
 
         // Remove theme, identifier, and time queries if they exist
         parsedUrl.searchParams.delete("theme");
+        parsedUrl.searchParams.delete("lang");
         parsedUrl.searchParams.delete("identifier");
         parsedUrl.searchParams.delete("time");
         parsedUrl.searchParams.delete("isManualNavigation");
@@ -213,8 +214,11 @@ function buildResourceUrl(service, name, identifier, path, isLink) {
         if (path != null) url = url.concat((path.startsWith("/") ? "" : "/") + path);
     }
 
-    if (isLink) url = url.concat((url.includes("?") ? "" : "?") + "&theme=" + _qdnTheme);
-
+    if (isLink) {
+        const hasQuery = url.includes("?");
+        const queryPrefix = hasQuery ? "&" : "?";
+        url += queryPrefix + "theme=" + _qdnTheme + "&lang=" + _qdnLang;
+    }
     return url;
 }
 

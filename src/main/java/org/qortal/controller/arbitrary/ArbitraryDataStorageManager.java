@@ -47,15 +47,15 @@ public class ArbitraryDataStorageManager extends Thread {
 
     private static final long DIRECTORY_SIZE_CHECK_INTERVAL = 10 * 60 * 1000L; // 10 minutes
 
-    /** Treat storage as full at 90% usage, to reduce risk of going over the limit.
+    /** Treat storage as full at 80% usage, to reduce risk of going over the limit.
      * This is necessary because we don't calculate total storage values before every write.
      * It also helps avoid a fetch/delete loop, as we will stop fetching before the hard limit.
      * This must be lower than DELETION_THRESHOLD. */
-    private static final double STORAGE_FULL_THRESHOLD = 0.90f; // 90%
+    private static final double STORAGE_FULL_THRESHOLD = 0.8f; // 80%
 
-    /** Start deleting files once we reach 98% usage.
+    /** Start deleting files once we reach 90% usage.
      * This must be higher than STORAGE_FULL_THRESHOLD in order to avoid a fetch/delete loop. */
-    public static final double DELETION_THRESHOLD = 0.98f; // 98%
+    public static final double DELETION_THRESHOLD = 0.9f; // 90%
 
     private static final long PER_NAME_STORAGE_MULTIPLIER = 4L;
 

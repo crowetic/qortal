@@ -130,6 +130,8 @@ public interface AccountRepository {
 	 */
 	public AccountBalanceData getBalance(String address, long assetId) throws DataException;
 
+	public List<AccountBalanceData> getBalances(List<String> addresses, long assetId) throws DataException;
+
 	/** Returns all account balances for given assetID, optionally excluding zero balances. */
 	public List<AccountBalanceData> getAssetBalances(long assetId, Boolean excludeZero) throws DataException;
 

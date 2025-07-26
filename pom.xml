@@ -3,7 +3,7 @@
 	<modelVersion>4.0.0</modelVersion>
 	<groupId>org.qortal</groupId>
 	<artifactId>qortal</artifactId>
-	<version>4.7.1</version>
+	<version>5.0.2</version>
 	<packaging>jar</packaging>
 	<properties>
 		<project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
@@ -49,6 +49,7 @@
 		<maven-reproducible-build-plugin.version>0.17</maven-reproducible-build-plugin.version>
 		<maven-resources-plugin.version>3.3.1</maven-resources-plugin.version>
 		<maven-shade-plugin.version>3.6.0</maven-shade-plugin.version>
+		<maven-install-plugin.version>3.1.3</maven-install-plugin.version>
 		<maven-surefire-plugin.version>3.5.2</maven-surefire-plugin.version>
 		<protobuf.version>3.25.3</protobuf.version>
 		<replacer.version>1.5.3</replacer.version>
@@ -308,6 +309,30 @@
 					</archive>
 				</configuration>
 			</plugin>
+			<!-- Copy modified hsqldb.jar to install / modified MANIFEST.MF-->
+			<plugin>
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-install-plugin</artifactId>
+				<version>${maven-install-plugin.version}</version>
+				<configuration>
+					<groupId>org.hsqldb</groupId>
+					<artifactId>hsqldb</artifactId>
+					<version>${hsqldb.version}</version>
+					<packaging>jar</packaging>
+				</configuration>
+				<executions>
+					<execution>
+						<phase>install</phase>
+						<goals>
+							<goal>install-file</goal>
+						</goals>
+						<configuration>
+							<file>${project.basedir}/lib/org/hsqldb/hsqldb/${hsqldb.version}/hsqldb.jar</file>
+						</configuration>
+					</execution>
+				</executions>
+			</plugin>
+
 			<plugin>
 				<groupId>org.apache.maven.plugins</groupId>
 				<artifactId>maven-shade-plugin</artifactId>
@@ -483,7 +508,7 @@
 			<scope>provided</scope>
 			<!-- needed for build, not for runtime -->
 		</dependency>
-		<!-- HSQLDB for repository -->
+		<!-- HSQLDB for repository should use local version with Sealed: false -->
 		<dependency>
 			<groupId>org.hsqldb</groupId>
 			<artifactId>hsqldb</artifactId>
@@ -759,12 +784,12 @@
 		<!-- BouncyCastle for crypto, including TLS secure networking -->
 		<dependency>
 			<groupId>org.bouncycastle</groupId>
-			<artifactId>bcprov-jdk15on</artifactId>
+			<artifactId>bcprov-jdk15to18</artifactId>
 			<version>${bouncycastle.version}</version>
 		</dependency>
 		<dependency>
 			<groupId>org.bouncycastle</groupId>
-			<artifactId>bctls-jdk15on</artifactId>
+			<artifactId>bctls-jdk15to18</artifactId>
 			<version>${bouncycastle.version}</version>
 		</dependency><!-- https://mvnrepository.com/artifact/org.bouncycastle/bcprov-jdk15to18 -->
 		<dependency>
@@ -931,5 +956,10 @@
       <scope>test</scope>
     </dependency>
 
+		<dependency>
+      <groupId>org.apache.tika</groupId>
+      <artifactId>tika-core</artifactId>
+      <version>3.1.0</version> 
+      </dependency>
 	</dependencies>
 </project>

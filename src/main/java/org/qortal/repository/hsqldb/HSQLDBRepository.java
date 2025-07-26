@@ -175,6 +175,11 @@ public class HSQLDBRepository implements Repository {
 	// Transaction COMMIT / ROLLBACK / savepoints
 
 	@Override
+	public Connection getConnection() {
+		return this.connection;
+	}
+
+	@Override
 	public void saveChanges() throws DataException {
 		long beforeQuery = this.slowQueryThreshold == null ? 0 : System.currentTimeMillis();
 

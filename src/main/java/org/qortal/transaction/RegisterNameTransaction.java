@@ -2,10 +2,12 @@ package org.qortal.transaction;
 
 import com.google.common.base.Utf8;
 import org.qortal.account.Account;
+import org.qortal.api.resource.TransactionsResource;
 import org.qortal.asset.Asset;
 import org.qortal.block.BlockChain;
 import org.qortal.controller.repository.NamesDatabaseIntegrityCheck;
 import org.qortal.crypto.Crypto;
+import org.qortal.data.naming.NameData;
 import org.qortal.data.transaction.RegisterNameTransactionData;
 import org.qortal.data.transaction.TransactionData;
 import org.qortal.naming.Name;
@@ -15,6 +17,7 @@ import org.qortal.utils.Unicode;
 
 import java.util.Collections;
 import java.util.List;
+import java.util.Optional;
 
 public class RegisterNameTransaction extends Transaction {
 
@@ -53,6 +56,15 @@ public class RegisterNameTransaction extends Transaction {
 	public ValidationResult isValid() throws DataException {
 		Account registrant = getRegistrant();
 		String name = this.registerNameTransactionData.getName();
+
+		Optional<String> registrantPrimaryName = registrant.getPrimaryName();
+		if( registrantPrimaryName.isPresent()  ) {
+
+			NameData nameData = repository.getNameRepository().fromName(registrantPrimaryName.get());
+			if (nameData.isForSale()) {
+				return ValidationResult.NOT_SUPPORTED;
+			}
+		}
 
 		int blockchainHeight = this.repository.getBlockRepository().getBlockchainHeight();
 		final int start = BlockChain.getInstance().getSelfSponsorshipAlgoV2Height() - 1180;
@@ -94,7 +106,7 @@ public class RegisterNameTransaction extends Transaction {
 			return ValidationResult.NAME_ALREADY_REGISTERED;
 
 		// If accounts are only allowed one registered name then check for this
-		if (BlockChain.getInstance().oneNamePerAccount()
+		if (BlockChain.getInstance().oneNamePerAccount(this.repository.getBlockRepository().getBlockchainHeight())
 				&& !this.repository.getNameRepository().getNamesByOwner(getRegistrant().getAddress()).isEmpty())
 			return ValidationResult.MULTIPLE_NAMES_FORBIDDEN;
 
@@ -117,6 +129,16 @@ public class RegisterNameTransaction extends Transaction {
 		// Register Name
 		Name name = new Name(this.repository, this.registerNameTransactionData);
 		name.register();
+
+		if( this.repository.getBlockRepository().getBlockchainHeight() > BlockChain.getInstance().getMultipleNamesPerAccountHeight()) {
+
+			Account account = new Account(this.repository, this.getCreator().getAddress());
+
+			// if there is no primary name established, then the new registered name is the primary name
+			if (account.getPrimaryName().isEmpty()) {
+				account.setPrimaryName(this.registerNameTransactionData.getName());
+			}
+		}
 	}
 
 	@Override

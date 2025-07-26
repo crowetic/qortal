@@ -13,6 +13,7 @@ import java.util.Arrays;
 import java.util.Collection;
 import java.util.EnumMap;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicLong;
 
 public class Dogecoin extends Bitcoiny {
 
@@ -60,7 +61,7 @@ public class Dogecoin extends Bitcoiny {
 
 			@Override
 			public long getP2shFee(Long timestamp) {
-				return this.getFeeCeiling();
+				return this.getFeeRequired();
 			}
 		},
 		TEST3 {
@@ -110,14 +111,14 @@ public class Dogecoin extends Bitcoiny {
 			}
 		};
 
-		private long feeCeiling = MAINNET_FEE;
+		private AtomicLong feeRequired = new AtomicLong(MAINNET_FEE);
 
-		public long getFeeCeiling() {
-			return feeCeiling;
+		public long getFeeRequired() {
+			return feeRequired.get();
 		}
 
-		public void setFeeCeiling(long feeCeiling) {
-			this.feeCeiling = feeCeiling;
+		public void setFeeRequired(long feeRequired) {
+			this.feeRequired.set(feeRequired);
 		}
 
 		public abstract NetworkParameters getParams();
@@ -179,13 +180,13 @@ public class Dogecoin extends Bitcoiny {
 	}
 
 	@Override
-	public long getFeeCeiling() {
-		return this.dogecoinNet.getFeeCeiling();
+	public long getFeeRequired() {
+		return this.dogecoinNet.getFeeRequired();
 	}
 
 	@Override
-	public void setFeeCeiling(long fee) {
+	public void setFeeRequired(long fee) {
 
-		this.dogecoinNet.setFeeCeiling( fee );
+		this.dogecoinNet.setFeeRequired( fee );
 	}
 }

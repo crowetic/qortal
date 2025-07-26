@@ -53,7 +53,7 @@ public class ArbitraryIndexUtils {
                 try {
                     fillCache(IndexCache.getInstance());
                 } catch (IOException | DataException e) {
-                    LOGGER.error(e.getMessage(), e);
+                    LOGGER.warn(e.getMessage());
                 }
             }
         };
@@ -111,6 +111,8 @@ public class ArbitraryIndexUtils {
 
                         indexDetails.add( new ArbitraryDataIndexDetail(indexResource.name, rank, indices.get(rank - 1), indexResource.identifier ));
                     }
+                } catch (MissingDataException e) {
+                    LOGGER.warn( e.getMessage() );
                 } catch (InvalidFormatException e) {
                    LOGGER.debug("invalid format, skipping: " + indexResource);
                 } catch (UnrecognizedPropertyException e) {
@@ -131,15 +133,11 @@ public class ArbitraryIndexUtils {
                     )
             );
 
-            LOGGER.info("processed indices by term: count = " + indicesByTerm.size());
-
             // lock, clear old, load new
             synchronized( IndexCache.getInstance().getIndicesByTerm() ) {
                 IndexCache.getInstance().getIndicesByTerm().clear();
                 IndexCache.getInstance().getIndicesByTerm().putAll(indicesByTerm);
             }
-
-            LOGGER.info("loaded indices by term");
 
             LOGGER.debug("processing indices by issuer ...");
             Map<String, List<ArbitraryDataIndexDetail>> indicesByIssuer
@@ -154,15 +152,11 @@ public class ArbitraryIndexUtils {
                     )
             );
 
-            LOGGER.info("processed indices by issuer: count = " + indicesByIssuer.size());
-
             // lock, clear old, load new
             synchronized( IndexCache.getInstance().getIndicesByIssuer() ) {
                 IndexCache.getInstance().getIndicesByIssuer().clear();
                 IndexCache.getInstance().getIndicesByIssuer().putAll(indicesByIssuer);
             }
-
-            LOGGER.info("loaded indices by issuer");
         }
     }
 
@@ -199,7 +193,7 @@ public class ArbitraryIndexUtils {
         }
     }
 
-    public static String getJson(String name, String identifier) throws IOException {
+    public static String getJson(String name, String identifier) throws IOException, MissingDataException {
 
         try {
             ArbitraryDataReader arbitraryDataReader
@@ -217,11 +211,10 @@ public class ArbitraryIndexUtils {
                     } catch (MissingDataException e) {
                         if (attempts > maxAttempts) {
                             // Give up after 5 attempts
-                            throw new IOException("Data unavailable. Please try again later.");
+                            throw e;
                         }
                     }
                 }
-                Thread.sleep(3000L);
             }
 
             java.nio.file.Path outputPath = arbitraryDataReader.getFilePath();

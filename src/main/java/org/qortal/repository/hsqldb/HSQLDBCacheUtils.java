@@ -468,7 +468,7 @@ public class HSQLDBCacheUtils {
 
                 Thread.currentThread().setName(DB_CACHE_TIMER_TASK);
 
-                try (final HSQLDBRepository respository = (HSQLDBRepository) Controller.REPOSITORY_FACTORY.getRepository()) {
+                try (final Repository respository = RepositoryManager.getRepository()) {
                     fillCache(ArbitraryResourceCache.getInstance(), respository);
                 }
                 catch( DataException e ) {
@@ -611,7 +611,7 @@ public class HSQLDBCacheUtils {
     private static int recordCurrentBalances(ConcurrentHashMap<Integer, List<AccountBalanceData>> balancesByHeight) {
         int currentHeight;
 
-        try (final HSQLDBRepository repository = (HSQLDBRepository) Controller.REPOSITORY_FACTORY.getRepository()) {
+        try (final Repository repository = RepositoryManager.getRepository()) {
 
             // get current balances
             List<AccountBalanceData> accountBalances = getAccountBalances(repository);
@@ -675,7 +675,7 @@ public class HSQLDBCacheUtils {
      * @param cache the cache to fill
      * @param repository the data source to fill the cache with
      */
-    public static void fillCache(ArbitraryResourceCache cache, HSQLDBRepository repository) {
+    public static void fillCache(ArbitraryResourceCache cache, Repository repository) {
 
         try {
             // ensure all data is committed in, before we query it
@@ -713,7 +713,7 @@ public class HSQLDBCacheUtils {
      *
      * @throws SQLException
      */
-    private static void fillNamepMap(ConcurrentHashMap<String, Integer> levelByName, HSQLDBRepository repository ) throws SQLException {
+    private static void fillNamepMap(ConcurrentHashMap<String, Integer> levelByName, Repository repository ) throws SQLException {
 
         StringBuilder sql = new StringBuilder(512);
 
@@ -721,7 +721,7 @@ public class HSQLDBCacheUtils {
         sql.append("FROM NAMES ");
         sql.append("INNER JOIN ACCOUNTS on owner = account ");
 
-        Statement statement = repository.connection.createStatement();
+        Statement statement = repository.getConnection().createStatement();
 
         ResultSet resultSet = statement.executeQuery(sql.toString());
 
@@ -744,7 +744,7 @@ public class HSQLDBCacheUtils {
      * @return the resources
      * @throws SQLException
      */
-    private static List<ArbitraryResourceData> getResources( HSQLDBRepository repository) throws SQLException {
+    private static List<ArbitraryResourceData> getResources( Repository repository) throws SQLException {
 
         List<ArbitraryResourceData> resources = new ArrayList<>();
 
@@ -756,7 +756,7 @@ public class HSQLDBCacheUtils {
         sql.append("LEFT JOIN ArbitraryMetadataCache USING (service, name, identifier) WHERE name IS NOT NULL");
 
         List<ArbitraryResourceData> arbitraryResources = new ArrayList<>();
-        Statement statement = repository.connection.createStatement();
+        Statement statement = repository.getConnection().createStatement();
 
         ResultSet resultSet = statement.executeQuery(sql.toString());
 
@@ -822,7 +822,7 @@ public class HSQLDBCacheUtils {
         return resources;
     }
 
-    public static List<AccountBalanceData> getAccountBalances(HSQLDBRepository repository) {
+    public static List<AccountBalanceData> getAccountBalances(Repository repository) {
 
         StringBuilder sql = new StringBuilder();
 
@@ -836,7 +836,7 @@ public class HSQLDBCacheUtils {
         LOGGER.info( "Getting account balances ...");
 
         try {
-            Statement statement = repository.connection.createStatement();
+            Statement statement = repository.getConnection().createStatement();
 
             ResultSet resultSet = statement.executeQuery(sql.toString());
 

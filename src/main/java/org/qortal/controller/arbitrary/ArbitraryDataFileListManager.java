@@ -25,6 +25,10 @@ import org.qortal.utils.NTP;
 import org.qortal.utils.Triple;
 
 import java.util.*;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
 
 import static org.qortal.controller.arbitrary.ArbitraryDataFileManager.MAX_FILE_HASH_RESPONSES;
 
@@ -73,6 +77,8 @@ public class ArbitraryDataFileListManager {
 
 
     private ArbitraryDataFileListManager() {
+        getArbitraryDataFileListMessageScheduler.scheduleAtFixedRate(this::processNetworkGetArbitraryDataFileListMessage, 60, 1, TimeUnit.SECONDS);
+        arbitraryDataFileListMessageScheduler.scheduleAtFixedRate(this::processNetworkArbitraryDataFileListMessage, 60, 1, TimeUnit.SECONDS);
     }
 
     public static ArbitraryDataFileListManager getInstance() {
@@ -118,8 +124,8 @@ public class ArbitraryDataFileListManager {
         if (timeSinceLastAttempt > 15 * 1000L) {
             // We haven't tried for at least 15 seconds
 
-            if (networkBroadcastCount < 3) {
-                // We've made less than 3 total attempts
+            if (networkBroadcastCount < 12) {
+                // We've made less than 12 total attempts
                 return true;
             }
         }
@@ -128,8 +134,8 @@ public class ArbitraryDataFileListManager {
         if (timeSinceLastAttempt > 60 * 1000L) {
             // We haven't tried for at least 1 minute
 
-            if (networkBroadcastCount < 8) {
-                // We've made less than 8 total attempts
+            if (networkBroadcastCount < 40) {
+                // We've made less than 40 total attempts
                 return true;
             }
         }
@@ -396,11 +402,11 @@ public class ArbitraryDataFileListManager {
         return true;
     }
 
-    public void deleteFileListRequestsForSignature(byte[] signature) {
-        String signature58 = Base58.encode(signature);
+    public void deleteFileListRequestsForSignature(String signature58) {
+
         for (Iterator<Map.Entry<Integer, Triple<String, Peer, Long>>> it = arbitraryDataFileListRequests.entrySet().iterator(); it.hasNext();) {
             Map.Entry<Integer, Triple<String, Peer, Long>> entry = it.next();
-            if (entry == null || entry.getKey() == null || entry.getValue() != null) {
+            if (entry == null || entry.getKey() == null || entry.getValue() == null) {
                 continue;
             }
             if (Objects.equals(entry.getValue().getA(), signature58)) {
@@ -413,70 +419,116 @@ public class ArbitraryDataFileListManager {
 
     // Network handlers
 
+    // List to collect messages
+    private final List<PeerMessage> arbitraryDataFileListMessageList = new ArrayList<>();
+    // Lock to synchronize access to the list
+    private final Object arbitraryDataFileListMessageLock = new Object();
+
+    // Scheduled executor service to process messages every second
+    private final ScheduledExecutorService arbitraryDataFileListMessageScheduler = Executors.newScheduledThreadPool(1);
+
     public void onNetworkArbitraryDataFileListMessage(Peer peer, Message message) {
         // Don't process if QDN is disabled
         if (!Settings.getInstance().isQdnEnabled()) {
             return;
         }
 
-        ArbitraryDataFileListMessage arbitraryDataFileListMessage = (ArbitraryDataFileListMessage) message;
-        LOGGER.debug("Received hash list from peer {} with {} hashes", peer, arbitraryDataFileListMessage.getHashes().size());
-
-        if (LOGGER.isDebugEnabled() && arbitraryDataFileListMessage.getRequestTime() != null) {
-            long totalRequestTime = NTP.getTime() - arbitraryDataFileListMessage.getRequestTime();
-            LOGGER.debug("totalRequestTime: {}, requestHops: {}, peerAddress: {}, isRelayPossible: {}",
-                    totalRequestTime, arbitraryDataFileListMessage.getRequestHops(),
-                    arbitraryDataFileListMessage.getPeerAddress(), arbitraryDataFileListMessage.isRelayPossible());
+        synchronized (arbitraryDataFileListMessageLock) {
+            arbitraryDataFileListMessageList.add(new PeerMessage(peer, message));
         }
+    }
 
-        // Do we have a pending request for this data?
-        Triple<String, Peer, Long> request = arbitraryDataFileListRequests.get(message.getId());
-        if (request == null || request.getA() == null) {
-            return;
-        }
-        boolean isRelayRequest = (request.getB() != null);
+    private void processNetworkArbitraryDataFileListMessage() {
 
-        // Does this message's signature match what we're expecting?
-        byte[] signature = arbitraryDataFileListMessage.getSignature();
-        String signature58 = Base58.encode(signature);
-        if (!request.getA().equals(signature58)) {
-            return;
-        }
+        try {
+            List<PeerMessage> messagesToProcess;
+            synchronized (arbitraryDataFileListMessageLock) {
+                messagesToProcess = new ArrayList<>(arbitraryDataFileListMessageList);
+                arbitraryDataFileListMessageList.clear();
+            }
 
-        List<byte[]> hashes = arbitraryDataFileListMessage.getHashes();
-        if (hashes == null || hashes.isEmpty()) {
-            return;
-        }
+            if (messagesToProcess.isEmpty()) return;
 
-        ArbitraryTransactionData arbitraryTransactionData = null;
+            Map<String, PeerMessage> peerMessageBySignature58 = new HashMap<>(messagesToProcess.size());
+            Map<String, byte[]> signatureBySignature58 = new HashMap<>(messagesToProcess.size());
+            Map<String, Boolean> isRelayRequestBySignature58 = new HashMap<>(messagesToProcess.size());
+            Map<String, List<byte[]>> hashesBySignature58 = new HashMap<>(messagesToProcess.size());
+            Map<String, Triple<String, Peer, Long>> requestBySignature58 = new HashMap<>(messagesToProcess.size());
 
-        // Check transaction exists and hashes are correct
-        try (final Repository repository = RepositoryManager.getRepository()) {
-            TransactionData transactionData = repository.getTransactionRepository().fromSignature(signature);
-            if (!(transactionData instanceof ArbitraryTransactionData))
+            for (PeerMessage peerMessage : messagesToProcess) {
+                Peer peer = peerMessage.getPeer();
+                Message message = peerMessage.getMessage();
+
+                ArbitraryDataFileListMessage arbitraryDataFileListMessage = (ArbitraryDataFileListMessage) message;
+                LOGGER.debug("Received hash list from peer {} with {} hashes", peer, arbitraryDataFileListMessage.getHashes().size());
+
+                if (LOGGER.isDebugEnabled() && arbitraryDataFileListMessage.getRequestTime() != null) {
+                    long totalRequestTime = NTP.getTime() - arbitraryDataFileListMessage.getRequestTime();
+                    LOGGER.debug("totalRequestTime: {}, requestHops: {}, peerAddress: {}, isRelayPossible: {}",
+                            totalRequestTime, arbitraryDataFileListMessage.getRequestHops(),
+                            arbitraryDataFileListMessage.getPeerAddress(), arbitraryDataFileListMessage.isRelayPossible());
+                }
+
+                // Do we have a pending request for this data?
+                Triple<String, Peer, Long> request = arbitraryDataFileListRequests.get(message.getId());
+                if (request == null || request.getA() == null) {
+                    continue;
+                }
+                boolean isRelayRequest = (request.getB() != null);
+
+                // Does this message's signature match what we're expecting?
+                byte[] signature = arbitraryDataFileListMessage.getSignature();
+                String signature58 = Base58.encode(signature);
+                if (!request.getA().equals(signature58)) {
+                    continue;
+                }
+
+                List<byte[]> hashes = arbitraryDataFileListMessage.getHashes();
+                if (hashes == null || hashes.isEmpty()) {
+                    continue;
+                }
+
+                peerMessageBySignature58.put(signature58, peerMessage);
+                signatureBySignature58.put(signature58, signature);
+                isRelayRequestBySignature58.put(signature58, isRelayRequest);
+                hashesBySignature58.put(signature58, hashes);
+                requestBySignature58.put(signature58, request);
+            }
+
+            if (signatureBySignature58.isEmpty()) return;
+
+            List<ArbitraryTransactionData> arbitraryTransactionDataList;
+
+            // Check transaction exists and hashes are correct
+            try (final Repository repository = RepositoryManager.getRepository()) {
+                arbitraryTransactionDataList
+                        = repository.getTransactionRepository()
+                        .fromSignatures(new ArrayList<>(signatureBySignature58.values())).stream()
+                        .filter(data -> data instanceof ArbitraryTransactionData)
+                        .map(data -> (ArbitraryTransactionData) data)
+                        .collect(Collectors.toList());
+            } catch (DataException e) {
+                LOGGER.error(String.format("Repository issue while finding arbitrary transaction data list"), e);
                 return;
+            }
 
-            arbitraryTransactionData = (ArbitraryTransactionData) transactionData;
+            for (ArbitraryTransactionData arbitraryTransactionData : arbitraryTransactionDataList) {
 
-//          // Load data file(s)
-//          ArbitraryDataFile arbitraryDataFile = ArbitraryDataFile.fromTransactionData(arbitraryTransactionData);
-//
-//			// Check all hashes exist
-//			for (byte[] hash : hashes) {
-//				//LOGGER.debug("Received hash {}", Base58.encode(hash));
-//				if (!arbitraryDataFile.containsChunk(hash)) {
-//					// Check the hash against the complete file
-//					if (!Arrays.equals(arbitraryDataFile.getHash(), hash)) {
-//						LOGGER.info("Received non-matching chunk hash {} for signature {}. This could happen if we haven't obtained the metadata file yet.", Base58.encode(hash), signature58);
-//						return;
-//					}
-//				}
-//			}
+                byte[] signature = arbitraryTransactionData.getSignature();
+                String signature58 = Base58.encode(signature);
 
-            if (!isRelayRequest || !Settings.getInstance().isRelayModeEnabled()) {
-                Long now = NTP.getTime();
+                List<byte[]> hashes = hashesBySignature58.get(signature58);
 
-                if (ArbitraryDataFileManager.getInstance().arbitraryDataFileHashResponses.size() < MAX_FILE_HASH_RESPONSES) {
+                PeerMessage peerMessage = peerMessageBySignature58.get(signature58);
+                Peer peer = peerMessage.getPeer();
+                Message message = peerMessage.getMessage();
+
+                ArbitraryDataFileListMessage arbitraryDataFileListMessage = (ArbitraryDataFileListMessage) message;
+
+                Boolean isRelayRequest = isRelayRequestBySignature58.get(signature58);
+                if (!isRelayRequest || !Settings.getInstance().isRelayModeEnabled()) {
+                    Long now = NTP.getTime();
+
                     // Keep track of the hashes this peer reports to have access to
                     for (byte[] hash : hashes) {
                         String hash58 = Base58.encode(hash);
@@ -487,64 +539,71 @@ public class ArbitraryDataFileListManager {
                         ArbitraryFileListResponseInfo responseInfo = new ArbitraryFileListResponseInfo(hash58, signature58,
                                 peer, now, arbitraryDataFileListMessage.getRequestTime(), requestHops);
 
-                        ArbitraryDataFileManager.getInstance().arbitraryDataFileHashResponses.add(responseInfo);
+                        ArbitraryDataFileManager.getInstance().addResponse(responseInfo);
+                    }
+
+                    // Keep track of the source peer, for direct connections
+                    if (arbitraryDataFileListMessage.getPeerAddress() != null) {
+                        ArbitraryDataFileManager.getInstance().addDirectConnectionInfoIfUnique(
+                                new ArbitraryDirectConnectionInfo(signature, arbitraryDataFileListMessage.getPeerAddress(), hashes, now));
                     }
                 }
 
-                // Keep track of the source peer, for direct connections
-                if (arbitraryDataFileListMessage.getPeerAddress() != null) {
-                    ArbitraryDataFileManager.getInstance().addDirectConnectionInfoIfUnique(
-                            new ArbitraryDirectConnectionInfo(signature, arbitraryDataFileListMessage.getPeerAddress(), hashes, now));
-                }
-            }
+                // Forwarding
+                if (isRelayRequest && Settings.getInstance().isRelayModeEnabled()) {
 
-        } catch (DataException e) {
-            LOGGER.error(String.format("Repository issue while finding arbitrary transaction data list for peer %s", peer), e);
-        }
+                    boolean isBlocked = (arbitraryTransactionData == null || ListUtils.isNameBlocked(arbitraryTransactionData.getName()));
+                    if (!isBlocked) {
+                        Triple<String, Peer, Long> request = requestBySignature58.get(signature58);
+                        Peer requestingPeer = request.getB();
+                        if (requestingPeer != null) {
+                            Long requestTime = arbitraryDataFileListMessage.getRequestTime();
+                            Integer requestHops = arbitraryDataFileListMessage.getRequestHops();
 
-        // Forwarding
-        if (isRelayRequest && Settings.getInstance().isRelayModeEnabled()) {
-            boolean isBlocked = (arbitraryTransactionData == null || ListUtils.isNameBlocked(arbitraryTransactionData.getName()));
-            if (!isBlocked) {
-                Peer requestingPeer = request.getB();
-                if (requestingPeer != null) {
-                    Long requestTime = arbitraryDataFileListMessage.getRequestTime();
-                    Integer requestHops = arbitraryDataFileListMessage.getRequestHops();
+                            // Add each hash to our local mapping so we know who to ask later
+                            Long now = NTP.getTime();
+                            for (byte[] hash : hashes) {
+                                String hash58 = Base58.encode(hash);
+                                ArbitraryRelayInfo relayInfo = new ArbitraryRelayInfo(hash58, signature58, peer, now, requestTime, requestHops);
+                                ArbitraryDataFileManager.getInstance().addToRelayMap(relayInfo);
+                            }
 
-                    // Add each hash to our local mapping so we know who to ask later
-                    Long now = NTP.getTime();
-                    for (byte[] hash : hashes) {
-                        String hash58 = Base58.encode(hash);
-                        ArbitraryRelayInfo relayInfo = new ArbitraryRelayInfo(hash58, signature58, peer, now, requestTime, requestHops);
-                        ArbitraryDataFileManager.getInstance().addToRelayMap(relayInfo);
-                    }
+                            // Bump requestHops if it exists
+                            if (requestHops != null) {
+                                requestHops++;
+                            }
 
-                    // Bump requestHops if it exists
-                    if (requestHops != null) {
-                        requestHops++;
-                    }
+                            ArbitraryDataFileListMessage forwardArbitraryDataFileListMessage;
 
-                    ArbitraryDataFileListMessage forwardArbitraryDataFileListMessage;
+                            // Remove optional parameters if the requesting peer doesn't support it yet
+                            // A message with less statistical data is better than no message at all
+                            if (!requestingPeer.isAtLeastVersion(MIN_PEER_VERSION_FOR_FILE_LIST_STATS)) {
+                                forwardArbitraryDataFileListMessage = new ArbitraryDataFileListMessage(signature, hashes);
+                            } else {
+                                forwardArbitraryDataFileListMessage = new ArbitraryDataFileListMessage(signature, hashes, requestTime, requestHops,
+                                        arbitraryDataFileListMessage.getPeerAddress(), arbitraryDataFileListMessage.isRelayPossible());
+                            }
+                            forwardArbitraryDataFileListMessage.setId(message.getId());
 
-                    // Remove optional parameters if the requesting peer doesn't support it yet
-                    // A message with less statistical data is better than no message at all
-                    if (!requestingPeer.isAtLeastVersion(MIN_PEER_VERSION_FOR_FILE_LIST_STATS)) {
-                        forwardArbitraryDataFileListMessage = new ArbitraryDataFileListMessage(signature, hashes);
-                    } else {
-                        forwardArbitraryDataFileListMessage = new ArbitraryDataFileListMessage(signature, hashes, requestTime, requestHops,
-                                arbitraryDataFileListMessage.getPeerAddress(), arbitraryDataFileListMessage.isRelayPossible());
-                    }
-                    forwardArbitraryDataFileListMessage.setId(message.getId());
-
-                    // Forward to requesting peer
-                    LOGGER.debug("Forwarding file list with {} hashes to requesting peer: {}", hashes.size(), requestingPeer);
-                    if (!requestingPeer.sendMessage(forwardArbitraryDataFileListMessage)) {
-                        requestingPeer.disconnect("failed to forward arbitrary data file list");
+                            // Forward to requesting peer
+                            LOGGER.debug("Forwarding file list with {} hashes to requesting peer: {}", hashes.size(), requestingPeer);
+                            requestingPeer.sendMessage(forwardArbitraryDataFileListMessage);
+                        }
                     }
                 }
             }
+        } catch (Exception e) {
+            LOGGER.error(e.getMessage(), e);
         }
     }
+
+    // List to collect messages
+    private final List<PeerMessage> getArbitraryDataFileListMessageList = new ArrayList<>();
+    // Lock to synchronize access to the list
+    private final Object getArbitraryDataFileListMessageLock = new Object();
+
+    // Scheduled executor service to process messages every second
+    private final ScheduledExecutorService getArbitraryDataFileListMessageScheduler = Executors.newScheduledThreadPool(1);
 
     public void onNetworkGetArbitraryDataFileListMessage(Peer peer, Message message) {
         // Don't respond if QDN is disabled
@@ -552,168 +611,228 @@ public class ArbitraryDataFileListManager {
             return;
         }
 
-        Controller.getInstance().stats.getArbitraryDataFileListMessageStats.requests.incrementAndGet();
-
-        GetArbitraryDataFileListMessage getArbitraryDataFileListMessage = (GetArbitraryDataFileListMessage) message;
-        byte[] signature = getArbitraryDataFileListMessage.getSignature();
-        String signature58 = Base58.encode(signature);
-        Long now = NTP.getTime();
-        Triple<String, Peer, Long> newEntry = new Triple<>(signature58, peer, now);
-
-        // If we've seen this request recently, then ignore
-        if (arbitraryDataFileListRequests.putIfAbsent(message.getId(), newEntry) != null) {
-            LOGGER.trace("Ignoring hash list request from peer {} for signature {}", peer, signature58);
-            return;
+        synchronized (getArbitraryDataFileListMessageLock) {
+            getArbitraryDataFileListMessageList.add(new PeerMessage(peer, message));
         }
+    }
 
-        List<byte[]> requestedHashes = getArbitraryDataFileListMessage.getHashes();
-        int hashCount = requestedHashes != null ? requestedHashes.size() : 0;
-        String requestingPeer = getArbitraryDataFileListMessage.getRequestingPeer();
+    private void processNetworkGetArbitraryDataFileListMessage() {
 
-        if (requestingPeer != null) {
-            LOGGER.debug("Received hash list request with {} hashes from peer {} (requesting peer {}) for signature {}", hashCount, peer, requestingPeer, signature58);
-        }
-        else {
-            LOGGER.debug("Received hash list request with {} hashes from peer {} for signature {}", hashCount, peer, signature58);
-        }
+        try {
+            List<PeerMessage> messagesToProcess;
+            synchronized (getArbitraryDataFileListMessageLock) {
+                messagesToProcess = new ArrayList<>(getArbitraryDataFileListMessageList);
+                getArbitraryDataFileListMessageList.clear();
+            }
 
-        List<byte[]> hashes = new ArrayList<>();
-        ArbitraryTransactionData transactionData = null;
-        boolean allChunksExist = false;
-        boolean hasMetadata = false;
+            if (messagesToProcess.isEmpty()) return;
 
-        try (final Repository repository = RepositoryManager.getRepository()) {
+            Map<String, byte[]> signatureBySignature58 = new HashMap<>(messagesToProcess.size());
+            Map<String, List<byte[]>> requestedHashesBySignature58 = new HashMap<>(messagesToProcess.size());
+            Map<String, String> requestingPeerBySignature58 = new HashMap<>(messagesToProcess.size());
+            Map<String, Long> nowBySignature58 = new HashMap<>((messagesToProcess.size()));
+            Map<String, PeerMessage> peerMessageBySignature58 = new HashMap<>(messagesToProcess.size());
 
-            // Firstly we need to lookup this file on chain to get a list of its hashes
-            transactionData = (ArbitraryTransactionData)repository.getTransactionRepository().fromSignature(signature);
-            if (transactionData instanceof ArbitraryTransactionData) {
+            for (PeerMessage messagePeer : messagesToProcess) {
+                Controller.getInstance().stats.getArbitraryDataFileListMessageStats.requests.incrementAndGet();
+
+                Message message = messagePeer.message;
+                Peer peer = messagePeer.peer;
+
+                GetArbitraryDataFileListMessage getArbitraryDataFileListMessage = (GetArbitraryDataFileListMessage) message;
+                byte[] signature = getArbitraryDataFileListMessage.getSignature();
+                String signature58 = Base58.encode(signature);
+                Long now = NTP.getTime();
+                Triple<String, Peer, Long> newEntry = new Triple<>(signature58, peer, now);
+
+                // If we've seen this request recently, then ignore
+                if (arbitraryDataFileListRequests.putIfAbsent(message.getId(), newEntry) != null) {
+                    LOGGER.trace("Ignoring hash list request from peer {} for signature {}", peer, signature58);
+                    continue;
+                }
+
+                List<byte[]> requestedHashes = getArbitraryDataFileListMessage.getHashes();
+                int hashCount = requestedHashes != null ? requestedHashes.size() : 0;
+                String requestingPeer = getArbitraryDataFileListMessage.getRequestingPeer();
+
+                if (requestingPeer != null) {
+                    LOGGER.debug("Received hash list request with {} hashes from peer {} (requesting peer {}) for signature {}", hashCount, peer, requestingPeer, signature58);
+                } else {
+                    LOGGER.debug("Received hash list request with {} hashes from peer {} for signature {}", hashCount, peer, signature58);
+                }
+
+                signatureBySignature58.put(signature58, signature);
+                requestedHashesBySignature58.put(signature58, requestedHashes);
+                requestingPeerBySignature58.put(signature58, requestingPeer);
+                nowBySignature58.put(signature58, now);
+                peerMessageBySignature58.put(signature58, messagePeer);
+            }
+
+            if (signatureBySignature58.isEmpty()) {
+                return;
+            }
+
+            List<byte[]> hashes = new ArrayList<>();
+            boolean allChunksExist = false;
+            boolean hasMetadata = false;
+
+            List<ArbitraryTransactionData> transactionDataList;
+            try (final Repository repository = RepositoryManager.getRepository()) {
+
+                // Firstly we need to lookup this file on chain to get a list of its hashes
+                transactionDataList
+                        = repository.getTransactionRepository()
+                        .fromSignatures(new ArrayList<>(signatureBySignature58.values())).stream()
+                        .filter(data -> data instanceof ArbitraryTransactionData)
+                        .map(data -> (ArbitraryTransactionData) data)
+                        .collect(Collectors.toList());
+
+            } catch (DataException e) {
+                LOGGER.error(String.format("Repository issue while fetching arbitrary file list for peer"), e);
+                return;
+            }
+
+            for (ArbitraryTransactionData transactionData : transactionDataList) {
+                byte[] signature = transactionData.getSignature();
+                String signature58 = Base58.encode(signature);
+                List<byte[]> requestedHashes = requestedHashesBySignature58.get(signature58);
 
                 // Check if we're even allowed to serve data for this transaction
                 if (ArbitraryDataStorageManager.getInstance().canStoreData(transactionData)) {
 
-                    // Load file(s) and add any that exist to the list of hashes
-                    ArbitraryDataFile arbitraryDataFile = ArbitraryDataFile.fromTransactionData(transactionData);
+                    try {
+                        // Load file(s) and add any that exist to the list of hashes
+                        ArbitraryDataFile arbitraryDataFile = ArbitraryDataFile.fromTransactionData(transactionData);
 
-                    // If the peer didn't supply a hash list, we need to return all hashes for this transaction
-                    if (requestedHashes == null || requestedHashes.isEmpty()) {
-                        requestedHashes = new ArrayList<>();
+                        // If the peer didn't supply a hash list, we need to return all hashes for this transaction
+                        if (requestedHashes == null || requestedHashes.isEmpty()) {
+                            requestedHashes = new ArrayList<>();
 
-                        // Add the metadata file
-                        if (arbitraryDataFile.getMetadataHash() != null) {
-                            requestedHashes.add(arbitraryDataFile.getMetadataHash());
-                            hasMetadata = true;
+                            // Add the metadata file
+                            if (arbitraryDataFile.getMetadataHash() != null) {
+                                requestedHashes.add(arbitraryDataFile.getMetadataHash());
+                                hasMetadata = true;
+                            }
+
+                            // Add the chunk hashes
+                            if (!arbitraryDataFile.getChunkHashes().isEmpty()) {
+                                requestedHashes.addAll(arbitraryDataFile.getChunkHashes());
+                            }
+                            // Add complete file if there are no hashes
+                            else {
+                                requestedHashes.add(arbitraryDataFile.getHash());
+                            }
                         }
 
-                        // Add the chunk hashes
-                        if (!arbitraryDataFile.getChunkHashes().isEmpty()) {
-                            requestedHashes.addAll(arbitraryDataFile.getChunkHashes());
+
+                        // Assume all chunks exists, unless one can't be found below
+                        allChunksExist = true;
+
+                        for (byte[] requestedHash : requestedHashes) {
+                            ArbitraryDataFileChunk chunk = ArbitraryDataFileChunk.fromHash(requestedHash, signature);
+                            if (chunk.exists()) {
+                                hashes.add(chunk.getHash());
+                                //LOGGER.trace("Added hash {}", chunk.getHash58());
+                            } else {
+                                LOGGER.trace("Couldn't add hash {} because it doesn't exist", chunk.getHash58());
+                                allChunksExist = false;
+                            }
                         }
-                        // Add complete file if there are no hashes
-                        else {
-                            requestedHashes.add(arbitraryDataFile.getHash());
-                        }
+                    } catch (DataException e) {
+                        LOGGER.error(e.getMessage(), e);
+                    }
+                }
+
+                // If the only file we have is the metadata then we shouldn't respond. Most nodes will already have that,
+                // or can use the separate metadata protocol to fetch it. This should greatly reduce network spam.
+                if (hasMetadata && hashes.size() == 1) {
+                    hashes.clear();
+                }
+
+                PeerMessage peerMessage = peerMessageBySignature58.get(signature58);
+                Peer peer = peerMessage.getPeer();
+                Message message = peerMessage.getMessage();
+
+                Long now = nowBySignature58.get(signature58);
+
+                // We should only respond if we have at least one hash
+                String requestingPeer = requestingPeerBySignature58.get(signature58);
+                if (!hashes.isEmpty()) {
+
+                    // Firstly we should keep track of the requesting peer, to allow for potential direct connections later
+                    ArbitraryDataFileManager.getInstance().addRecentDataRequest(requestingPeer);
+
+                    // We have all the chunks, so update requests map to reflect that we've sent it
+                    // There is no need to keep track of the request, as we can serve all the chunks
+                    if (allChunksExist) {
+                        Triple<String, Peer, Long> newEntry = new Triple<>(null, null, now);
+                        arbitraryDataFileListRequests.put(message.getId(), newEntry);
                     }
 
-                    // Assume all chunks exists, unless one can't be found below
-                    allChunksExist = true;
+                    String ourAddress = Network.getInstance().getOurExternalIpAddressAndPort();
+                    ArbitraryDataFileListMessage arbitraryDataFileListMessage;
 
-                    for (byte[] requestedHash : requestedHashes) {
-                        ArbitraryDataFileChunk chunk = ArbitraryDataFileChunk.fromHash(requestedHash, signature);
-                        if (chunk.exists()) {
-                            hashes.add(chunk.getHash());
-                            //LOGGER.trace("Added hash {}", chunk.getHash58());
+                    // Remove optional parameters if the requesting peer doesn't support it yet
+                    // A message with less statistical data is better than no message at all
+                    if (!peer.isAtLeastVersion(MIN_PEER_VERSION_FOR_FILE_LIST_STATS)) {
+                        arbitraryDataFileListMessage = new ArbitraryDataFileListMessage(signature, hashes);
+                    } else {
+                        arbitraryDataFileListMessage = new ArbitraryDataFileListMessage(signature,
+                                hashes, NTP.getTime(), 0, ourAddress, true);
+                    }
+
+                    arbitraryDataFileListMessage.setId(message.getId());
+
+                    if (!peer.sendMessage(arbitraryDataFileListMessage)) {
+                        LOGGER.debug("Couldn't send list of hashes");
+                        continue;
+                    }
+
+                    if (allChunksExist) {
+                        // Nothing left to do, so return to prevent any unnecessary forwarding from occurring
+                        LOGGER.debug("No need for any forwarding because file list request is fully served");
+                        continue;
+                    }
+
+                }
+
+                // We may need to forward this request on
+                boolean isBlocked = (transactionData == null || ListUtils.isNameBlocked(transactionData.getName()));
+                if (Settings.getInstance().isRelayModeEnabled() && !isBlocked) {
+                    // In relay mode - so ask our other peers if they have it
+
+
+                    GetArbitraryDataFileListMessage getArbitraryDataFileListMessage = (GetArbitraryDataFileListMessage) message;
+
+                    long requestTime = getArbitraryDataFileListMessage.getRequestTime();
+                    int requestHops = getArbitraryDataFileListMessage.getRequestHops() + 1;
+                    long totalRequestTime = now - requestTime;
+
+                    if (totalRequestTime < RELAY_REQUEST_MAX_DURATION) {
+                        // Relay request hasn't timed out yet, so can potentially be rebroadcast
+                        if (requestHops < RELAY_REQUEST_MAX_HOPS) {
+                            // Relay request hasn't reached the maximum number of hops yet, so can be rebroadcast
+
+                            Message relayGetArbitraryDataFileListMessage = new GetArbitraryDataFileListMessage(signature, hashes, requestTime, requestHops, requestingPeer);
+                            relayGetArbitraryDataFileListMessage.setId(message.getId());
+
+                            LOGGER.debug("Rebroadcasting hash list request from peer {} for signature {} to our other peers... totalRequestTime: {}, requestHops: {}", peer, Base58.encode(signature), totalRequestTime, requestHops);
+                            Network.getInstance().broadcast(
+                                    broadcastPeer ->
+                                            !broadcastPeer.isAtLeastVersion(RELAY_MIN_PEER_VERSION) ? null :
+                                                    broadcastPeer == peer || Objects.equals(broadcastPeer.getPeerData().getAddress().getHost(), peer.getPeerData().getAddress().getHost()) ? null : relayGetArbitraryDataFileListMessage
+                            );
+
                         } else {
-                            LOGGER.trace("Couldn't add hash {} because it doesn't exist", chunk.getHash58());
-                            allChunksExist = false;
+                            // This relay request has reached the maximum number of allowed hops
                         }
+                    } else {
+                        // This relay request has timed out
                     }
                 }
             }
-
-        } catch (DataException e) {
-            LOGGER.error(String.format("Repository issue while fetching arbitrary file list for peer %s", peer), e);
-        }
-
-        // If the only file we have is the metadata then we shouldn't respond. Most nodes will already have that,
-        // or can use the separate metadata protocol to fetch it. This should greatly reduce network spam.
-        if (hasMetadata && hashes.size() == 1) {
-            hashes.clear();
-        }
-
-        // We should only respond if we have at least one hash
-        if (!hashes.isEmpty()) {
-
-            // Firstly we should keep track of the requesting peer, to allow for potential direct connections later
-            ArbitraryDataFileManager.getInstance().addRecentDataRequest(requestingPeer);
-
-            // We have all the chunks, so update requests map to reflect that we've sent it
-            // There is no need to keep track of the request, as we can serve all the chunks
-            if (allChunksExist) {
-                newEntry = new Triple<>(null, null, now);
-                arbitraryDataFileListRequests.put(message.getId(), newEntry);
-            }
-
-            String ourAddress = Network.getInstance().getOurExternalIpAddressAndPort();
-            ArbitraryDataFileListMessage arbitraryDataFileListMessage;
-
-            // Remove optional parameters if the requesting peer doesn't support it yet
-            // A message with less statistical data is better than no message at all
-            if (!peer.isAtLeastVersion(MIN_PEER_VERSION_FOR_FILE_LIST_STATS)) {
-                arbitraryDataFileListMessage = new ArbitraryDataFileListMessage(signature, hashes);
-            } else {
-                arbitraryDataFileListMessage = new ArbitraryDataFileListMessage(signature,
-                        hashes, NTP.getTime(), 0, ourAddress, true);
-            }
-
-            arbitraryDataFileListMessage.setId(message.getId());
-
-            if (!peer.sendMessage(arbitraryDataFileListMessage)) {
-                LOGGER.debug("Couldn't send list of hashes");
-                peer.disconnect("failed to send list of hashes");
-                return;
-            }
-            LOGGER.debug("Sent list of hashes (count: {})", hashes.size());
-
-            if (allChunksExist) {
-                // Nothing left to do, so return to prevent any unnecessary forwarding from occurring
-                LOGGER.debug("No need for any forwarding because file list request is fully served");
-                return;
-            }
-
-        }
-
-        // We may need to forward this request on
-        boolean isBlocked = (transactionData == null || ListUtils.isNameBlocked(transactionData.getName()));
-        if (Settings.getInstance().isRelayModeEnabled() && !isBlocked) {
-            // In relay mode - so ask our other peers if they have it
-
-            long requestTime = getArbitraryDataFileListMessage.getRequestTime();
-            int requestHops = getArbitraryDataFileListMessage.getRequestHops() + 1;
-            long totalRequestTime = now - requestTime;
-
-            if (totalRequestTime < RELAY_REQUEST_MAX_DURATION) {
-                // Relay request hasn't timed out yet, so can potentially be rebroadcast
-                if (requestHops < RELAY_REQUEST_MAX_HOPS) {
-                    // Relay request hasn't reached the maximum number of hops yet, so can be rebroadcast
-
-                    Message relayGetArbitraryDataFileListMessage = new GetArbitraryDataFileListMessage(signature, hashes, requestTime, requestHops, requestingPeer);
-                    relayGetArbitraryDataFileListMessage.setId(message.getId());
-
-                    LOGGER.debug("Rebroadcasting hash list request from peer {} for signature {} to our other peers... totalRequestTime: {}, requestHops: {}", peer, Base58.encode(signature), totalRequestTime, requestHops);
-                    Network.getInstance().broadcast(
-                            broadcastPeer ->
-                                    !broadcastPeer.isAtLeastVersion(RELAY_MIN_PEER_VERSION) ? null :
-                                    broadcastPeer == peer || Objects.equals(broadcastPeer.getPeerData().getAddress().getHost(), peer.getPeerData().getAddress().getHost()) ? null : relayGetArbitraryDataFileListMessage
-                    );
-
-                }
-                else {
-                    // This relay request has reached the maximum number of allowed hops
-                }
-            }
-            else {
-                // This relay request has timed out
-            }
+        } catch (Exception e) {
+            LOGGER.error(e.getMessage(), e);
         }
     }
 

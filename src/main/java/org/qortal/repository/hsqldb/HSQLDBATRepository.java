@@ -15,8 +15,12 @@ import org.qortal.utils.ByteArray;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
+import java.util.stream.Collectors;
 
 import org.qortal.data.account.AccountData;
 
@@ -71,6 +75,63 @@ public class HSQLDBATRepository implements ATRepository {
 			return new ATData(atAddress, creatorPublicKey, created, version, assetId, codeBytes, codeHash,
 					isSleeping, sleepUntilHeight, isFinished, hadFatalError, isFrozen, frozenBalance,
 					sleepUntilMessageTimestamp);
+		} catch (SQLException e) {
+			throw new DataException("Unable to fetch AT from repository", e);
+		}
+	}
+
+	@Override
+	public List<ATData> fromATAddresses(List<String> atAddresses) throws DataException {
+		String sql = "SELECT creator, created_when, version, asset_id, code_bytes, code_hash, "
+				+ "is_sleeping, sleep_until_height, is_finished, had_fatal_error, "
+				+ "is_frozen, frozen_balance, sleep_until_message_timestamp, AT_address "
+				+ "FROM ATs "
+				+ "WHERE AT_address IN ("
+				+ String.join(", ", Collections.nCopies(atAddresses.size(), "?"))
+				+ ")"
+				;
+
+		List<ATData> list;
+		try (ResultSet resultSet = this.repository.checkedExecute(sql, atAddresses.toArray(new String[atAddresses.size()]))) {
+			if (resultSet == null) {
+				return new ArrayList<>(0);
+			}
+
+			list = new ArrayList<>(atAddresses.size());
+
+			do {
+				byte[] creatorPublicKey = resultSet.getBytes(1);
+				long created = resultSet.getLong(2);
+				int version = resultSet.getInt(3);
+				long assetId = resultSet.getLong(4);
+				byte[] codeBytes = resultSet.getBytes(5); // Actually BLOB
+				byte[] codeHash = resultSet.getBytes(6);
+				boolean isSleeping = resultSet.getBoolean(7);
+
+				Integer sleepUntilHeight = resultSet.getInt(8);
+				if (sleepUntilHeight == 0 && resultSet.wasNull())
+					sleepUntilHeight = null;
+
+				boolean isFinished = resultSet.getBoolean(9);
+				boolean hadFatalError = resultSet.getBoolean(10);
+				boolean isFrozen = resultSet.getBoolean(11);
+
+				Long frozenBalance = resultSet.getLong(12);
+				if (frozenBalance == 0 && resultSet.wasNull())
+					frozenBalance = null;
+
+				Long sleepUntilMessageTimestamp = resultSet.getLong(13);
+				if (sleepUntilMessageTimestamp == 0 && resultSet.wasNull())
+					sleepUntilMessageTimestamp = null;
+
+				String atAddress = resultSet.getString(14);
+
+				list.add(new ATData(atAddress, creatorPublicKey, created, version, assetId, codeBytes, codeHash,
+						isSleeping, sleepUntilHeight, isFinished, hadFatalError, isFrozen, frozenBalance,
+						sleepUntilMessageTimestamp));
+			} while ( resultSet.next());
+
+			return list;
 		} catch (SQLException e) {
 			throw new DataException("Unable to fetch AT from repository", e);
 		}
@@ -401,6 +462,56 @@ public class HSQLDBATRepository implements ATRepository {
 		} catch (SQLException e) {
 			throw new DataException("Unable to fetch latest AT state from repository", e);
 		}
+	}
+
+	@Override
+	public List<ATStateData> getLatestATStates(List<String> atAddresses) throws DataException{
+		String sql = "SELECT height, state_data, state_hash, fees, is_initial, sleep_until_message_timestamp, AT_address "
+				+ "FROM ATStates "
+				+ "JOIN ATStatesData USING (AT_address, height) "
+				+ "WHERE ATStates.AT_address IN ("
+				+ String.join(", ", Collections.nCopies(atAddresses.size(), "?"))
+				+ ")";
+
+		List<ATStateData> stateDataList;
+
+		try (ResultSet resultSet = this.repository.checkedExecute(sql, atAddresses.toArray(new String[atAddresses.size()]))) {
+			if (resultSet == null)
+				return new ArrayList<>(0);
+
+			stateDataList = new ArrayList<>();
+
+			do {
+				int height = resultSet.getInt(1);
+				byte[] stateData = resultSet.getBytes(2); // Actually BLOB
+				byte[] stateHash = resultSet.getBytes(3);
+				long fees = resultSet.getLong(4);
+				boolean isInitial = resultSet.getBoolean(5);
+
+				Long sleepUntilMessageTimestamp = resultSet.getLong(6);
+				if (sleepUntilMessageTimestamp == 0 && resultSet.wasNull())
+					sleepUntilMessageTimestamp = null;
+
+				String atAddress = resultSet.getString(7);
+				stateDataList.add(new ATStateData(atAddress, height, stateData, stateHash, fees, isInitial, sleepUntilMessageTimestamp));
+			} while( resultSet.next());
+		} catch (SQLException e) {
+			throw new DataException("Unable to fetch latest AT state from repository", e);
+		}
+
+		Map<String, List<ATStateData>> stateDataByAtAddress
+			= stateDataList.stream()
+				.collect(Collectors.groupingBy(ATStateData::getATAddress));
+
+		List<ATStateData> latestForEachAtAddress
+			= stateDataByAtAddress.values().stream()
+				.map(list -> list.stream()
+						.max(Comparator.comparing(ATStateData::getHeight))
+						.orElse(null))
+				.filter(obj -> obj != null)
+				.collect(Collectors.toList());
+
+		return latestForEachAtAddress;
 	}
 
 	@Override

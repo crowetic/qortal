@@ -156,6 +156,58 @@ public class HSQLDBTransactionRepository implements TransactionRepository {
 	}
 
 	@Override
+	public List<TransactionData> fromSignatures(List<byte[]> signatures) throws DataException {
+		StringBuffer sql = new StringBuffer();
+
+		sql.append("SELECT type, reference, creator, created_when, fee, tx_group_id, block_height, approval_status, approval_height, signature ");
+		sql.append("FROM Transactions WHERE signature IN (");
+		sql.append(String.join(", ", Collections.nCopies(signatures.size(), "?")));
+		sql.append(")");
+
+		List<TransactionData> list;
+		try (ResultSet resultSet = this.repository.checkedExecute(sql.toString(), signatures.toArray(new byte[0][]))) {
+			if (resultSet == null) {
+				return new ArrayList<>(0);
+			}
+
+			list = new ArrayList<>(signatures.size());
+
+			do {
+				TransactionType type = TransactionType.valueOf(resultSet.getInt(1));
+
+				byte[] reference = resultSet.getBytes(2);
+				byte[] creatorPublicKey = resultSet.getBytes(3);
+				long timestamp = resultSet.getLong(4);
+
+				Long fee = resultSet.getLong(5);
+				if (fee == 0 && resultSet.wasNull())
+					fee = null;
+
+				int txGroupId = resultSet.getInt(6);
+
+				Integer blockHeight = resultSet.getInt(7);
+				if (blockHeight == 0 && resultSet.wasNull())
+					blockHeight = null;
+
+				ApprovalStatus approvalStatus = ApprovalStatus.valueOf(resultSet.getInt(8));
+				Integer approvalHeight = resultSet.getInt(9);
+				if (approvalHeight == 0 && resultSet.wasNull())
+					approvalHeight = null;
+
+				byte[] signature = resultSet.getBytes(10);
+
+				BaseTransactionData baseTransactionData = new BaseTransactionData(timestamp, txGroupId, reference, creatorPublicKey, fee, approvalStatus, blockHeight, approvalHeight, signature);
+
+				list.add( fromBase(type, baseTransactionData) );
+			} while( resultSet.next());
+
+			return list;
+		} catch (SQLException e) {
+			throw new DataException("Unable to fetch transactions from repository", e);
+		}
+	}
+
+	@Override
 	public TransactionData fromReference(byte[] reference) throws DataException {
 		String sql = "SELECT type, signature, creator, created_when, fee, tx_group_id, block_height, approval_status, approval_height "
 				+ "FROM Transactions WHERE reference = ?";

@@ -1092,25 +1092,4 @@ public class AdminResource {
 
 		return info;
 	}
-
-	@GET
-	@Path("/dbstates")
-	@Operation(
-			summary = "Get DB States",
-			description = "Get DB States",
-			responses = {
-					@ApiResponse(
-							content = @Content(mediaType = MediaType.APPLICATION_JSON, array = @ArraySchema(schema = @Schema(implementation = DbConnectionInfo.class)))
-					)
-			}
-	)
-	public List<DbConnectionInfo> getDbConnectionsStates() {
-
-		try {
-			return Controller.REPOSITORY_FACTORY.getDbConnectionsStates();
-		} catch (Exception e) {
-			LOGGER.error(e.getMessage(), e);
-			return new ArrayList<>(0);
-		}
-	}
 }

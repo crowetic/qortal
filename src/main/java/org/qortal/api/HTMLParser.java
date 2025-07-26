@@ -1,14 +1,13 @@
 package org.qortal.api;
 
+
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.jsoup.Jsoup;
 import org.jsoup.nodes.Document;
 import org.jsoup.select.Elements;
 import org.qortal.arbitrary.misc.Service;
-
 import java.util.Objects;
-
 public class HTMLParser {
 
     private static final Logger LOGGER = LogManager.getLogger(HTMLParser.class);
@@ -22,10 +21,11 @@ public class HTMLParser {
     private String identifier;
     private String path;
     private String theme;
+    private String lang;
     private boolean usingCustomRouting;
 
     public HTMLParser(String resourceId, String inPath, String prefix, boolean includeResourceIdInPrefix, byte[] data,
-                      String qdnContext, Service service, String identifier, String theme, boolean usingCustomRouting) {
+                      String qdnContext, Service service, String identifier, String theme, boolean usingCustomRouting,  String lang) {
         String inPathWithoutFilename = inPath.contains("/") ? inPath.substring(0, inPath.lastIndexOf('/')) : String.format("/%s",inPath);
         this.qdnBase = includeResourceIdInPrefix ? String.format("%s/%s", prefix, resourceId) : prefix;
         this.qdnBaseWithPath = includeResourceIdInPrefix ? String.format("%s/%s%s", prefix, resourceId, inPathWithoutFilename) : String.format("%s%s", prefix, inPathWithoutFilename);
@@ -36,6 +36,7 @@ public class HTMLParser {
         this.identifier = identifier;
         this.path = inPath;
         this.theme = theme;
+        this.lang = lang;
         this.usingCustomRouting = usingCustomRouting;
     }
 
@@ -61,9 +62,13 @@ public class HTMLParser {
             String identifier = this.identifier != null ? this.identifier.replace("\\", "").replace("\"","\\\"") : "";
             String path = this.path != null ? this.path.replace("\\", "").replace("\"","\\\"") : "";
             String theme = this.theme != null ? this.theme.replace("\\", "").replace("\"","\\\"") : "";
+            String lang = this.lang != null ? this.lang.replace("\\", "").replace("\"", "\\\"") : "";
             String qdnBase = this.qdnBase != null ? this.qdnBase.replace("\\", "").replace("\"","\\\"") : "";
             String qdnBaseWithPath = this.qdnBaseWithPath != null ? this.qdnBaseWithPath.replace("\\", "").replace("\"","\\\"") : "";
-            String qdnContextVar = String.format("<script>var _qdnContext=\"%s\"; var _qdnTheme=\"%s\"; var _qdnService=\"%s\"; var _qdnName=\"%s\"; var _qdnIdentifier=\"%s\"; var _qdnPath=\"%s\"; var _qdnBase=\"%s\"; var _qdnBaseWithPath=\"%s\";</script>", qdnContext, theme, service, name, identifier, path, qdnBase, qdnBaseWithPath);
+            String qdnContextVar = String.format(
+                "<script>var _qdnContext=\"%s\"; var _qdnTheme=\"%s\"; var _qdnLang=\"%s\"; var _qdnService=\"%s\"; var _qdnName=\"%s\"; var _qdnIdentifier=\"%s\"; var _qdnPath=\"%s\"; var _qdnBase=\"%s\"; var _qdnBaseWithPath=\"%s\";</script>",
+                qdnContext, theme, lang, service, name, identifier, path, qdnBase, qdnBaseWithPath
+              );
             head.get(0).prepend(qdnContextVar);
 
             // Add base href tag
