@@ -79,7 +79,10 @@ public enum MessageType {
     GET_NAME(182, GetNameMessage::fromByteBuffer),
 
     TRANSACTIONS(190, TransactionsMessage::fromByteBuffer),
-    GET_ACCOUNT_TRANSACTIONS(191, GetAccountTransactionsMessage::fromByteBuffer);
+    GET_ACCOUNT_TRANSACTIONS(191, GetAccountTransactionsMessage::fromByteBuffer),
+
+    FOREIGN_FEES( 200, ForeignFeesMessage::fromByteBuffer),
+    GET_FOREIGN_FEES( 201, GetForeignFeesMessage::fromByteBuffer);
 
     public final int value;
     public final MessageProducer fromByteBufferMethod;

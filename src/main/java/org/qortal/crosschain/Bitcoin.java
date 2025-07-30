@@ -1,5 +1,6 @@
 package org.qortal.crosschain;
 
+import org.bitcoinj.core.Coin;
 import org.bitcoinj.core.Context;
 import org.bitcoinj.core.NetworkParameters;
 import org.bitcoinj.core.Transaction;
@@ -14,15 +15,21 @@ import java.util.Arrays;
 import java.util.Collection;
 import java.util.EnumMap;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicLong;
 
 public class Bitcoin extends Bitcoiny {
 
 	public static final String CURRENCY_CODE = "BTC";
 
-	private static final long MINIMUM_ORDER_AMOUNT = 100000; // 0.001 BTC minimum order, due to high fees
+	// Locking fee to lock in a QORT for BTC. This is the default value that the user should reset to
+	// a value inline with the BTC fee market. This is 5 sats per kB.
+	private static final Coin DEFAULT_FEE_PER_KB = Coin.valueOf(5_000); // 0.00005 BTC per 1000 bytes
 
-	// Temporary values until a dynamic fee system is written.
-	private static final long NEW_FEE_AMOUNT = 6_000L;
+	private static final long MINIMUM_ORDER_AMOUNT = 100_000; // 0.001 BTC minimum order, due to high fees
+
+	// Default value until user resets fee to compete with the current market. This is a total value for a
+	// p2sh transaction, size 300 kB, 5 sats per kB
+	private static final long NEW_FEE_AMOUNT = 1_500L;
 
 	private static final long NON_MAINNET_FEE = 1000L; // enough for TESTNET3 and should be OK for REGTEST
 
@@ -111,7 +118,7 @@ public class Bitcoin extends Bitcoiny {
 
 			@Override
 			public long getP2shFee(Long timestamp) {
-				return this.getFeeCeiling();
+				return this.getFeeRequired();
 			}
 		},
 		TEST3 {
@@ -173,14 +180,14 @@ public class Bitcoin extends Bitcoiny {
 			}
 		};
 
-		private long feeCeiling = NEW_FEE_AMOUNT;
+		private AtomicLong feeRequired = new AtomicLong(NEW_FEE_AMOUNT);
 
-		public long getFeeCeiling() {
-			return feeCeiling;
+		public long getFeeRequired() {
+			return feeRequired.get();
 		}
 
-		public void setFeeCeiling(long feeCeiling) {
-			this.feeCeiling = feeCeiling;
+		public void setFeeRequired(long feeRequired) {
+			this.feeRequired.set(feeRequired);
 		}
 
 		public abstract NetworkParameters getParams();
@@ -196,7 +203,7 @@ public class Bitcoin extends Bitcoiny {
 	// Constructors and instance
 
 	private Bitcoin(BitcoinNet bitcoinNet, BitcoinyBlockchainProvider blockchain, Context bitcoinjContext, String currencyCode) {
-		super(blockchain, bitcoinjContext, currencyCode, bitcoinjContext.getFeePerKb());
+		super(blockchain, bitcoinjContext, currencyCode, DEFAULT_FEE_PER_KB);
 		this.bitcoinNet = bitcoinNet;
 
 		LOGGER.info(() -> String.format("Starting Bitcoin support using %s", this.bitcoinNet.name()));
@@ -242,14 +249,14 @@ public class Bitcoin extends Bitcoiny {
 	}
 
 	@Override
-	public long getFeeCeiling() {
-		return this.bitcoinNet.getFeeCeiling();
+	public long getFeeRequired() {
+		return this.bitcoinNet.getFeeRequired();
 	}
 
 	@Override
-	public void setFeeCeiling(long fee) {
+	public void setFeeRequired(long fee) {
 
-		this.bitcoinNet.setFeeCeiling( fee );
+		this.bitcoinNet.setFeeRequired( fee );
 	}
 	/**
  	* Returns bitcoinj transaction sending <tt>amount</tt> to <tt>recipient</tt> using 20 sat/byte fee.

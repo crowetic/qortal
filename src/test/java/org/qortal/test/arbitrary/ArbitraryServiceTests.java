@@ -99,6 +99,45 @@ public class ArbitraryServiceTests extends Common {
     }
 
     @Test
+    public void testValidateWebsiteWithIndexFile() throws IOException {
+        // Generate some random data
+        byte[] data = new byte[1024];
+        new Random().nextBytes(data);
+
+        // Write the data to several files in a temp path
+        Path path = Files.createTempDirectory("testValidateWebsiteWithoutIndexFile");
+        path.toFile().deleteOnExit();
+        Files.write(Paths.get(path.toString(), "index.html"), data, StandardOpenOption.CREATE);
+        Files.write(Paths.get(path.toString(), "data1.html"), data, StandardOpenOption.CREATE);
+        Files.write(Paths.get(path.toString(), "data2"), data, StandardOpenOption.CREATE);
+        Files.write(Paths.get(path.toString(), "data3"), data, StandardOpenOption.CREATE);
+
+        Service service = Service.WEBSITE;
+        assertTrue(service.isValidationRequired());
+
+        // There is no index file in the root
+        assertEquals(ValidationResult.OK, service.validate(path));
+    }
+
+    @Test
+    public void testValidateWebsiteWithIndexFileOnly() throws IOException {
+        // Generate some random data
+        byte[] data = new byte[1024];
+        new Random().nextBytes(data);
+
+        // Write the data to several files in a temp path
+        Path path = Files.createTempDirectory("testValidateWebsiteWithoutIndexFile");
+        path.toFile().deleteOnExit();
+        Files.write(Paths.get(path.toString(), "index.html"), data, StandardOpenOption.CREATE);
+
+        Service service = Service.WEBSITE;
+        assertTrue(service.isValidationRequired());
+
+        // There is no index file in the root
+        assertEquals(ValidationResult.OK, service.validate(path));
+    }
+
+    @Test
     public void testValidateWebsiteWithoutIndexFileInRoot() throws IOException {
         // Generate some random data
         byte[] data = new byte[1024];

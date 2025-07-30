@@ -89,7 +89,7 @@ public class BitcoinyTBD extends Bitcoiny {
 		NetTBD netTBD
 				= new NetTBD(
 				bitcoinyTBDRequest.getNetworkName(),
-				bitcoinyTBDRequest.getFeeCeiling(),
+				bitcoinyTBDRequest.getFeeRequired(),
 				networkParams,
 				Collections.emptyList(),
 				bitcoinyTBDRequest.getExpectedGenesisHash()
@@ -134,18 +134,18 @@ public class BitcoinyTBD extends Bitcoiny {
 	@Override
 	public long getP2shFee(Long timestamp) throws ForeignBlockchainException {
 
-		return this.netTBD.getFeeCeiling();
+		return this.netTBD.getFeeRequired();
 	}
 
 	@Override
-	public long getFeeCeiling() {
+	public long getFeeRequired() {
 
-		return this.netTBD.getFeeCeiling();
+		return this.netTBD.getFeeRequired();
 	}
 
 	@Override
-	public void setFeeCeiling(long fee) {
+	public void setFeeRequired(long fee) {
 
-		this.netTBD.setFeeCeiling( fee );
+		this.netTBD.setFeeRequired( fee );
 	}
 }

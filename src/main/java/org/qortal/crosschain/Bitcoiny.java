@@ -840,9 +840,9 @@ public abstract class Bitcoiny implements ForeignBlockchain {
 		} while (true);
 	}
 
-	public abstract long getFeeCeiling();
+	public abstract long getFeeRequired();
 
-	public abstract void setFeeCeiling(long fee);
+	public abstract void setFeeRequired(long fee);
 
 	// UTXOProvider support
 

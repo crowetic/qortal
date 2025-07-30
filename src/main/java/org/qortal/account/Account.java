@@ -2,12 +2,14 @@ package org.qortal.account;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.qortal.api.resource.TransactionsResource;
 import org.qortal.block.BlockChain;
 import org.qortal.controller.LiteNode;
 import org.qortal.data.account.AccountBalanceData;
 import org.qortal.data.account.AccountData;
 import org.qortal.data.account.RewardShareData;
 import org.qortal.data.naming.NameData;
+import org.qortal.data.transaction.TransactionData;
 import org.qortal.repository.DataException;
 import org.qortal.repository.GroupRepository;
 import org.qortal.repository.NameRepository;
@@ -19,7 +21,11 @@ import org.qortal.utils.Groups;
 import javax.xml.bind.annotation.XmlAccessType;
 import javax.xml.bind.annotation.XmlAccessorType;
 
+import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Optional;
 
 import static org.qortal.utils.Amounts.prettyAmount;
 
@@ -359,6 +365,142 @@ public class Account {
 			return BlockChain.getInstance().getFounderEffectiveMintingLevel();
 
 		return accountData.getLevel();
+	}
+
+	/**
+	 * Get Primary Name
+	 *
+	 * @return the primary name for this address if present, otherwise empty
+	 *
+	 * @throws DataException
+	 */
+	public Optional<String> getPrimaryName() throws DataException {
+
+		return this.repository.getNameRepository().getPrimaryName(this.address);
+	}
+
+	/**
+	 * Remove Primary Name
+	 *
+	 * @throws DataException
+	 */
+	public void removePrimaryName() throws DataException {
+		this.repository.getNameRepository().removePrimaryName(this.address);
+	}
+
+	/**
+	 * Reset Primary Name
+	 *
+	 * Set primary name based on the names (and their history) this account owns.
+	 *
+	 * @param confirmationStatus the status of the transactions for the determining the primary name
+	 *
+	 * @return the primary name, empty if their isn't one
+	 *
+	 * @throws DataException
+	 */
+	public Optional<String> resetPrimaryName(TransactionsResource.ConfirmationStatus confirmationStatus) throws DataException {
+		Optional<String> primaryName = determinePrimaryName(confirmationStatus);
+
+		if(primaryName.isPresent()) {
+			return setPrimaryName(primaryName.get());
+		}
+		else {
+			return primaryName;
+		}
+	}
+
+	/**
+	 * Determine Primary Name
+	 *
+	 * Determine primary name based on a list of registered names.
+	 *
+	 * @param confirmationStatus the status of the transactions for this determination
+	 *
+	 * @return the primary name, empty if there is no primary name
+	 *
+	 * @throws DataException
+	 */
+	public Optional<String> determinePrimaryName(TransactionsResource.ConfirmationStatus confirmationStatus) throws DataException {
+
+		// all registered names for the owner
+		List<NameData> names = this.repository.getNameRepository().getNamesByOwner(this.address);
+
+		Optional<String> primaryName;
+
+		// if no registered names, the no primary name possible
+		if (names.isEmpty()) {
+			primaryName = Optional.empty();
+		}
+		// if names
+		else {
+			// if one name, then that is the primary name
+			if (names.size() == 1) {
+				primaryName = Optional.of( names.get(0).getName() );
+			}
+			// if more than one name, then seek the earliest name acquisition that was never released
+			else {
+				Map<String, TransactionData> txByName = new HashMap<>(names.size());
+
+				// for each name, get the latest transaction
+				for (NameData nameData : names) {
+
+					// since the name is currently registered to the owner,
+					// we assume the latest transaction involving this name was the transaction that the acquired
+					// name through registration, purchase or update
+					Optional<TransactionData> latestTransaction
+							= this.repository
+							.getTransactionRepository()
+							.getTransactionsInvolvingName(
+									nameData.getName(),
+									confirmationStatus
+							)
+							.stream()
+							.sorted(Comparator.comparing(
+									TransactionData::getTimestamp).reversed()
+							)
+							.findFirst(); // first is the last, since it was reversed
+
+					// if there is a latest transaction, expected for all registered names
+					if (latestTransaction.isPresent()) {
+						txByName.put(nameData.getName(), latestTransaction.get());
+					}
+					// if there is no latest transaction, then
+					else {
+						LOGGER.warn("No matching transaction for name: " + nameData.getName());
+					}
+				}
+
+				// get the first name aqcuistion for this address
+				Optional<Map.Entry<String, TransactionData>> firstNameEntry
+						= txByName.entrySet().stream().sorted(Comparator.comparing(entry -> entry.getValue().getTimestamp())).findFirst();
+
+				// if their is a name acquisition, then the first one is the primary name
+				if (firstNameEntry.isPresent()) {
+					primaryName = Optional.of( firstNameEntry.get().getKey() );
+				}
+				// if there is no nameacquistion, then there is no primary name
+				else {
+					primaryName =  Optional.empty();
+				}
+			}
+		}
+		return primaryName;
+	}
+
+	/**
+	 * Set Primary Name
+	 *
+	 * @param primaryName the primary to set to this address
+	 *
+	 * @return the primary name if successful, empty if unsuccessful
+	 *
+	 * @throws DataException
+	 */
+	public Optional<String> setPrimaryName( String primaryName ) throws DataException {
+		int changed = this.repository.getNameRepository().setPrimaryName(this.address, primaryName);
+
+		return changed > 0 ? Optional.of(primaryName) : Optional.empty();
 	}
 
 	/**

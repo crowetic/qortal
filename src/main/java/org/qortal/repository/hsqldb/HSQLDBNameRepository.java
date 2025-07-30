@@ -8,6 +8,7 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 
 public class HSQLDBNameRepository implements NameRepository {
 
@@ -267,7 +268,7 @@ public class HSQLDBNameRepository implements NameRepository {
 		StringBuilder sql = new StringBuilder(512);
 
 		sql.append("SELECT name, reduced_name, data, registered_when, updated_when, "
-				+ "is_for_sale, sale_price, reference, creation_group_id FROM Names WHERE owner = ? ORDER BY name");
+				+ "is_for_sale, sale_price, reference, creation_group_id FROM Names WHERE owner = ? ORDER BY registered_when");
 
 		if (reverse != null && reverse)
 			sql.append(" DESC");
@@ -330,6 +331,55 @@ public class HSQLDBNameRepository implements NameRepository {
 			return names;
 		} catch (SQLException e) {
 			throw new DataException("Unable to fetch recent names from repository", e);
+		}
+	}
+
+	@Override
+	public void removePrimaryName(String address) throws DataException {
+		try {
+			this.repository.delete("PrimaryNames", "owner = ?", address);
+		} catch (SQLException e) {
+			throw new DataException("Unable to delete primary name from repository", e);
+		}
+	}
+
+	@Override
+	public Optional<String> getPrimaryName(String address) throws DataException {
+		String sql = "SELECT name FROM PrimaryNames WHERE owner = ?";
+
+		List<String> names = new ArrayList<>();
+
+		try (ResultSet resultSet = this.repository.checkedExecute(sql, address)) {
+			if (resultSet == null)
+				return Optional.empty();
+
+			String name = resultSet.getString(1);
+
+			return Optional.of(name);
+		} catch (SQLException e) {
+			throw new DataException("Unable to fetch recent names from repository", e);
+		}
+	}
+
+	@Override
+	public int setPrimaryName(String address, String primaryName) throws DataException {
+
+		String sql = "INSERT INTO PrimaryNames (owner, name) VALUES (?, ?) ON DUPLICATE KEY UPDATE name = ?";
+
+		try{
+			return this.repository.executeCheckedUpdate(sql, address, primaryName, primaryName);
+		} catch (SQLException e) {
+			throw new DataException("Unable to set primary name", e);
+		}
+	}
+
+	@Override
+	public int clearPrimaryNames() throws DataException {
+
+		try {
+			return this.repository.delete("PrimaryNames");
+		} catch (SQLException e) {
+			throw new DataException("Unable to clear primary names from repository", e);
 		}
 	}
 

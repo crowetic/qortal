@@ -3,6 +3,7 @@ package org.qortal.repository;
 import org.qortal.data.naming.NameData;
 
 import java.util.List;
+import java.util.Optional;
 
 public interface NameRepository {
 
@@ -34,10 +35,17 @@ public interface NameRepository {
 		return getNamesByOwner(address, null, null, null);
 	}
 
+	public int setPrimaryName(String address, String primaryName) throws DataException;
+
+	public void removePrimaryName(String address) throws DataException;
+
+	public Optional<String> getPrimaryName(String address) throws DataException;
+
+	public int clearPrimaryNames() throws DataException;
+
 	public List<String> getRecentNames(long startTimestamp) throws DataException;
 
 	public void save(NameData nameData) throws DataException;
 
 	public void delete(String name) throws DataException;
-
 }

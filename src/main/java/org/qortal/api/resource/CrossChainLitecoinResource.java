@@ -540,10 +540,10 @@ public class CrossChainLitecoinResource {
 	}
 
 	@GET
-	@Path("/feeceiling")
+	@Path("/feerequired")
 	@Operation(
-			summary = "Returns Litecoin fee per Kb.",
-			description = "Returns Litecoin fee per Kb.",
+			summary = "The total fee required for unlocking LTC to the trade offer creator.",
+			description = "This is in sats for a transaction that is approximately 300 kB in size.",
 			responses = {
 					@ApiResponse(
 							content = @Content(
@@ -554,17 +554,17 @@ public class CrossChainLitecoinResource {
 					)
 			}
 	)
-	public String getLitecoinFeeCeiling() {
+	public String getLitecoinFeeRequired() {
 		Litecoin litecoin = Litecoin.getInstance();
 
-		return String.valueOf(litecoin.getFeeCeiling());
+		return String.valueOf(litecoin.getFeeRequired());
 	}
 
 	@POST
-	@Path("/updatefeeceiling")
+	@Path("/updatefeerequired")
 	@Operation(
-			summary = "Sets Litecoin fee ceiling.",
-			description = "Sets Litecoin fee ceiling.",
+			summary = "The total fee required for unlocking LTC to the trade offer creator.",
+			description = "This is in sats for a transaction that is approximately 300 kB in size.",
 			requestBody = @RequestBody(
 					required = true,
 					content = @Content(
@@ -583,13 +583,13 @@ public class CrossChainLitecoinResource {
 			}
 	)
 	@ApiErrors({ApiError.INVALID_PRIVATE_KEY, ApiError.INVALID_CRITERIA})
-	public String setLitecoinFeeCeiling(@HeaderParam(Security.API_KEY_HEADER) String apiKey, String fee) {
+	public String setLitecoinFeeRequired(@HeaderParam(Security.API_KEY_HEADER) String apiKey, String fee) {
 		Security.checkApiCallAllowed(request);
 
 		Litecoin litecoin = Litecoin.getInstance();
 
 		try {
-			return CrossChainUtils.setFeeCeiling(litecoin, fee);
+			return CrossChainUtils.setFeeRequired(litecoin, fee);
 		}
 		catch (IllegalArgumentException e) {
 			throw ApiExceptionFactory.INSTANCE.createException(request, ApiError.INVALID_CRITERIA);

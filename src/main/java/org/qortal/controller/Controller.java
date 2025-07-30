@@ -49,6 +49,7 @@ import org.qortal.utils.*;
 
 import javax.xml.bind.annotation.XmlAccessType;
 import javax.xml.bind.annotation.XmlAccessorType;
+
 import java.awt.TrayIcon.MessageType;
 import java.io.File;
 import java.io.FileNotFoundException;
@@ -56,6 +57,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.net.InetSocketAddress;
 import java.net.UnknownHostException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.security.SecureRandom;
@@ -73,10 +75,9 @@ import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 public class Controller extends Thread {
-
-	public static HSQLDBRepositoryFactory REPOSITORY_FACTORY;
 
 	static {
 		// This must go before any calls to LogManager/Logger
@@ -400,6 +401,9 @@ public class Controller extends Thread {
 
 		Controller.newInstance(args);
 
+
+		cleanChunkUploadTempDir(); // cleanup leftover chunks from streaming to disk
+
 		LOGGER.info("Starting NTP");
 		Long ntpOffset = Settings.getInstance().getTestNtpOffset();
 		if (ntpOffset != null)
@@ -409,8 +413,8 @@ public class Controller extends Thread {
 
 		LOGGER.info("Starting repository");
 		try {
-			REPOSITORY_FACTORY = new HSQLDBRepositoryFactory(getRepositoryUrl());
-			RepositoryManager.setRepositoryFactory(REPOSITORY_FACTORY);
+			HSQLDBRepositoryFactory repositoryFactory = new HSQLDBRepositoryFactory(getRepositoryUrl());
+			RepositoryManager.setRepositoryFactory(repositoryFactory);
 			RepositoryManager.setRequestedCheckpoint(Boolean.TRUE);
 
 			try (final Repository repository = RepositoryManager.getRepository()) {
@@ -575,6 +579,12 @@ public class Controller extends Thread {
 
 		LOGGER.info("Starting online accounts manager");
 		OnlineAccountsManager.getInstance().start();
+
+		LOGGER.info("Starting foreign fees manager");
+		ForeignFeesManager.getInstance().start();
+
+		LOGGER.info("Starting follower");
+		Follower.getInstance().start();
 
 		LOGGER.info("Starting transaction importer");
 		TransactionImporter.getInstance().start();
@@ -1264,6 +1274,9 @@ public class Controller extends Thread {
 				LOGGER.info("Shutting down online accounts manager");
 				OnlineAccountsManager.getInstance().shutdown();
 
+				LOGGER.info("Shutting down foreign fees manager");
+				ForeignFeesManager.getInstance().shutdown();
+
 				LOGGER.info("Shutting down transaction importer");
 				TransactionImporter.getInstance().shutdown();
 
@@ -1638,6 +1651,14 @@ public class Controller extends Thread {
 
 			case ONLINE_ACCOUNTS_V3:
 				OnlineAccountsManager.getInstance().onNetworkOnlineAccountsV3Message(peer, message);
+				break;
+
+			case GET_FOREIGN_FEES:
+				ForeignFeesManager.getInstance().onNetworkGetForeignFeesMessage(peer, message);
+				break;
+
+			case FOREIGN_FEES:
+				ForeignFeesManager.getInstance().onNetworkForeignFeesMessage(peer, message);
 				break;
 
 			case GET_ARBITRARY_DATA:
@@ -2325,6 +2346,24 @@ public class Controller extends Thread {
 
 		return now - offset;
 	}
+
+	private static void cleanChunkUploadTempDir() {
+		Path uploadsTemp = Paths.get("uploads-temp");
+		if (!Files.exists(uploadsTemp)) {
+			return;
+		}
+	
+		try (Stream<Path> paths = Files.walk(uploadsTemp)) {
+			paths.sorted(Comparator.reverseOrder())
+				 .map(Path::toFile)
+				 .forEach(File::delete);
+	
+			LOGGER.info("Cleaned up all temporary uploads in {}", uploadsTemp);
+		} catch (IOException e) {
+			LOGGER.warn("Failed to clean up uploads-temp directory", e);
+		}
+	}
+	
 
 	public StatsSnapshot getStatsSnapshot() {
 		return this.stats;

@@ -3,8 +3,12 @@ package org.qortal.test.naming;
 import org.junit.Before;
 import org.junit.Test;
 import org.qortal.account.PrivateKeyAccount;
+import org.qortal.api.resource.TransactionsResource;
+import org.qortal.block.BlockChain;
 import org.qortal.data.naming.NameData;
+import org.qortal.data.transaction.BuyNameTransactionData;
 import org.qortal.data.transaction.RegisterNameTransactionData;
+import org.qortal.data.transaction.SellNameTransactionData;
 import org.qortal.data.transaction.TransactionData;
 import org.qortal.data.transaction.UpdateNameTransactionData;
 import org.qortal.repository.DataException;
@@ -15,6 +19,9 @@ import org.qortal.test.common.Common;
 import org.qortal.test.common.TransactionUtils;
 import org.qortal.test.common.transaction.TestTransaction;
 import org.qortal.transaction.RegisterNameTransaction;
+import org.qortal.transaction.Transaction;
+
+import java.util.Optional;
 
 import static org.junit.Assert.*;
 
@@ -395,12 +402,24 @@ public class UpdateTests extends Common {
 			assertTrue(repository.getNameRepository().nameExists(initialName));
 			assertNotNull(repository.getNameRepository().fromReducedName(initialReducedName));
 
+			// move passed primary initiation
+			BlockUtils.mintBlocks(repository, BlockChain.getInstance().getMultipleNamesPerAccountHeight());
+
+			// check primary name
+			assertTrue(alice.getPrimaryName().isPresent());
+			assertEquals(initialName, alice.getPrimaryName().get());
+
 			// Update data
 			String middleName = "middle-name";
 			String middleReducedName = "midd1e-name";
 			String middleData = "middle-data";
 			transactionData = new UpdateNameTransactionData(TestTransaction.generateBase(alice), initialName, middleName, middleData);
 			TransactionUtils.signAndMint(repository, transactionData, alice);
+
+			// check primary name
+			Optional<String> alicePrimaryName1 = alice.getPrimaryName();
+			assertTrue(alicePrimaryName1.isPresent());
+			assertEquals(middleName, alicePrimaryName1.get());
 
 			// Check data is correct
 			assertEquals(middleData, repository.getNameRepository().fromName(middleName).getData());
@@ -413,6 +432,11 @@ public class UpdateTests extends Common {
 
 			// Check data is correct
 			assertEquals(newestData, repository.getNameRepository().fromName(newestName).getData());
+
+			// check primary name
+			Optional<String> alicePrimaryName2 = alice.getPrimaryName();
+			assertTrue(alicePrimaryName2.isPresent());
+			assertEquals(newestName, alicePrimaryName2.get());
 
 			// Check initial name no longer exists
 			assertFalse(repository.getNameRepository().nameExists(initialName));
@@ -516,4 +540,101 @@ public class UpdateTests extends Common {
 		}
 	}
 
+	@Test
+	public void testUpdatePrimaryName() throws DataException {
+		try (final Repository repository = RepositoryManager.getRepository()) {
+			// mint passed the feature trigger block
+			BlockUtils.mintBlocks(repository, BlockChain.getInstance().getMultipleNamesPerAccountHeight());
+
+			PrivateKeyAccount alice = Common.getTestAccount(repository, "alice");
+			PrivateKeyAccount bob = Common.getTestAccount(repository, "bob");
+
+			// register name 1
+			String initialName = "initial-name";
+			RegisterNameTransactionData registerNameTransactionData1 = new RegisterNameTransactionData(TestTransaction.generateBase(alice), initialName, "{}");
+			registerNameTransactionData1.setFee(new RegisterNameTransaction(null, null).getUnitFee(registerNameTransactionData1.getTimestamp()));
+			TransactionUtils.signAndMint(repository, registerNameTransactionData1, alice);
+
+			// assert name 1 registration, assert primary name
+			assertTrue(repository.getNameRepository().nameExists(initialName));
+
+			Optional<String> primaryNameOptional = alice.getPrimaryName();
+			assertTrue(primaryNameOptional.isPresent());
+			assertEquals(initialName, primaryNameOptional.get());
+
+			// register name 2
+			String secondName = "second-name";
+			RegisterNameTransactionData registerNameTransactionData2 = new RegisterNameTransactionData(TestTransaction.generateBase(alice), secondName, "{}");
+			registerNameTransactionData2.setFee(new RegisterNameTransaction(null, null).getUnitFee(registerNameTransactionData2.getTimestamp()));
+			TransactionUtils.signAndMint(repository, registerNameTransactionData2, alice);
+
+			// assert name 2 registration, assert primary has not changed
+			assertTrue(repository.getNameRepository().nameExists(secondName));
+
+			// the name alice is trying to update to
+			String newName = "updated-name";
+
+			// update name, assert invalid
+			updateName(repository, initialName, newName, Transaction.ValidationResult.NOT_SUPPORTED, alice);
+
+			// check primary name did not update
+			// check primary name update
+			Optional<String> primaryNameNotUpdateOptional = alice.getPrimaryName();
+			assertTrue(primaryNameNotUpdateOptional.isPresent());
+			assertEquals(initialName, primaryNameNotUpdateOptional.get());
+
+			// sell name 2, assert valid
+			Long amount = 1000000L;
+			SellNameTransactionData transactionData = new SellNameTransactionData(TestTransaction.generateBase(alice), secondName, amount);
+			TransactionUtils.signAndMint(repository, transactionData, alice);
+
+			// Check name is for sale
+			NameData nameData = repository.getNameRepository().fromName(secondName);
+			assertTrue(nameData.isForSale());
+			assertEquals("price incorrect", amount, nameData.getSalePrice());
+
+			// bob buys name 2, assert
+			BuyNameTransactionData bobBuysName2Data = new BuyNameTransactionData(TestTransaction.generateBase(bob), secondName, amount, alice.getAddress());
+			TransactionUtils.signAndMint(repository, bobBuysName2Data, bob);
+
+			// update name, assert valid, assert primary name change
+			updateName(repository, initialName, newName, Transaction.ValidationResult.OK, alice);
+
+			// check primary name update
+			Optional<String> primaryNameUpdateOptional = alice.getPrimaryName();
+			assertTrue(primaryNameUpdateOptional.isPresent());
+			assertEquals(newName, primaryNameUpdateOptional.get());
+
+			assertEquals(alice.getPrimaryName(), alice.determinePrimaryName(TransactionsResource.ConfirmationStatus.CONFIRMED));
+			assertEquals(bob.getPrimaryName(), bob.determinePrimaryName(TransactionsResource.ConfirmationStatus.CONFIRMED));
+		}
+	}
+
+	/**
+	 * Update Name
+	 *
+	 * @param repository
+	 * @param initialName the name before the update
+	 * @param newName the name after the update
+	 * @param expectedValidationResult the validation result expected from the update
+	 * @param account the account for the update
+	 *
+	 * @throws DataException
+	 */
+	private static void updateName(Repository repository, String initialName, String newName, Transaction.ValidationResult expectedValidationResult, PrivateKeyAccount account) throws DataException {
+		TransactionData data = new UpdateNameTransactionData(TestTransaction.generateBase(account), initialName, newName, "{}");
+		Transaction.ValidationResult result = TransactionUtils.signAndImport(repository,data, account);
+
+		assertEquals("Transaction invalid", expectedValidationResult, result);
+
+		BlockUtils.mintBlock(repository);
+
+		if( Transaction.ValidationResult.OK.equals(expectedValidationResult) ) {
+			assertTrue(repository.getNameRepository().nameExists(newName));
+		}
+		else {
+			// the new name should not exist, because the update was invalid
+			assertFalse(repository.getNameRepository().nameExists(newName));
+		}
+	}
 }

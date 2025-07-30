@@ -48,6 +48,24 @@ public class ArbitraryTransactionUtils {
         }
     }
 
+    public static List<ArbitraryTransactionData> fetchTransactionDataList(final Repository repository, final List<byte[]> signature) {
+        try {
+            List<TransactionData> transactions = repository.getTransactionRepository().fromSignatures(signature);
+
+            List<ArbitraryTransactionData> list
+                = transactions.stream()
+                    .filter( transaction -> transaction instanceof ArbitraryTransactionData )
+                    .map( transactionData ->  (ArbitraryTransactionData) transactionData)
+                    .collect(Collectors.toList());
+
+            return list;
+
+        } catch (DataException e) {
+            LOGGER.error("Repository issue when fetching arbitrary transaction data", e);
+            return null;
+        }
+    }
+
     public static ArbitraryTransactionData fetchLatestPut(Repository repository, ArbitraryTransactionData arbitraryTransactionData) {
         if (arbitraryTransactionData == null) {
             return null;

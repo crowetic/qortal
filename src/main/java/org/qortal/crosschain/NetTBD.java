@@ -3,18 +3,19 @@ package org.qortal.crosschain;
 import org.bitcoinj.core.NetworkParameters;
 
 import java.util.Collection;
+import java.util.concurrent.atomic.AtomicLong;
 
 public class NetTBD {
 
     private String name;
-    private long feeCeiling;
+    private AtomicLong feeRequired;
     private NetworkParameters params;
     private Collection<ElectrumX.Server> servers;
     private String genesisHash;
 
-    public NetTBD(String name, long feeCeiling, NetworkParameters params, Collection<ElectrumX.Server> servers, String genesisHash) {
+    public NetTBD(String name, long feeRequired, NetworkParameters params, Collection<ElectrumX.Server> servers, String genesisHash) {
         this.name = name;
-        this.feeCeiling = feeCeiling;
+        this.feeRequired = new AtomicLong(feeRequired);
         this.params = params;
         this.servers = servers;
         this.genesisHash = genesisHash;
@@ -25,14 +26,14 @@ public class NetTBD {
         return this.name;
     }
 
-    public long getFeeCeiling() {
+    public long getFeeRequired() {
 
-        return feeCeiling;
+        return feeRequired.get();
     }
 
-    public void setFeeCeiling(long feeCeiling) {
+    public void setFeeRequired(long feeRequired) {
 
-        this.feeCeiling = feeCeiling;
+        this.feeRequired.set(feeRequired);
     }
 
     public NetworkParameters getParams() {

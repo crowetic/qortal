@@ -502,10 +502,10 @@ public class CrossChainBitcoinResource {
 	}
 
 	@GET
-	@Path("/feeceiling")
+	@Path("/feerequired")
 	@Operation(
-			summary = "Returns Bitcoin fee per Kb.",
-			description = "Returns Bitcoin fee per Kb.",
+			summary = "The total fee required for unlocking BTC to the trade offer creator.",
+			description = "This is in sats for a transaction that is approximately 300 kB in size.",
 			responses = {
 					@ApiResponse(
 							content = @Content(
@@ -516,17 +516,17 @@ public class CrossChainBitcoinResource {
 					)
 			}
 	)
-	public String getBitcoinFeeCeiling() {
+	public String getBitcoinFeeRequired() {
 		Bitcoin bitcoin = Bitcoin.getInstance();
 
-		return String.valueOf(bitcoin.getFeeCeiling());
+		return String.valueOf(bitcoin.getFeeRequired());
 	}
 
 	@POST
-	@Path("/updatefeeceiling")
+	@Path("/updatefeerequired")
 	@Operation(
-			summary = "Sets Bitcoin fee ceiling.",
-			description = "Sets Bitcoin fee ceiling.",
+			summary = "The total fee required for unlocking BTC to the trade offer creator.",
+			description = "This is in sats for a transaction that is approximately 300 kB in size.",
 			requestBody = @RequestBody(
 					required = true,
 					content = @Content(
@@ -545,13 +545,13 @@ public class CrossChainBitcoinResource {
 			}
 	)
 	@ApiErrors({ApiError.INVALID_PRIVATE_KEY, ApiError.INVALID_CRITERIA})
-	public String setBitcoinFeeCeiling(@HeaderParam(Security.API_KEY_HEADER) String apiKey, String fee) {
+	public String setBitcoinFeeRequired(@HeaderParam(Security.API_KEY_HEADER) String apiKey, String fee) {
 		Security.checkApiCallAllowed(request);
 
 		Bitcoin bitcoin = Bitcoin.getInstance();
 
 		try {
-			return CrossChainUtils.setFeeCeiling(bitcoin, fee);
+			return CrossChainUtils.setFeeRequired(bitcoin, fee);
 		}
 		catch (IllegalArgumentException e) {
 			throw ApiExceptionFactory.INSTANCE.createException(request, ApiError.INVALID_CRITERIA);

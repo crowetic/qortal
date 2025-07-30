@@ -3,6 +3,7 @@ package org.qortal.transaction;
 import com.google.common.base.Utf8;
 import org.qortal.account.Account;
 import org.qortal.asset.Asset;
+import org.qortal.block.BlockChain;
 import org.qortal.controller.repository.NamesDatabaseIntegrityCheck;
 import org.qortal.crypto.Crypto;
 import org.qortal.data.naming.NameData;
@@ -48,6 +49,12 @@ public class UpdateNameTransaction extends Transaction {
 	@Override
 	public ValidationResult isValid() throws DataException {
 		String name = this.updateNameTransactionData.getName();
+
+		// if the account has more than one name, then they cannot update their primary name
+		if( this.repository.getNameRepository().getNamesByOwner(this.getOwner().getAddress()).size() > 1 &&
+				this.getOwner().getPrimaryName().get().equals(name) ) {
+			return ValidationResult.NOT_SUPPORTED;
+		}
 
 		// Check name size bounds
 		int nameLength = Utf8.encodedLength(name);
@@ -152,6 +159,16 @@ public class UpdateNameTransaction extends Transaction {
 
 		// Save this transaction, now with updated "name reference" to previous transaction that changed name
 		this.repository.getTransactionRepository().save(this.updateNameTransactionData);
+
+		if( this.repository.getBlockRepository().getBlockchainHeight() > BlockChain.getInstance().getMultipleNamesPerAccountHeight()) {
+
+			Account account = new Account(this.repository, this.getCreator().getAddress());
+
+			// if updating the primary name, then set primary name to new name
+			if( account.getPrimaryName().isEmpty() || account.getPrimaryName().get().equals(this.updateNameTransactionData.getName())) {
+				account.setPrimaryName(this.updateNameTransactionData.getNewName());
+			}
+		}
 	}
 
 	@Override
@@ -167,6 +184,16 @@ public class UpdateNameTransaction extends Transaction {
 
 		// Save this transaction, with previous "name reference"
 		this.repository.getTransactionRepository().save(this.updateNameTransactionData);
+
+		if( this.repository.getBlockRepository().getBlockchainHeight() > BlockChain.getInstance().getMultipleNamesPerAccountHeight()) {
+
+			Account account = new Account(this.repository, this.getCreator().getAddress());
+
+			// if the primary name is the new updated name, then it needs to be set back to the previous name
+			if (account.getPrimaryName().isPresent() && account.getPrimaryName().get().equals(this.updateNameTransactionData.getNewName())) {
+				account.setPrimaryName(this.updateNameTransactionData.getName());
+			}
+		}
 	}
 
 }

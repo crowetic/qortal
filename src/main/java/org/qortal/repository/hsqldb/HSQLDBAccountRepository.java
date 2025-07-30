@@ -408,6 +408,39 @@ public class HSQLDBAccountRepository implements AccountRepository {
 	}
 
 	@Override
+	public List<AccountBalanceData> getBalances(List<String> addresses, long assetId) throws DataException {
+
+		StringBuffer sql = new StringBuffer();
+		sql.append("SELECT balance, account, asset_id FROM AccountBalances ");
+		sql.append("WHERE account IN (");
+		sql.append(String.join(", ", Collections.nCopies(addresses.size(), "?")));
+		sql.append(")");
+
+		try (ResultSet resultSet = this.repository.checkedExecute(sql.toString(), addresses.toArray(new String[addresses.size()]))) {
+			if (resultSet == null)
+				return new ArrayList<>(0);
+
+			List<AccountBalanceData> balances = new ArrayList<>(addresses.size());
+			do {
+				long balance = resultSet.getLong(1);
+				String address = resultSet.getString(2);
+				Long assetIdResult = resultSet.getLong(3);
+
+				if( assetIdResult != assetId ) {
+					LOGGER.warn("assetIdResult = " + assetIdResult);
+					continue;
+				}
+
+				balances.add(new AccountBalanceData(address, assetId, balance) );
+			} while( resultSet.next());
+
+			return balances;
+		} catch (SQLException e) {
+			throw new DataException("Unable to fetch account balance from repository", e);
+		}
+	}
+
+	@Override
 	public List<AccountBalanceData> getAssetBalances(long assetId, Boolean excludeZero) throws DataException {
 		StringBuilder sql = new StringBuilder(1024);
 

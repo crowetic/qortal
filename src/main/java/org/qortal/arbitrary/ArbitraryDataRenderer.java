@@ -1,6 +1,7 @@
 package org.qortal.arbitrary;
 
 import com.google.common.io.Resources;
+
 import org.apache.commons.io.FileUtils;
 import org.apache.commons.lang3.ArrayUtils;
 import org.apache.logging.log4j.LogManager;
@@ -15,11 +16,13 @@ import org.qortal.settings.Settings;
 import javax.servlet.ServletContext;
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
+
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.net.URL;
+
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
@@ -37,6 +40,7 @@ public class ArbitraryDataRenderer {
     private final Service service;
     private final String identifier;
     private String theme = "light";
+    private String lang = "en"; 
     private String inPath;
     private final String secret58;
     private final String prefix;
@@ -166,9 +170,16 @@ public class ArbitraryDataRenderer {
             if (HTMLParser.isHtmlFile(filename)) {
                 // HTML file - needs to be parsed
                 byte[] data = Files.readAllBytes(filePath); // TODO: limit file size that can be read into memory
-                HTMLParser htmlParser = new HTMLParser(resourceId, inPath, prefix, includeResourceIdInPrefix, data, qdnContext, service, identifier, theme, usingCustomRouting);
+                String encodedResourceId;
+
+                if (resourceIdType == ResourceIdType.NAME) {
+                    encodedResourceId = resourceId.replace(" ", "%20");
+                } else {
+                    encodedResourceId = resourceId;
+                }
+                HTMLParser htmlParser = new HTMLParser(encodedResourceId, inPath, prefix, includeResourceIdInPrefix, data, qdnContext, service, identifier, theme, usingCustomRouting, lang);
                 htmlParser.addAdditionalHeaderTags();
-                response.addHeader("Content-Security-Policy", "default-src 'self' 'unsafe-inline' 'unsafe-eval'; font-src 'self' data:; media-src 'self' data: blob:; img-src 'self' data: blob:; connect-src 'self' wss:;");
+               response.addHeader("Content-Security-Policy", "default-src 'self' 'unsafe-inline' 'unsafe-eval'; font-src 'self' data:; media-src 'self' data: blob:; img-src 'self' data: blob:; connect-src 'self' wss: blob:;");
                 response.setContentType(context.getMimeType(filename));
                 response.setContentLength(htmlParser.getData().length);
                 response.getOutputStream().write(htmlParser.getData());
@@ -256,5 +267,8 @@ public class ArbitraryDataRenderer {
     public void setTheme(String theme) {
         this.theme = theme;
     }
+    public void setLang(String lang) {
+        this.lang = lang;
+    }    
 
 }

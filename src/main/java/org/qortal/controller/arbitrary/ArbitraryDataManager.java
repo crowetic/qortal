@@ -42,10 +42,10 @@ public class ArbitraryDataManager extends Thread {
 	private int powDifficulty = 14; // Must not be final, as unit tests need to reduce this value
 
 	/** Request timeout when transferring arbitrary data */
-	public static final long ARBITRARY_REQUEST_TIMEOUT = 12 * 1000L; // ms
+	public static final long ARBITRARY_REQUEST_TIMEOUT = 24 * 1000L; // ms
 
 	/** Maximum time to hold information about an in-progress relay */
-	public static final long ARBITRARY_RELAY_TIMEOUT = 60 * 1000L; // ms
+	public static final long ARBITRARY_RELAY_TIMEOUT = 120 * 1000L; // ms
 
 	/** Maximum time to hold direct peer connection information */
 	public static final long ARBITRARY_DIRECT_CONNECTION_INFO_TIMEOUT = 2 * 60 * 1000L; // ms

@@ -14,6 +14,8 @@ public interface ATRepository {
 	/** Returns ATData using AT's address or null if none found */
 	public ATData fromATAddress(String atAddress) throws DataException;
 
+	public List<ATData> fromATAddresses(List<String> atAddresses) throws DataException;
+
 	/** Returns where AT with passed address exists in repository */
 	public boolean exists(String atAddress) throws DataException;
 
@@ -61,6 +63,8 @@ public interface ATRepository {
 	 * @return ATStateData for AT with greatest height or null if none found
 	 */
 	public ATStateData getLatestATState(String atAddress) throws DataException;
+
+	public List<ATStateData> getLatestATStates(List<String> collect) throws DataException;
 
 	/**
 	 * Returns final ATStateData for ATs matching codeHash (required)

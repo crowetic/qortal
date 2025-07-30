@@ -1,6 +1,7 @@
 package org.qortal.repository;
 
 import java.io.IOException;
+import java.sql.Connection;
 import java.util.concurrent.TimeoutException;
 
 public interface Repository extends AutoCloseable {
@@ -62,4 +63,5 @@ public interface Repository extends AutoCloseable {
 
 	public static void attemptRecovery(String connectionUrl, String name) throws DataException {}
 
+    public Connection getConnection();
 }

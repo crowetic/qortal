@@ -67,6 +67,11 @@ public class NameData {
 		this(name, reducedName, owner, data, registered, null, false, null, reference, creationGroupId);
 	}
 
+	// Typically used for name summsry
+	public NameData(String name, String owner) {
+		this(name, null, owner, null, 0L, null, false, null, null, 0);
+	}
+
 	// Getters / setters
 
 	public String getName() {

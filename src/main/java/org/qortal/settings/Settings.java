@@ -213,7 +213,7 @@ public class Settings {
 	public long recoveryModeTimeout = 9999999999999L;
 
 	/** Minimum peer version number required in order to sync with them */
-	private String minPeerVersion = "4.6.5";
+	private String minPeerVersion = "5.0.0";
 	/** Whether to allow connections with peers below minPeerVersion
 	 * If true, we won't sync with them but they can still sync with us, and will show in the peers list
 	 * If false, sync will be blocked both ways, and they will not appear in the peers list */
@@ -767,17 +767,17 @@ public class Settings {
 	private void setAdditionalDefaults() {
 		// Populate defaults for maxThreadsPerMessageType. If any are specified in settings.json, they will take priority.
 		maxThreadsPerMessageType.add(new ThreadLimit("ARBITRARY_DATA_FILE", 5));
-		maxThreadsPerMessageType.add(new ThreadLimit("GET_ARBITRARY_DATA_FILE", 5));
+		maxThreadsPerMessageType.add(new ThreadLimit("GET_ARBITRARY_DATA_FILE", 15));
 		maxThreadsPerMessageType.add(new ThreadLimit("ARBITRARY_DATA", 5));
 		maxThreadsPerMessageType.add(new ThreadLimit("GET_ARBITRARY_DATA", 5));
-		maxThreadsPerMessageType.add(new ThreadLimit("ARBITRARY_DATA_FILE_LIST", 5));
-		maxThreadsPerMessageType.add(new ThreadLimit("GET_ARBITRARY_DATA_FILE_LIST", 5));
+		maxThreadsPerMessageType.add(new ThreadLimit("ARBITRARY_DATA_FILE_LIST", 50));
+		maxThreadsPerMessageType.add(new ThreadLimit("GET_ARBITRARY_DATA_FILE_LIST", 50));
 		maxThreadsPerMessageType.add(new ThreadLimit("ARBITRARY_SIGNATURES", 5));
 		maxThreadsPerMessageType.add(new ThreadLimit("ARBITRARY_METADATA", 5));
-		maxThreadsPerMessageType.add(new ThreadLimit("GET_ARBITRARY_METADATA", 5));
-		maxThreadsPerMessageType.add(new ThreadLimit("GET_TRANSACTION", 10));
-		maxThreadsPerMessageType.add(new ThreadLimit("TRANSACTION_SIGNATURES", 5));
-		maxThreadsPerMessageType.add(new ThreadLimit("TRADE_PRESENCES", 5));
+		maxThreadsPerMessageType.add(new ThreadLimit("GET_ARBITRARY_METADATA", 100));
+		maxThreadsPerMessageType.add(new ThreadLimit("GET_TRANSACTION", 50));
+		maxThreadsPerMessageType.add(new ThreadLimit("TRANSACTION_SIGNATURES", 50));
+		maxThreadsPerMessageType.add(new ThreadLimit("TRADE_PRESENCES", 50));
 	}
 
 	// Getters / setters

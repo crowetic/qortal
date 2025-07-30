@@ -24,6 +24,11 @@ import org.qortal.utils.Triple;
 
 import java.io.IOException;
 import java.util.*;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Function;
+import java.util.stream.Collectors;
 
 import static org.qortal.controller.arbitrary.ArbitraryDataFileListManager.*;
 
@@ -61,6 +66,7 @@ public class ArbitraryMetadataManager {
 
 
     private ArbitraryMetadataManager() {
+        scheduler.scheduleAtFixedRate(this::processNetworkGetArbitraryMetadataMessage, 60, 1, TimeUnit.SECONDS);
     }
 
     public static ArbitraryMetadataManager getInstance() {
@@ -354,9 +360,8 @@ public class ArbitraryMetadataManager {
 
                         // Forward to requesting peer
                         LOGGER.debug("Forwarding metadata to requesting peer: {}", requestingPeer);
-                        if (!requestingPeer.sendMessage(forwardArbitraryMetadataMessage)) {
-                            requestingPeer.disconnect("failed to forward arbitrary metadata");
-                        }
+                        requestingPeer.sendMessage(forwardArbitraryMetadataMessage);
+                       
                     }
                 }
             }
@@ -371,107 +376,159 @@ public class ArbitraryMetadataManager {
         }
     }
 
+    // List to collect messages
+    private final List<PeerMessage> messageList = new ArrayList<>();
+    // Lock to synchronize access to the list
+    private final Object lock = new Object();
+
+    // Scheduled executor service to process messages every second
+    private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
+
     public void onNetworkGetArbitraryMetadataMessage(Peer peer, Message message) {
+
         // Don't respond if QDN is disabled
         if (!Settings.getInstance().isQdnEnabled()) {
             return;
         }
 
-        Controller.getInstance().stats.getArbitraryMetadataMessageStats.requests.incrementAndGet();
-
-        GetArbitraryMetadataMessage getArbitraryMetadataMessage = (GetArbitraryMetadataMessage) message;
-        byte[] signature = getArbitraryMetadataMessage.getSignature();
-        String signature58 = Base58.encode(signature);
-        Long now = NTP.getTime();
-        Triple<String, Peer, Long> newEntry = new Triple<>(signature58, peer, now);
-
-        // If we've seen this request recently, then ignore
-        if (arbitraryMetadataRequests.putIfAbsent(message.getId(), newEntry) != null) {
-            LOGGER.debug("Ignoring metadata request from peer {} for signature {}", peer, signature58);
-            return;
-        }
-
-        LOGGER.debug("Received metadata request from peer {} for signature {}", peer, signature58);
-
-        ArbitraryTransactionData transactionData = null;
-        ArbitraryDataFile metadataFile = null;
-
-        try (final Repository repository = RepositoryManager.getRepository()) {
-
-            // Firstly we need to lookup this file on chain to get its metadata hash
-            transactionData = (ArbitraryTransactionData)repository.getTransactionRepository().fromSignature(signature);
-            if (transactionData instanceof ArbitraryTransactionData) {
-
-                // Check if we're even allowed to serve metadata for this transaction
-                if (ArbitraryDataStorageManager.getInstance().canStoreData(transactionData)) {
-
-                    byte[] metadataHash = transactionData.getMetadataHash();
-                    if (metadataHash != null) {
-
-                        // Load metadata file
-                        metadataFile = ArbitraryDataFile.fromHash(metadataHash, signature);
-                    }
-                }
-            }
-
-        } catch (DataException e) {
-            LOGGER.error(String.format("Repository issue while fetching arbitrary metadata for peer %s", peer), e);
-        }
-
-        // We should only respond if we have the metadata file
-        if (metadataFile != null && metadataFile.exists()) {
-
-            // We have the metadata file, so update requests map to reflect that we've sent it
-            newEntry = new Triple<>(null, null, now);
-            arbitraryMetadataRequests.put(message.getId(), newEntry);
-
-            ArbitraryMetadataMessage arbitraryMetadataMessage = new ArbitraryMetadataMessage(signature, metadataFile);
-            arbitraryMetadataMessage.setId(message.getId());
-            if (!peer.sendMessage(arbitraryMetadataMessage)) {
-                LOGGER.debug("Couldn't send metadata");
-                peer.disconnect("failed to send metadata");
-                return;
-            }
-            LOGGER.debug("Sent metadata");
-
-            // Nothing left to do, so return to prevent any unnecessary forwarding from occurring
-            LOGGER.debug("No need for any forwarding because metadata request is fully served");
-            return;
-
-        }
-
-        // We may need to forward this request on
-        boolean isBlocked = (transactionData == null || ListUtils.isNameBlocked(transactionData.getName()));
-        if (Settings.getInstance().isRelayModeEnabled() && !isBlocked) {
-            // In relay mode - so ask our other peers if they have it
-
-            long requestTime = getArbitraryMetadataMessage.getRequestTime();
-            int requestHops = getArbitraryMetadataMessage.getRequestHops() + 1;
-            long totalRequestTime = now - requestTime;
-
-            if (totalRequestTime < RELAY_REQUEST_MAX_DURATION) {
-                // Relay request hasn't timed out yet, so can potentially be rebroadcast
-                if (requestHops < RELAY_REQUEST_MAX_HOPS) {
-                    // Relay request hasn't reached the maximum number of hops yet, so can be rebroadcast
-
-                    Message relayGetArbitraryMetadataMessage = new GetArbitraryMetadataMessage(signature, requestTime, requestHops);
-                    relayGetArbitraryMetadataMessage.setId(message.getId());
-
-                    LOGGER.debug("Rebroadcasting metadata request from peer {} for signature {} to our other peers... totalRequestTime: {}, requestHops: {}", peer, Base58.encode(signature), totalRequestTime, requestHops);
-                    Network.getInstance().broadcast(
-                            broadcastPeer ->
-                                    !broadcastPeer.isAtLeastVersion(RELAY_MIN_PEER_VERSION) ? null :
-                                    broadcastPeer == peer || Objects.equals(broadcastPeer.getPeerData().getAddress().getHost(), peer.getPeerData().getAddress().getHost()) ? null : relayGetArbitraryMetadataMessage);
-
-                }
-                else {
-                    // This relay request has reached the maximum number of allowed hops
-                }
-            }
-            else {
-                // This relay request has timed out
-            }
+        synchronized (lock) {
+            messageList.add(new PeerMessage(peer, message));
         }
     }
 
+    private void processNetworkGetArbitraryMetadataMessage() {
+
+        try {
+            List<PeerMessage> messagesToProcess;
+            synchronized (lock) {
+                messagesToProcess = new ArrayList<>(messageList);
+                messageList.clear();
+            }
+
+            Map<String, byte[]> signatureBySignature58 = new HashMap<>((messagesToProcess.size()));
+            Map<String, Long> nowBySignature58 = new HashMap<>(messagesToProcess.size());
+            Map<String,PeerMessage> peerMessageBySignature58 = new HashMap<>(messagesToProcess.size());
+
+            for( PeerMessage peerMessage : messagesToProcess) {
+                Controller.getInstance().stats.getArbitraryMetadataMessageStats.requests.incrementAndGet();
+
+                GetArbitraryMetadataMessage getArbitraryMetadataMessage = (GetArbitraryMetadataMessage) peerMessage.message;
+                byte[] signature = getArbitraryMetadataMessage.getSignature();
+                String signature58 = Base58.encode(signature);
+                Long now = NTP.getTime();
+                Triple<String, Peer, Long> newEntry = new Triple<>(signature58, peerMessage.peer, now);
+
+                // If we've seen this request recently, then ignore
+                if (arbitraryMetadataRequests.putIfAbsent(peerMessage.message.getId(), newEntry) != null) {
+                    LOGGER.debug("Ignoring metadata request from peer {} for signature {}", peerMessage.peer, signature58);
+                    continue;
+                }
+
+                LOGGER.debug("Received metadata request from peer {} for signature {}", peerMessage.peer, signature58);
+
+                signatureBySignature58.put(signature58, signature);
+                nowBySignature58.put(signature58, now);
+                peerMessageBySignature58.put(signature58, peerMessage);
+            }
+
+            if( signatureBySignature58.isEmpty() ) return;
+
+            List<TransactionData> transactionDataList;
+            try (final Repository repository = RepositoryManager.getRepository()) {
+
+                // Firstly we need to lookup this file on chain to get its metadata hash
+                transactionDataList = repository.getTransactionRepository().fromSignatures(new ArrayList(signatureBySignature58.values()));
+            } catch (DataException e) {
+                LOGGER.error(String.format("Repository issue while fetching arbitrary transactions"), e);
+                return;
+            }
+
+            Map<String, ArbitraryTransactionData> dataBySignature58
+                = transactionDataList.stream()
+                    .filter(data -> data instanceof ArbitraryTransactionData)
+                    .map(ArbitraryTransactionData.class::cast)
+                    .collect(Collectors.toMap(data -> Base58.encode(data.getSignature()), Function.identity()));
+
+            for(Map.Entry<String, ArbitraryTransactionData> entry : dataBySignature58.entrySet()) {
+                String signature58 = entry.getKey();
+                ArbitraryTransactionData transactionData = entry.getValue();
+
+                try {
+
+                    // Check if we're even allowed to serve metadata for this transaction
+                    if (ArbitraryDataStorageManager.getInstance().canStoreData(transactionData)) {
+
+                        byte[] metadataHash = transactionData.getMetadataHash();
+                        if (metadataHash != null) {
+
+                            // Load metadata file
+                            ArbitraryDataFile metadataFile = ArbitraryDataFile.fromHash(metadataHash, transactionData.getSignature());
+                            // We should only respond if we have the metadata file
+                            if (metadataFile != null && metadataFile.exists()) {
+
+                                PeerMessage peerMessage = peerMessageBySignature58.get(signature58);
+                                Message message = peerMessage.message;
+                                Peer peer = peerMessage.peer;
+
+                                // We have the metadata file, so update requests map to reflect that we've sent it
+                                Triple newEntry = new Triple<>(null, null, nowBySignature58.get(signature58));
+                                arbitraryMetadataRequests.put(message.getId(), newEntry);
+
+                                ArbitraryMetadataMessage arbitraryMetadataMessage = new ArbitraryMetadataMessage(entry.getValue().getSignature(), metadataFile);
+                                arbitraryMetadataMessage.setId(message.getId());
+                                if (!peer.sendMessage(arbitraryMetadataMessage)) {
+                                    LOGGER.debug("Couldn't send metadata");
+                                    continue;
+                                }
+                                LOGGER.debug("Sent metadata");
+
+                                // Nothing left to do, so return to prevent any unnecessary forwarding from occurring
+                                LOGGER.debug("No need for any forwarding because metadata request is fully served");
+                            }
+
+                        }
+                    }
+                } catch (DataException e) {
+                    LOGGER.error(String.format("Repository issue while fetching arbitrary metadata"), e);
+                }
+
+                // We may need to forward this request on
+                boolean isBlocked = (transactionDataList == null || ListUtils.isNameBlocked(transactionData.getName()));
+                if (Settings.getInstance().isRelayModeEnabled() && !isBlocked) {
+                    // In relay mode - so ask our other peers if they have it
+
+                    PeerMessage peerMessage = peerMessageBySignature58.get(signature58);
+                    GetArbitraryMetadataMessage getArbitraryMetadataMessage = (GetArbitraryMetadataMessage) peerMessage.message;
+                    long requestTime = getArbitraryMetadataMessage.getRequestTime();
+                    int requestHops = getArbitraryMetadataMessage.getRequestHops() + 1;
+                    long totalRequestTime = nowBySignature58.get(signature58) - requestTime;
+
+                    if (totalRequestTime < RELAY_REQUEST_MAX_DURATION) {
+                        // Relay request hasn't timed out yet, so can potentially be rebroadcast
+                        if (requestHops < RELAY_REQUEST_MAX_HOPS) {
+                            // Relay request hasn't reached the maximum number of hops yet, so can be rebroadcast
+
+                            byte[] signature = signatureBySignature58.get(signature58);
+                            Message relayGetArbitraryMetadataMessage = new GetArbitraryMetadataMessage(signature, requestTime, requestHops);
+                            relayGetArbitraryMetadataMessage.setId(getArbitraryMetadataMessage.getId());
+
+                            Peer peer = peerMessage.peer;
+                            LOGGER.debug("Rebroadcasting metadata request from peer {} for signature {} to our other peers... totalRequestTime: {}, requestHops: {}", peer, Base58.encode(signature), totalRequestTime, requestHops);
+                            Network.getInstance().broadcast(
+                                    broadcastPeer ->
+                                            !broadcastPeer.isAtLeastVersion(RELAY_MIN_PEER_VERSION) ? null :
+                                                    broadcastPeer == peer || Objects.equals(broadcastPeer.getPeerData().getAddress().getHost(), peer.getPeerData().getAddress().getHost()) ? null : relayGetArbitraryMetadataMessage);
+
+                        } else {
+                            // This relay request has reached the maximum number of allowed hops
+                        }
+                    } else {
+                        // This relay request has timed out
+                    }
+                }
+            }
+        } catch (Exception e) {
+            LOGGER.error(e.getMessage(), e);
+        }
+    }
 }

@@ -12,10 +12,15 @@ import org.bouncycastle.util.Strings;
 import org.json.simple.JSONObject;
 import org.qortal.api.model.CrossChainTradeLedgerEntry;
 import org.qortal.api.model.crosschain.BitcoinyTBDRequest;
+import org.qortal.asset.Asset;
 import org.qortal.crosschain.*;
+import org.qortal.data.account.AccountBalanceData;
 import org.qortal.data.at.ATData;
 import org.qortal.data.at.ATStateData;
 import org.qortal.data.crosschain.*;
+import org.qortal.event.EventBus;
+import org.qortal.event.LockingFeeUpdateEvent;
+import org.qortal.event.RequiredFeeUpdateEvent;
 import org.qortal.repository.DataException;
 import org.qortal.repository.Repository;
 import org.qortal.utils.Amounts;
@@ -23,15 +28,11 @@ import org.qortal.utils.BitTwiddling;
 
 import java.io.BufferedWriter;
 import java.io.IOException;
-import java.io.OutputStreamWriter;
-import java.io.PrintWriter;
 import java.io.Writer;
 import java.text.DateFormat;
 import java.text.SimpleDateFormat;
-import java.time.Instant;
-import java.time.ZoneId;
-import java.time.ZonedDateTime;
 import java.util.*;
+import java.util.function.Function;
 import java.util.stream.Collectors;
 
 
@@ -103,11 +104,13 @@ public class CrossChainUtils {
 
         bitcoiny.setFeePerKb(Coin.valueOf(satoshis) );
 
+        EventBus.INSTANCE.notify(new LockingFeeUpdateEvent());
+
         return String.valueOf(bitcoiny.getFeePerKb().value);
     }
 
     /**
-     * Set Fee Ceiling
+     * Set Fee Required
      *
      * @param bitcoiny the blockchain support
      * @param fee the fee in satoshis
@@ -116,14 +119,16 @@ public class CrossChainUtils {
      *
      * @throws IllegalArgumentException if invalid
      */
-    public static String setFeeCeiling(Bitcoiny bitcoiny, String fee)  throws IllegalArgumentException{
+    public static String setFeeRequired(Bitcoiny bitcoiny, String fee)  throws IllegalArgumentException{
 
         long satoshis = Long.parseLong(fee);
         if( satoshis < 0 ) throw new IllegalArgumentException("can't set fee to negative number");
 
-        bitcoiny.setFeeCeiling( Long.parseLong(fee));
+        bitcoiny.setFeeRequired( Long.parseLong(fee));
 
-        return String.valueOf(bitcoiny.getFeeCeiling());
+        EventBus.INSTANCE.notify(new RequiredFeeUpdateEvent(bitcoiny));
+
+        return String.valueOf(bitcoiny.getFeeRequired());
     }
 
     /**
@@ -232,6 +237,9 @@ public class CrossChainUtils {
         return bitcoiny.getBlockchainProvider().removeServer(server);
     }
 
+    public static ChainableServer getCurrentServer( Bitcoiny bitcoiny ) {
+        return bitcoiny.getBlockchainProvider().getCurrentServer();
+    }
     /**
      * Set Current Server
      *
@@ -770,5 +778,47 @@ public class CrossChainUtils {
 
             entries.add(ledgerEntry);
         }
+    }
+
+    public static List<CrossChainTradeData> populateTradeDataList(Repository repository, ACCT acct, List<ATData> atDataList) throws DataException {
+
+        if(atDataList.isEmpty()) return new ArrayList<>(0);
+
+        List<ATStateData> latestATStates
+            = repository.getATRepository()
+                .getLatestATStates(
+                    atDataList.stream()
+                        .map(ATData::getATAddress)
+                        .collect(Collectors.toList())
+                );
+
+        Map<String, ATStateData> atStateDataByAtAddress
+            = latestATStates.stream().collect(Collectors.toMap(ATStateData::getATAddress, Function.identity()));
+
+        Map<String, ATData> atDataByAtAddress
+                = atDataList.stream().collect(Collectors.toMap(ATData::getATAddress, Function.identity()));
+
+        Map<String, Long> balanceByAtAddress
+            = repository
+                .getAccountRepository()
+                .getBalances(new ArrayList<>(atDataByAtAddress.keySet()), Asset.QORT)
+                .stream().collect(Collectors.toMap(AccountBalanceData::getAddress, AccountBalanceData::getBalance));
+
+        List<CrossChainTradeData> crossChainTradeDataList = new ArrayList<>(latestATStates.size());
+
+        for( ATStateData atStateData : latestATStates ) {
+            ATData atData = atDataByAtAddress.get(atStateData.getATAddress());
+            crossChainTradeDataList.add(
+                acct.populateTradeData(
+                    repository,
+                    atData.getCreatorPublicKey(),
+                    atData.getCreation(),
+                    atStateData,
+                    OptionalLong.of(balanceByAtAddress.get(atStateData.getATAddress()))
+                )
+            );
+        }
+
+        return crossChainTradeDataList;
     }
 }

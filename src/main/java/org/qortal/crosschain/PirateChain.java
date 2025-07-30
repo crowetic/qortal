@@ -21,6 +21,7 @@ import org.qortal.utils.BitTwiddling;
 
 import java.nio.ByteBuffer;
 import java.util.*;
+import java.util.concurrent.atomic.AtomicLong;
 
 public class PirateChain extends Bitcoiny {
 
@@ -51,12 +52,7 @@ public class PirateChain extends Bitcoiny {
 			public Collection<Server> getServers() {
 				return Arrays.asList(
 					// Servers chosen on NO BASIS WHATSOEVER from various sources!
-					new Server("lightd.pirate.black", Server.ConnectionType.SSL, 443),
-					new Server("wallet-arrr1.qortal.online", Server.ConnectionType.SSL, 443),
-					new Server("wallet-arrr2.qortal.online", Server.ConnectionType.SSL, 443),
-					new Server("wallet-arrr3.qortal.online", Server.ConnectionType.SSL, 443),
-					new Server("wallet-arrr4.qortal.online", Server.ConnectionType.SSL, 443),
-					new Server("wallet-arrr5.qortal.online", Server.ConnectionType.SSL, 443)
+					new Server("lightd.pirate.black", Server.ConnectionType.SSL, 443)
 				);
 			}
 
@@ -67,7 +63,7 @@ public class PirateChain extends Bitcoiny {
 
 			@Override
 			public long getP2shFee(Long timestamp) {
-				return this.getFeeCeiling();
+				return this.getFeeRequired();
 			}
 		},
 		TEST3 {
@@ -117,14 +113,14 @@ public class PirateChain extends Bitcoiny {
 			}
 		};
 
-		private long feeCeiling = MAINNET_FEE;
+		private AtomicLong feeRequired = new AtomicLong(MAINNET_FEE);
 
-		public long getFeeCeiling() {
-			return feeCeiling;
+		public long getFeeRequired() {
+			return feeRequired.get();
 		}
 
-		public void setFeeCeiling(long feeCeiling) {
-			this.feeCeiling = feeCeiling;
+		public void setFeeRequired(long feeRequired) {
+			this.feeRequired.set(feeRequired);
 		}
 
 		public abstract NetworkParameters getParams();
@@ -186,14 +182,14 @@ public class PirateChain extends Bitcoiny {
 	}
 
 	@Override
-	public long getFeeCeiling() {
-		return this.pirateChainNet.getFeeCeiling();
+	public long getFeeRequired() {
+		return this.pirateChainNet.getFeeRequired();
 	}
 
 	@Override
-	public void setFeeCeiling(long fee) {
+	public void setFeeRequired(long fee) {
 
-		this.pirateChainNet.setFeeCeiling( fee );
+		this.pirateChainNet.setFeeRequired( fee );
 	}
 	/**
 	 * Returns confirmed balance, based on passed payment script.
