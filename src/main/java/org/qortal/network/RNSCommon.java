@@ -20,6 +20,19 @@ public class RNSCommon {
     public static String defaultRNSConfig = "reticulum_default_config.yml";
     public static String defaultRNSConfigTestnet = "reticulum_default_testnet_config.yml";
 
+    /**
+     * Reticulum port for TCP Client interfaces
+     */
+    public static Integer MAINNET_IF_TCP_PORT = 4242;
+    public static Integer TESTNET_IF_TCP_PORT = 4243;
+
+    /**
+     * Reticulum Jinjava configuration template name
+     */
+    //public static String templateRNSClientConfig = "reticulum_server_config_template.jinja";
+    //public static String templateRNSServerConfig = "reticulum_server_config_template.jinja";
+    public static String jinjaConfigTemplateName = "reticulum_config_template.jinja";
+
     ///**
     // * Qortal RNS Destinations
     // */

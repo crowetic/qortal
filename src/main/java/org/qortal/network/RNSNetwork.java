@@ -36,11 +36,17 @@ import lombok.Data;
 //import lombok.Getter;
 import lombok.Synchronized;
 
+import org.apache.commons.io.FileUtils;
+import org.apache.commons.lang3.StringUtils;
 import org.qortal.repository.DataException;
 import org.qortal.settings.Settings;
 
+import java.io.BufferedReader;
 import java.io.IOException;
+import java.io.InputStreamReader;
+import java.net.InetAddress;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
 import static java.nio.file.StandardOpenOption.CREATE;
 import static java.nio.file.StandardOpenOption.WRITE;
@@ -56,11 +62,7 @@ import static java.util.Objects.nonNull;
 //import static org.apache.commons.lang3.BooleanUtils.isFalse;
 
 import java.io.File;
-import java.util.Arrays;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.List;
-import java.util.Iterator;
+import java.util.*;
 //import java.util.Random;
 //import java.util.Scanner;
 import java.util.concurrent.TimeUnit;
@@ -68,9 +70,11 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicLong;
 //import java.util.concurrent.locks.Lock;
 //import java.util.concurrent.locks.ReentrantLock;
-import java.util.Objects;
 import java.util.function.Function;
 import java.time.Instant;
+import java.util.stream.Collectors;
+//import java.net.InetAddress;
+//import java.net.UnknownHostException;
 
 import static org.apache.commons.codec.binary.Hex.encodeHexString;
 import org.qortal.utils.ExecuteProduceConsume;
@@ -96,6 +100,10 @@ import lombok.extern.slf4j.Slf4j;
 //import org.slf4j.Logger;
 //import org.slf4j.LoggerFactory;
 
+// templates
+import com.hubspot.jinjava.Jinjava;
+import com.google.common.collect.Maps;
+
 @Data
 @Slf4j
 public class RNSNetwork {
@@ -103,6 +111,7 @@ public class RNSNetwork {
     Reticulum reticulum;
     //private static final String APP_NAME = "qortal";
     static final String APP_NAME = Settings.getInstance().isTestNet() ? RNSCommon.TESTNET_APP_NAME: RNSCommon.MAINNET_APP_NAME;
+    static final Integer TARGET_PORT = Settings.getInstance().isTestNet() ? RNSCommon.TESTNET_IF_TCP_PORT: RNSCommon.MAINNET_IF_TCP_PORT;
     //static final String defaultConfigPath = ".reticulum"; // if empty will look in Reticulums default paths
     static final String defaultConfigPath = Settings.getInstance().isTestNet() ? RNSCommon.defaultRNSConfigPathTestnet: RNSCommon.defaultRNSConfigPath;
     private final int MAX_PEERS = Settings.getInstance().getReticulumMaxPeers();
@@ -153,7 +162,7 @@ public class RNSNetwork {
         log.info("RNSNetwork constructor");
         try {
             //String configPath = new java.io.File(defaultConfigPath).getCanonicalPath();
-            log.info("creating config from {}", defaultConfigPath);
+            log.info("creating config in {}", defaultConfigPath);
             initConfig(defaultConfigPath);
             //reticulum = new Reticulum(configPath);
             reticulum = new Reticulum(defaultConfigPath);
@@ -241,13 +250,50 @@ public class RNSNetwork {
         }
         var configPath = Path.of(configDir1.getAbsolutePath());
         Path configFile = configPath.resolve(CONFIG_FILE_NAME);
+        var localhost = InetAddress.getLocalHost();
+        var fqdn = localhost.getCanonicalHostName();
+        var isReticulumGateway = Settings.getInstance().getReticulumIsGateway();
+        var reticulumDesiredClientInterfaces =  Settings.getInstance().getReticulumDesiredClientInterfaces();
+        var reticulumTcpGatewayServers = Arrays.stream(Settings.getInstance().getReticulumTcpGatewayServers()).collect(Collectors.toList());
+        reticulumTcpGatewayServers.remove(fqdn);
+        Map<String, Object> context = Maps.newHashMap();
+
+        //log.info("fqdn: {}, reticulumTcpGatewayServers: {}", fqdn, reticulumTcpGatewayServers);
 
         if (Files.notExists(configFile)) {
-            var defaultConfig = this.getClass().getClassLoader().getResourceAsStream(RNSCommon.defaultRNSConfig);
-            if (Settings.getInstance().isTestNet()) {
-                defaultConfig = this.getClass().getClassLoader().getResourceAsStream(RNSCommon.defaultRNSConfigTestnet);
+            try {
+                var jnj = new Jinjava();
+                var reticulumGateways = StringUtils.join(reticulumTcpGatewayServers, " ");
+                log.info("reticulumGateways: {}", reticulumGateways);
+                context.put("tcp_gateway_servers",  reticulumGateways);
+                context.put("num_client_interfaces", reticulumDesiredClientInterfaces);
+                context.put("host_fqdn", fqdn);
+                context.put("qortal_network_name",  APP_NAME);
+                context.put("target_port", TARGET_PORT);
+                context.put("is_reticulum_gateway", isReticulumGateway ? "true" : "false");
+                context.put("is_testnet", Settings.getInstance().isTestNet() ? "true" : "false");
+                //log.info("context populated");
+
+                // render config.yml from template
+                log.info("Rendering new Reticulum configuration file from resource {}", RNSCommon.jinjaConfigTemplateName  );
+                //var templateUrl = this.getClass().getClassLoader().getResource(RNSCommon.jinjaConfigTemplateName);
+                var templateResourceInpuSteam = this.getClass().getClassLoader().getResourceAsStream(RNSCommon.jinjaConfigTemplateName);
+                //var template = new Scanner(templateResourceInputSteam).useDelimiter("\n").next();
+                var template = new BufferedReader(new InputStreamReader(templateResourceInpuSteam)).lines().parallel().collect(Collectors.joining("\n"));
+                //log.info("template: {}", template);
+                var renderedConfig = jnj.render(template, context);
+                //log.info("rendered template - {}", renderedConfig);
+                Files.write(configFile, renderedConfig.getBytes(), CREATE, WRITE);
+            } catch (Exception e) {
+                log.error("Failed to render config file - creating fallback default  config file", e);
+                var defaultConfig = this.getClass().getClassLoader().getResourceAsStream(RNSCommon.defaultRNSConfig);
+                if (Settings.getInstance().isTestNet()) {
+                    defaultConfig = this.getClass().getClassLoader().getResourceAsStream(RNSCommon.defaultRNSConfigTestnet);
+                }
+                Files.copy(defaultConfig, configFile, StandardCopyOption.REPLACE_EXISTING);
             }
-            Files.copy(defaultConfig, configFile, StandardCopyOption.REPLACE_EXISTING);
+        } else {
+            log.debug("Reticulum config exists, skipping.");
         }
     }
 

@@ -1,0 +1,61 @@
+---
+# Reticulum server config
+#
+# jinjava variables set in context:
+# * tcp_gateway_servers
+# * num_client_interfaces: number of client interfaces to core servers
+# * host_fqdn: host FQDN
+# * qortal_network_name: either "qortal" or "qortaltest" (from isTestnet)
+# * is_reticulum_gateway: one of the instances (Qortal core or RNS) has
+#                         at least one Gateway interface
+# * is_test_net: boolean (from isTestNet)
+# * target_port: target port for TCPServerInterface (only)
+
+reticulum:
+
+  # Unless we have a native gateway interface we don't need routing
+  enable_transport: false
+
+  share_instance: false
+
+  # default used by RNS
+  #shared_instance_port: 37428
+  #instance_control_port: 37429
+  # we'll use a different default port
+  shared_instance_port: 37438
+  instance_control_port: 37439
+
+  panic_on_interface_error: false
+
+interfaces:
+
+  # This interface enables communication with other
+  # link-local Reticulum nodes over UDP. It does not
+  # need any functional IP infrastructure like routers
+  # or DHCP servers, but will require that at least link-
+  # local IPv6 is enabled in your operating system.
+  "Default Interface":
+    type: AutoInterface
+    # disabled by default
+    enabled: false
+
+{% if is_reticulum_gateway %}
+  # gateway node: client to local Python RNS instance
+  "TCP Client Interface qortal local":
+    type: TCPClientInterface
+    enabled: true
+    target_host: localhost
+    target_port: 4242
+    network_name: {{ qortal_network_name }}
+{% endif %}
+{%- set gateway_servers = tcp_gateway_servers|split(' ') -%}
+{%- for item in gateway_servers -%}
+  {% if (loop.index <= num_client_interfaces) and (item != host_fqdn) %}
+  "TCP Client Interface qortal {{ item }}":
+    type: TCPClientInterface
+    enabled: true
+    target_host: {{ item }}
+    target_port: {{ target_port }}
+    network_name: {{ qortal_network_name }}
+  {% endif %}
+{%- endfor -%}
