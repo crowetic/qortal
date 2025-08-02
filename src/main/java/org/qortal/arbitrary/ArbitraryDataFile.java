@@ -177,7 +177,7 @@ public class ArbitraryDataFile {
         File file = path.toFile();
         if (file.exists()) {
             try {
-                byte[] digest = Crypto.digest(file);
+                byte[] digest = Crypto.digestFileStream(file);
                 ArbitraryDataFile arbitraryDataFile = ArbitraryDataFile.fromHash(digest, signature);
 
                 // Copy file to data directory if needed
@@ -352,7 +352,7 @@ public class ArbitraryDataFile {
         return this.chunks.size();
     }
 
-    public boolean join() {
+ public boolean join() {
         // Ensure we have chunks
         if (this.chunks != null && !this.chunks.isEmpty()) {
 
@@ -373,7 +373,7 @@ public class ArbitraryDataFile {
                 for (ArbitraryDataFileChunk chunk : this.chunks) {
                     File sourceFile = chunk.filePath.toFile();
                     BufferedInputStream in = new BufferedInputStream(new FileInputStream(sourceFile));
-                    byte[] buffer = new byte[2048];
+                    byte[] buffer = new byte[8192];
                     int inSize;
                     while ((inSize = in.read(buffer)) != -1) {
                         out.write(buffer, 0, inSize);
@@ -397,6 +397,8 @@ public class ArbitraryDataFile {
         }
         return false;
     }
+
+
 
     public boolean delete() {
         // Delete the complete file
@@ -667,6 +669,9 @@ public class ArbitraryDataFile {
         }
     }
 
+
+
+
     public boolean containsChunk(byte[] hash) {
         for (ArbitraryDataFileChunk chunk : this.chunks) {
             if (Arrays.equals(hash, chunk.getHash())) {
@@ -781,18 +786,17 @@ public class ArbitraryDataFile {
         return this.filePath;
     }
 
-    public byte[] digest() {
-        File file = this.getFile();
-        if (file != null && file.exists()) {
-            try {
-                return Crypto.digest(file);
-
-            } catch (IOException e) {
-                LOGGER.error("Couldn't compute digest for ArbitraryDataFile");
-            }
+ public byte[] digest() {
+    File file = this.getFile();
+    if (file != null && file.exists()) {
+        try {
+            return Crypto.digestFileStream(file);
+        } catch (IOException e) {
+            LOGGER.error("Couldn't compute digest for ArbitraryDataFile");
         }
-        return null;
     }
+    return null;
+}
 
     public String digest58() {
         if (this.digest() != null) {

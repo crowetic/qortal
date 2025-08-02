@@ -77,10 +77,11 @@ public class Network {
     private static final String[] INITIAL_PEERS = new String[]{
             "node1.qortal.org", "node2.qortal.org", "node3.qortal.org", "node4.qortal.org", "node5.qortal.org",
             "node6.qortal.org", "node7.qortal.org", "node8.qortal.org", "node9.qortal.org", "node10.qortal.org",
-            "node.qortal.ru", "node2.qortal.ru", "node3.qortal.ru", "node.qortal.uk", "node22.qortal.org",
-            "cinfu1.crowetic.com", "node.cwd.systems", "bootstrap.cwd.systems", "node1.qortalnodes.live",
+            "node11.qortal.org", "node12.qortal.org", "node13.qortal.org", "node14.qortal.org", "node15.qortal.org",
+            "node.qortal.ru", "node2.qortal.ru", "node3.qortal.ru", "node.qortal.uk", "qnode1.crowetic.com", "bootstrap-ssh.qortal.org",
+            "proxynodes.qortal.link", "api.qortal.org", "bootstrap2-ssh.qortal.org", "bootstrap3-ssh.qortal.org",
             "node2.qortalnodes.live", "node3.qortalnodes.live", "node4.qortalnodes.live", "node5.qortalnodes.live",
-            "node6.qortalnodes.live", "node7.qortalnodes.live", "node8.qortalnodes.live"
+            "node6.qortalnodes.live", "node7.qortalnodes.live", "node8.qortalnodes.live", "ubuntu-monster.qortal.org"
     };
 
     private static final long NETWORK_EPC_KEEPALIVE = 5L; // seconds
@@ -235,6 +236,8 @@ public class Network {
                     this.allKnownPeers.addAll(repository.getNetworkRepository().getAllPeers());
                 }
             }
+
+            LOGGER.debug("starting with {} known peers", this.allKnownPeers.size());
         }
 
         // Attempt to set up UPnP. All errors are ignored.
@@ -711,63 +714,49 @@ public class Network {
     }
 
     private Peer getConnectablePeer(final Long now) throws InterruptedException {
-        // We can't block here so use tryRepository(). We don't NEED to connect a new peer.
-        try (Repository repository = RepositoryManager.tryRepository()) {
-            if (repository == null) {
-                LOGGER.warn("Unable to get repository connection : Network.getConnectablePeer()");
-                return null;
-            }
 
-            // Find an address to connect to
-            List<PeerData> peers = this.getAllKnownPeers();
+        // Find an address to connect to
+        List<PeerData> peers = this.getAllKnownPeers();
 
-            // Don't consider peers with recent connection failures
-            final long lastAttemptedThreshold = now - CONNECT_FAILURE_BACKOFF;
-            peers.removeIf(peerData -> peerData.getLastAttempted() != null
-                    && (peerData.getLastConnected() == null
-                    || peerData.getLastConnected() < peerData.getLastAttempted())
-                    && peerData.getLastAttempted() > lastAttemptedThreshold);
+        // Don't consider peers with recent connection failures
+        final long lastAttemptedThreshold = now - CONNECT_FAILURE_BACKOFF;
+        peers.removeIf(peerData -> peerData.getLastAttempted() != null
+                && (peerData.getLastConnected() == null
+                || peerData.getLastConnected() < peerData.getLastAttempted())
+                && peerData.getLastAttempted() > lastAttemptedThreshold);
 
-            // Don't consider peers that we know loop back to ourself
-            synchronized (this.selfPeers) {
-                peers.removeIf(isSelfPeer);
-            }
+        // Don't consider peers that we know loop back to ourself
+        synchronized (this.selfPeers) {
+            peers.removeIf(isSelfPeer);
+        }
 
-            // Don't consider already connected peers (simple address match)
-            peers.removeIf(isConnectedPeer);
+        // Don't consider already connected peers (simple address match)
+        peers.removeIf(isConnectedPeer);
 
-            // Don't consider already connected peers (resolved address match)
-            // Disabled because this might be too slow if we end up waiting a long time for hostnames to resolve via DNS
-            // Which is ok because duplicate connections to the same peer are handled during handshaking
-            // peers.removeIf(isResolvedAsConnectedPeer);
+        // Don't consider already connected peers (resolved address match)
+        // Disabled because this might be too slow if we end up waiting a long time for hostnames to resolve via DNS
+        // Which is ok because duplicate connections to the same peer are handled during handshaking
+        // peers.removeIf(isResolvedAsConnectedPeer);
 
-            this.checkLongestConnection(now);
+        this.checkLongestConnection(now);
 
-            // Any left?
-            if (peers.isEmpty()) {
-                return null;
-            }
-
-            // Pick random peer
-            int peerIndex = new Random().nextInt(peers.size());
-
-            // Pick candidate
-            PeerData peerData = peers.get(peerIndex);
-            Peer newPeer = new Peer(peerData);
-            newPeer.setIsDataPeer(false);
-
-            // Update connection attempt info
-            peerData.setLastAttempted(now);
-            synchronized (this.allKnownPeers) {
-                repository.getNetworkRepository().save(peerData);
-                repository.saveChanges();
-            }
-
-            return newPeer;
-        } catch (DataException e) {
-            LOGGER.error("Repository issue while finding a connectable peer", e);
+        // Any left?
+        if (peers.isEmpty()) {
             return null;
         }
+
+        // Pick random peer
+        int peerIndex = new Random().nextInt(peers.size());
+
+        // Pick candidate
+        PeerData peerData = peers.get(peerIndex);
+        Peer newPeer = new Peer(peerData);
+        newPeer.setIsDataPeer(false);
+
+        // Update connection attempt info
+        peerData.setLastAttempted(now);
+
+        return newPeer;
     }
 
     public boolean connectPeer(Peer newPeer) throws InterruptedException {
@@ -947,18 +936,6 @@ public class Network {
     public void peerMisbehaved(Peer peer) {
         PeerData peerData = peer.getPeerData();
         peerData.setLastMisbehaved(NTP.getTime());
-
-        // Only update repository if outbound peer
-        if (peer.isOutbound()) {
-            try (Repository repository = RepositoryManager.getRepository()) {
-                synchronized (this.allKnownPeers) {
-                    repository.getNetworkRepository().save(peerData);
-                    repository.saveChanges();
-                }
-            } catch (DataException e) {
-                LOGGER.warn("Repository issue while updating peer synchronization info", e);
-            }
-        }
     }
 
     /**
@@ -1147,19 +1124,6 @@ public class Network {
 
         // Make a note that we've successfully completed handshake (and when)
         peer.getPeerData().setLastConnected(NTP.getTime());
-
-        // Update connection info for outbound peers only
-        if (peer.isOutbound()) {
-            try (Repository repository = RepositoryManager.getRepository()) {
-                synchronized (this.allKnownPeers) {
-                    repository.getNetworkRepository().save(peer.getPeerData());
-                    repository.saveChanges();
-                }
-            } catch (DataException e) {
-                LOGGER.error("[{}] Repository issue while trying to update outbound peer {}",
-                        peer.getPeerConnectionId(), peer, e);
-            }
-        }
 
         // Process any pending signature requests, as this peer may have been connected for this purpose only
         List<byte[]> pendingSignatureRequests = new ArrayList<>(peer.getPendingSignatureRequests());
@@ -1424,32 +1388,23 @@ public class Network {
     }
 
     public boolean forgetPeer(PeerAddress peerAddress) throws DataException {
-        int numDeleted;
+        boolean numDeleted;
 
         synchronized (this.allKnownPeers) {
-            this.allKnownPeers.removeIf(peerData -> peerData.getAddress().equals(peerAddress));
-
-            try (Repository repository = RepositoryManager.getRepository()) {
-                numDeleted = repository.getNetworkRepository().delete(peerAddress);
-                repository.saveChanges();
-            }
+            numDeleted = this.allKnownPeers.removeIf(peerData -> peerData.getAddress().equals(peerAddress));
         }
 
         disconnectPeer(peerAddress);
 
-        return numDeleted != 0;
+        return numDeleted;
     }
 
     public int forgetAllPeers() throws DataException {
         int numDeleted;
 
         synchronized (this.allKnownPeers) {
+            numDeleted = this.allKnownPeers.size();
             this.allKnownPeers.clear();
-
-            try (Repository repository = RepositoryManager.getRepository()) {
-                numDeleted = repository.getNetworkRepository().deleteAllPeers();
-                repository.saveChanges();
-            }
         }
 
         for (Peer peer : this.getImmutableConnectedPeers()) {
@@ -1498,48 +1453,36 @@ public class Network {
 
         // Prune 'old' peers from repository...
         // Pruning peers isn't critical so no need to block for a repository instance.
-        try (Repository repository = RepositoryManager.tryRepository()) {
-            if (repository == null) {
-                LOGGER.warn("Unable to get repository connection : Network.prunePeers()");
-                return;
-            }
+        synchronized (this.allKnownPeers) {
+            // Fetch all known peers
+            List<PeerData> peers = new ArrayList<>(this.allKnownPeers);
 
-            synchronized (this.allKnownPeers) {
-                // Fetch all known peers
-                List<PeerData> peers = new ArrayList<>(this.allKnownPeers);
-
-                // 'Old' peers:
-                // We attempted to connect within the last day
-                // but we last managed to connect over a week ago.
-                Predicate<PeerData> isNotOldPeer = peerData -> {
-                    if (peerData.getLastAttempted() == null
-                            || peerData.getLastAttempted() < now - OLD_PEER_ATTEMPTED_PERIOD) {
-                        return true;
-                    }
-
-                    if (peerData.getLastConnected() == null
-                            || peerData.getLastConnected() > now - OLD_PEER_CONNECTION_PERIOD) {
-                        return true;
-                    }
-
-                    return false;
-                };
-
-                // Disregard peers that are NOT 'old'
-                peers.removeIf(isNotOldPeer);
-
-                // Don't consider already connected peers (simple address match)
-                peers.removeIf(isConnectedPeer);
-
-                for (PeerData peerData : peers) {
-                    LOGGER.debug("Deleting old peer {} from repository", peerData.getAddress().toString());
-                    repository.getNetworkRepository().delete(peerData.getAddress());
-
-                    // Delete from known peer cache too
-                    this.allKnownPeers.remove(peerData);
+            // 'Old' peers:
+            // We attempted to connect within the last day
+            // but we last managed to connect over a week ago.
+            Predicate<PeerData> isNotOldPeer = peerData -> {
+                if (peerData.getLastAttempted() == null
+                        || peerData.getLastAttempted() < now - OLD_PEER_ATTEMPTED_PERIOD) {
+                    return true;
                 }
 
-                repository.saveChanges();
+                if (peerData.getLastConnected() == null
+                        || peerData.getLastConnected() > now - OLD_PEER_CONNECTION_PERIOD) {
+                    return true;
+                }
+
+                return false;
+            };
+
+            // Disregard peers that are NOT 'old'
+            peers.removeIf(isNotOldPeer);
+
+            // Don't consider already connected peers (simple address match)
+            peers.removeIf(isConnectedPeer);
+
+            for (PeerData peerData : peers) {
+                // Delete from known peer cache too
+                this.allKnownPeers.remove(peerData);
             }
         }
     }
@@ -1547,8 +1490,8 @@ public class Network {
     public boolean mergePeers(String addedBy, long addedWhen, List<PeerAddress> peerAddresses) throws DataException {
         mergePeersLock.lock();
 
-        try (Repository repository = RepositoryManager.getRepository()) {
-            return this.mergePeers(repository, addedBy, addedWhen, peerAddresses);
+        try{
+            return this.mergePeersUnlocked(addedBy, addedWhen, peerAddresses);
         } finally {
             mergePeersLock.unlock();
         }
@@ -1567,23 +1510,17 @@ public class Network {
 
         try {
             // Merging peers isn't critical so don't block for a repository instance.
-            try (Repository repository = RepositoryManager.tryRepository()) {
-                if (repository == null) {
-                    LOGGER.warn("Unable to get repository connection : Network.opportunisticMergePeers()");
-                    return;
-                }
 
-                this.mergePeers(repository, addedBy, addedWhen, peerAddresses);
+            this.mergePeersUnlocked(addedBy, addedWhen, peerAddresses);
 
-            } catch (DataException e) {
-                // Already logged by this.mergePeers()
-            }
+        } catch (DataException e) {
+            // Already logged by this.mergePeersUnlocked()
         } finally {
             mergePeersLock.unlock();
         }
     }
 
-    private boolean mergePeers(Repository repository, String addedBy, long addedWhen, List<PeerAddress> peerAddresses)
+    private boolean mergePeersUnlocked(String addedBy, long addedWhen, List<PeerAddress> peerAddresses)
             throws DataException {
         List<String> fixedNetwork = Settings.getInstance().getFixedNetwork();
         if (fixedNetwork != null && !fixedNetwork.isEmpty()) {
@@ -1607,19 +1544,6 @@ public class Network {
                     .collect(Collectors.toList());
 
             this.allKnownPeers.addAll(newPeers);
-
-            try {
-                // Save new peers into database
-                for (PeerData peerData : newPeers) {
-                    LOGGER.info("Adding new peer {} to repository", peerData.getAddress());
-                    repository.getNetworkRepository().save(peerData);
-                }
-
-                repository.saveChanges();
-            } catch (DataException e) {
-                LOGGER.error("Repository issue while merging peers list from {}", addedBy, e);
-                throw e;
-            }
 
             return true;
         }
@@ -1663,6 +1587,33 @@ public class Network {
             }
         } catch (InterruptedException e) {
             LOGGER.warn("Interrupted while waiting for networking threads to terminate");
+        }
+
+        try( Repository repository = RepositoryManager.getRepository() ){
+
+            // reset all known peers in database
+            int deletedCount = repository.getNetworkRepository().deleteAllPeers();
+
+            LOGGER.debug("Deleted {} known peers", deletedCount);
+
+            List<PeerData> knownPeersToProcess;
+            synchronized (this.allKnownPeers) {
+                knownPeersToProcess = new ArrayList<>(this.allKnownPeers);
+            }
+
+            int addedPeerCount = 0;
+
+            // save all known peers for next start up
+            for (PeerData knownPeerToProcess : knownPeersToProcess) {
+                repository.getNetworkRepository().save(knownPeerToProcess);
+                addedPeerCount++;
+            }
+
+            repository.saveChanges();
+
+            LOGGER.debug("Added {} known peers", addedPeerCount);
+        } catch (DataException e) {
+            LOGGER.error(e.getMessage(), e);
         }
 
         // Close all peer connections

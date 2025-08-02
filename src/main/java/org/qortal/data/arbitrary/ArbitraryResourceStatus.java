@@ -63,7 +63,7 @@ public class ArbitraryResourceStatus {
         this.description = status.description;
         this.localChunkCount = localChunkCount;
         this.totalChunkCount = totalChunkCount;
-        this.percentLoaded = (this.localChunkCount != null && this.totalChunkCount != null && this.totalChunkCount > 0) ? this.localChunkCount / (float)this.totalChunkCount * 100.0f : null;
+        this.percentLoaded = (this.localChunkCount != null && this.totalChunkCount != null && this.totalChunkCount > 0 && this.totalChunkCount >= this.localChunkCount) ? this.localChunkCount / (float)this.totalChunkCount * 100.0f : null;
     }
 
     public ArbitraryResourceStatus(Status status) {
