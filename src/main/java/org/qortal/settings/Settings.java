@@ -624,7 +624,7 @@ public class Settings {
 	private int reticulumMinDesiredPeers = 8;
 	/** Maximum number of task executor network threads */
 	private int reticulumMaxNetworkThreadPoolSize = 89;
-	/** Provide a TCPServerInterface or other "qortal"/"qortaltest" gateway interface */
+	/** Node provides a TCPServerInterface or other "qortal"/"qortaltest" gateway interface */
 	private boolean reticulumHasServerInterface = false;
 	/** Number of desired client Interfaces (taken from core server list) */
 	private int reticulumDesiredClientInterfaces = 1;
