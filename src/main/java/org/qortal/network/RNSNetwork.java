@@ -262,6 +262,15 @@ public class RNSNetwork {
 
         if (Files.notExists(configFile)) {
             try {
+                // jinjava variables set in context:
+                // * tcp_gateway_servers: list of nodes with a TCPServerInterface
+                // * num_client_interfaces: number of client interfaces to gateways be configured
+                // * host_fqdn: host FQDN
+                // * qortal_network_name: either "qortal" or "qortaltest" (from isTestnet)
+                // * is_reticulum_gateway: one of the instances (Qortal core or RNS) has
+                //                         at least one Gateway interface
+                // * is_test_net: String "true" or "false" (from isTestNet)
+                // * target_port: target port for TCPServerInterface (only)
                 var jnj = new Jinjava();
                 var reticulumGateways = StringUtils.join(reticulumTcpGatewayServers, " ");
                 log.info("reticulumGateways: {}", reticulumGateways);

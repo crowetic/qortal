@@ -29,8 +29,6 @@ public class RNSCommon {
     /**
      * Reticulum Jinjava configuration template name
      */
-    //public static String templateRNSClientConfig = "reticulum_server_config_template.jinja";
-    //public static String templateRNSServerConfig = "reticulum_server_config_template.jinja";
     public static String jinjaConfigTemplateName = "reticulum_config_template.jinja";
 
     ///**
