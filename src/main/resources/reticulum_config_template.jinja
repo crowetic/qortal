@@ -48,7 +48,7 @@ interfaces:
     target_port: 4242
     network_name: {{ qortal_network_name }}
 {% endif %}
-{%- set gateway_servers = tcp_gateway_servers|split(' ') -%}
+{%- set gateway_servers = tcp_gateway_servers|split(' ')|shuffle -%}
 {%- for item in gateway_servers -%}
   {% if (loop.index <= num_client_interfaces) and (item != host_fqdn) %}
   "TCP Client Interface qortal {{ item }}":
