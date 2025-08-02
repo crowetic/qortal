@@ -624,6 +624,15 @@ public class Settings {
 	private int reticulumMinDesiredPeers = 8;
 	/** Maximum number of task executor network threads */
 	private int reticulumMaxNetworkThreadPoolSize = 89;
+	/** Node provides a TCPServerInterface or other "qortal"/"qortaltest" gateway interface */
+	private boolean reticulumHasServerInterface = false;
+	/** Number of desired client Interfaces (taken from core server list) */
+	private int reticulumDesiredClientInterfaces = 1;
+	/** Array of core Reticulum server hostnames. TCP only */
+	private String[] reticulumTcpGatewayServers = new String[]{
+			"phantom.mobilefabrik.com",
+			"phantom.tuergass.net"
+	};
 
 	// Constructors
 
@@ -1397,6 +1406,14 @@ public class Settings {
 	public int getReticulumMaxNetworkThreadPoolSize() {
 		return this.reticulumMaxNetworkThreadPoolSize;
   	}
+
+	public boolean getReticulumIsGateway() { return this.reticulumHasServerInterface; }
+
+	public int getReticulumDesiredClientInterfaces() { return this.reticulumDesiredClientInterfaces; }
+
+	public String[] getReticulumTcpGatewayServers() {
+		return this.reticulumTcpGatewayServers;
+	}
 
 	public int getBuildArbitraryResourcesBatchSize() {
 		return buildArbitraryResourcesBatchSize;

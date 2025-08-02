@@ -772,6 +772,8 @@ public class ArbitraryDataFileListManager {
                     String ourAddress = Network.getInstance().getOurExternalIpAddressAndPort();
                     ArbitraryDataFileListMessage arbitraryDataFileListMessage;
 
+                    Collections.shuffle(hashes);
+
                     // Remove optional parameters if the requesting peer doesn't support it yet
                     // A message with less statistical data is better than no message at all
                     if (!peer.isAtLeastVersion(MIN_PEER_VERSION_FOR_FILE_LIST_STATS)) {

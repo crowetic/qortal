@@ -437,16 +437,24 @@ public class ArbitraryDataReader {
                 throw new IOException(String.format("File doesn't exist: %s", arbitraryDataFile));
             }
             // Ensure the complete hash matches the joined chunks
-            if (!Arrays.equals(arbitraryDataFile.digest(), transactionData.getData())) {
-                // Delete the invalid file
-                LOGGER.info("Deleting invalid file: path = " + arbitraryDataFile.getFilePath());
 
-                if( arbitraryDataFile.delete() ) {
-                    LOGGER.info("Deleted invalid file successfully: path = " + arbitraryDataFile.getFilePath());
-                }
-                else {
-                    LOGGER.warn("Could not delete invalid file: path = " + arbitraryDataFile.getFilePath());
-                }
+        if (!Arrays.equals(arbitraryDataFile.digest(), transactionData.getData())) {
+        
+            
+            // Delete the invalid file
+            LOGGER.info("Deleting invalid file: path = {}", arbitraryDataFile.getFilePath());
+            if (arbitraryDataFile.delete()) {
+                LOGGER.info("Deleted invalid file successfully: path = {}", arbitraryDataFile.getFilePath());
+            } else {
+                LOGGER.warn("Could not delete invalid file: path = {}", arbitraryDataFile.getFilePath());
+            }
+
+            // Also delete its chunks
+            if (arbitraryDataFile.deleteAllChunks()) {
+                LOGGER.info("Deleted all chunks associated with invalid file: {}", arbitraryDataFile.getFilePath());
+            } else {
+                LOGGER.warn("Failed to delete one or more chunks for invalid file: {}", arbitraryDataFile.getFilePath());
+            }
 
                 throw new DataException("Unable to validate complete file hash");
             }

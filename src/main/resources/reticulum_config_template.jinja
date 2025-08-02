@@ -1,0 +1,57 @@
+---
+# Reticulum server config
+#
+# Qortal settings (settins.json) used for generation of this config:
+# "reticulumHasServerInterface": node has gateway interface [boolean]
+# "reticulumDesiredClientInterfaces": how many TCP server interfaces
+#                                      to generate [integer] (deafault: 1)
+# "reticulumTcpGatewayServers": list of TCP Gateway nodes [json list]
+
+reticulum:
+
+  # Unless we have a native gateway interface we don't need routing
+  enable_transport: false
+
+  share_instance: false
+
+  # default used by RNS
+  #shared_instance_port: 37428
+  #instance_control_port: 37429
+  # we'll use a different default port
+  shared_instance_port: 37438
+  instance_control_port: 37439
+
+  panic_on_interface_error: false
+
+interfaces:
+
+  # This interface enables communication with other
+  # link-local Reticulum nodes over UDP. It does not
+  # need any functional IP infrastructure like routers
+  # or DHCP servers, but will require that at least link-
+  # local IPv6 is enabled in your operating system.
+  "Default Interface":
+    type: AutoInterface
+    # disabled by default
+    enabled: false
+
+{% if is_reticulum_gateway %}
+  # gateway node: client to local Python RNS instance
+  "TCP Client Interface qortal local":
+    type: TCPClientInterface
+    enabled: true
+    target_host: localhost
+    target_port: 4242
+    network_name: {{ qortal_network_name }}
+{% endif %}
+{%- set gateway_servers = tcp_gateway_servers|split(' ')|shuffle -%}
+{%- for item in gateway_servers -%}
+  {% if (loop.index <= num_client_interfaces) and (item != host_fqdn) %}
+  "TCP Client Interface qortal {{ item }}":
+    type: TCPClientInterface
+    enabled: true
+    target_host: {{ item }}
+    target_port: {{ target_port }}
+    network_name: {{ qortal_network_name }}
+  {% endif %}
+{%- endfor -%}
