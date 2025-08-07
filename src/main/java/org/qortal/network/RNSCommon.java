@@ -31,12 +31,12 @@ public class RNSCommon {
      */
     public static String jinjaConfigTemplateName = "reticulum_config_template.jinja";
 
-    ///**
-    // * Qortal RNS Destinations
-    // */
-    //public enum RNSDestinations {
-    //    BASE,
-    //    QDN;
-    //}
+    /**
+     * Qortal RNS Destination types
+     */
+    public enum RNSDestinationType {
+        BASE,
+        DATA;
+    }
     
 }
