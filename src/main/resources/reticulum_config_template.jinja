@@ -51,7 +51,6 @@ interfaces:
 {%- set gateway_servers = tcp_gateway_servers|split(' ')|shuffle -%}
 {%- for item in gateway_servers -%}
   {%- set fqdn_port_list = item|split(':') -%}
-  {# fqdn_port_list #}
   {%- if fqdn_port_list|length > 1 -%}
     {%- set item_fqdn = fqdn_port_list[0] -%}
     {%- set item_target_port = fqdn_port_list[1] -%}
