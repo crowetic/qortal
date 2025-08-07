@@ -633,6 +633,10 @@ public class Settings {
 			"phantom.mobilefabrik.com",
 			"phantom.tuergass.net"
 	};
+	/** There is a Python rnsd running on the node with a gateway inteface to use */
+	private boolean reticulumUsePythonRNS = false;
+	/** Specify the port if reticulumUsePythonRNS=true and rnsd has a TCPServerInterface */
+	private int reticulumPythonRNSGatewayPort = 4242;
 
 	// Constructors
 
@@ -1414,6 +1418,10 @@ public class Settings {
 	public String[] getReticulumTcpGatewayServers() {
 		return this.reticulumTcpGatewayServers;
 	}
+
+	public boolean getReticulumUsePythonRNS() { return this.reticulumUsePythonRNS; }
+
+	public int getReticulumPythonRNSGatewayPort() { return this.reticulumPythonRNSGatewayPort; }
 
 	public int getBuildArbitraryResourcesBatchSize() {
 		return buildArbitraryResourcesBatchSize;
