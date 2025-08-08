@@ -402,7 +402,7 @@ public class RNSPeer {
 
                     case PONG:
                         log.trace("PONG received");
-                        addToQueue(message);  // as response in blocking queue for ping getResponse
+                        //addToQueue(message);  // as response in blocking queue for ping getResponse
                         break;
 
                     // Do we need this ? (no need to relay peer list...)

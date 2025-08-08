@@ -277,6 +277,8 @@ public class RNSNetwork {
                 //                         at least one Gateway interface
                 // * is_test_net: String "true" or "false" (from isTestNet)
                 // * target_port: target port for TCPServerInterface (only)
+                // * use_python_rns: use local shared python rnsd (has to provide a gateway interface)
+                // * python_rns_if_port: rnsd TCPServerInterface port (if rnsd gateway is a TCPServerInterface)
                 var jnj = new Jinjava();
                 var reticulumGateways = StringUtils.join(reticulumTcpGatewayServers, " ");
                 log.info("reticulumGateways: {}", reticulumGateways);
@@ -286,10 +288,9 @@ public class RNSNetwork {
                 context.put("qortal_network_name",  APP_NAME);
                 context.put("target_port", TARGET_PORT);
                 context.put("is_reticulum_gateway", isReticulumGateway ? "true" : "false");
-                context.put("is_testnet", Settings.getInstance().isTestNet() ? "true" : "false");
+                //context.put("is_test_net", Settings.getInstance().isTestNet() ? "true" : "false");
                 context.put("use_python_rns", Settings.getInstance().getReticulumUsePythonRNS() ? "true" : "false");
                 context.put("python_rns_if_port", Settings.getInstance().getReticulumPythonRNSGatewayPort());
-                //log.info("context populated");
 
                 // render config.yml from template
                 log.info("Rendering new Reticulum configuration file from resource {}", RNSCommon.jinjaConfigTemplateName  );
