@@ -24,7 +24,7 @@ public class RNSCommon {
      * Reticulum port for TCP Client interfaces
      */
     public static Integer MAINNET_IF_TCP_PORT = 4242;
-    public static Integer TESTNET_IF_TCP_PORT = 4243;
+    public static Integer TESTNET_IF_TCP_PORT = 4240;
 
     /**
      * Reticulum Jinjava configuration template name
