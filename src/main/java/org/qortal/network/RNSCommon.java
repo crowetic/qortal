@@ -24,19 +24,19 @@ public class RNSCommon {
      * Reticulum port for TCP Client interfaces
      */
     public static Integer MAINNET_IF_TCP_PORT = 4242;
-    public static Integer TESTNET_IF_TCP_PORT = 4243;
+    public static Integer TESTNET_IF_TCP_PORT = 4240;
 
     /**
      * Reticulum Jinjava configuration template name
      */
     public static String jinjaConfigTemplateName = "reticulum_config_template.jinja";
 
-    ///**
-    // * Qortal RNS Destinations
-    // */
-    //public enum RNSDestinations {
-    //    BASE,
-    //    QDN;
-    //}
+    /**
+     * Qortal RNS Destination types
+     */
+    public enum RNSDestinationType {
+        BASE,
+        DATA;
+    }
     
 }

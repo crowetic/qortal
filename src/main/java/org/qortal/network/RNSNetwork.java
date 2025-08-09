@@ -231,13 +231,19 @@ public class RNSNetwork {
    
         baseDestination.setProofStrategy(ProofStrategy.PROVE_ALL);
         baseDestination.setAcceptLinkRequests(true);
+        //dataDestination.setProofStrategy(ProofStrategy.PROVE_APP);
+        //dataDestination.setAcceptLinkRequests(true);
         
-        baseDestination.setLinkEstablishedCallback(this::clientConnected);
+        baseDestination.setLinkEstablishedCallback(this::baseClientConnected);
+        //dataDestination.setLinkEstablishedCallback(this::dataClientConnected);
         Transport.getInstance().registerAnnounceHandler(new QAnnounceHandler());
+        //Transport.getInstance().registerAnnounceHandler(new QAnnounceHandler("qortal.qdn"));
         log.debug("announceHandlers: {}", Transport.getInstance().getAnnounceHandlers());
         // do a first announce
         baseDestination.announce();
         log.debug("Sent initial announce from {} ({})", encodeHexString(baseDestination.getHash()), baseDestination.getName());
+        // announce DFN destination
+        //dataDestination.announce();
 
         // Start up first networking thread (the "server loop", the "Tasks engine")
         rnsNetworkEPC.start();
@@ -271,6 +277,8 @@ public class RNSNetwork {
                 //                         at least one Gateway interface
                 // * is_test_net: String "true" or "false" (from isTestNet)
                 // * target_port: target port for TCPServerInterface (only)
+                // * use_python_rns: use local shared python rnsd (has to provide a gateway interface)
+                // * python_rns_if_port: rnsd TCPServerInterface port (if rnsd gateway is a TCPServerInterface)
                 var jnj = new Jinjava();
                 var reticulumGateways = StringUtils.join(reticulumTcpGatewayServers, " ");
                 log.info("reticulumGateways: {}", reticulumGateways);
@@ -280,12 +288,12 @@ public class RNSNetwork {
                 context.put("qortal_network_name",  APP_NAME);
                 context.put("target_port", TARGET_PORT);
                 context.put("is_reticulum_gateway", isReticulumGateway ? "true" : "false");
-                context.put("is_testnet", Settings.getInstance().isTestNet() ? "true" : "false");
-                //log.info("context populated");
+                //context.put("is_test_net", Settings.getInstance().isTestNet() ? "true" : "false");
+                context.put("use_python_rns", Settings.getInstance().getReticulumUsePythonRNS() ? "true" : "false");
+                context.put("python_rns_if_port", Settings.getInstance().getReticulumPythonRNSGatewayPort());
 
                 // render config.yml from template
                 log.info("Rendering new Reticulum configuration file from resource {}", RNSCommon.jinjaConfigTemplateName  );
-                //var templateUrl = this.getClass().getClassLoader().getResource(RNSCommon.jinjaConfigTemplateName);
                 var templateResourceInpuSteam = this.getClass().getClassLoader().getResourceAsStream(RNSCommon.jinjaConfigTemplateName);
                 //var template = new Scanner(templateResourceInputSteam).useDelimiter("\n").next();
                 var template = new BufferedReader(new InputStreamReader(templateResourceInpuSteam)).lines().parallel().collect(Collectors.joining("\n"));
@@ -418,18 +426,34 @@ public class RNSNetwork {
         log.info("packet timed out, receipt status: {}", receipt.getStatus());
     }
 
-    public void clientConnected(Link link) {
+    public void baseClientConnected(Link link) {
         //link.setLinkClosedCallback(this::clientDisconnected);
         //link.setPacketCallback(this::serverPacketReceived);
-        log.info("clientConnected - link hash: {}, {}", link.getHash(), encodeHexString(link.getHash()));
+        log.info("baseClientConnected - link hash: {}, {}", link.getHash(), encodeHexString(link.getHash()));
         RNSPeer newPeer = new RNSPeer(link);
         newPeer.setPeerLinkHash(link.getHash());
+        newPeer.setDestinationType(RNSCommon.RNSDestinationType.BASE);
         newPeer.setMessageMagic(getMessageMagic());
         // make sure the peer has a channel and buffer
         newPeer.getOrInitPeerBuffer();
         addIncomingPeer(newPeer);
-        log.info("***> Client connected, link: {}", encodeHexString(link.getLinkId()));
+        log.info("***> Client connected, base link: {}", encodeHexString(link.getLinkId()));
     }
+
+    //public void dataClientConnected(Link link) {
+    //    //link.setLinkClosedCallback(this::clientDisconnected);
+    //    //link.setPacketCallback(this::serverPacketReceived);
+    //    log.info("dataClientConnected - link hash: {}, {}", link.getHash(), encodeHexString(link.getHash()));
+    //    RNSPeer newPeer = new RNSPeer(link);
+    //    newPeer.setPeerLinkHash(link.getHash());
+    //    newPeer.setDestinationType(RNSCommon.RNSDestinationType.DATA);
+    //    newPeer.setType(...)
+    //    newPeer.setMessageMagic(getMessageMagic());
+    //    // make sure the peer has a channel and buffer
+    //    newPeer.getOrInitPeerBuffer();
+    //    addIncomingPeer(newPeer);
+    //    log.info("***> Client connected, data link: {}", encodeHexString(link.getLinkId()));
+    //}
 
     public void clientDisconnected(Link link) {
         log.info("***> Client disconnected");
@@ -445,9 +469,20 @@ public class RNSNetwork {
     //}
 
     private class QAnnounceHandler implements AnnounceHandler {
+        String aspectFilter;
+
+        QAnnounceHandler(String aspectFilter) {
+            this.aspectFilter = aspectFilter;
+        }
+
+        QAnnounceHandler() {
+            this.aspectFilter = "qortal.core";
+        }
+
         @Override
         public String getAspectFilter() {
-            return "qortal.core";
+            //return "qortal.core";
+            return this.aspectFilter;
         }
 
         @Override
@@ -501,6 +536,14 @@ public class RNSNetwork {
                     RNSPeer newPeer = new RNSPeer(destinationHash);
                     newPeer.setServerIdentity(announcedIdentity);
                     newPeer.setIsInitiator(true);
+                    newPeer.setDestinationType(RNSCommon.RNSDestinationType.BASE);
+                    //if (aspectFilter == "qortal.qdn") {
+                    //    // data peer
+                    //    newPeer.setDestinationType(RNSCommon.RNSDestinationType.DATA);
+                    //} else {
+                    //    // core peer
+                    //    newPeer.setDestinationType(RNSCommon.RNSDestinationType.BASE);
+                    //}
                     newPeer.setMessageMagic(getMessageMagic());
                     addLinkedPeer(newPeer);
                     log.info("added new RNSPeer, destinationHash: {}", encodeHexString(destinationHash));

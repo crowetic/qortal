@@ -86,6 +86,7 @@ public class RNSPeer {
 
     private byte[] destinationHash;   // remote destination hash
     Destination peerDestination;      // OUT destination created for this
+    RNSCommon.RNSDestinationType destinationType;
     private Identity serverIdentity;
     @Setter(AccessLevel.PACKAGE) private Instant creationTimestamp;
     @Setter(AccessLevel.PACKAGE) private Instant lastAccessTimestamp;
@@ -235,6 +236,11 @@ public class RNSPeer {
         }
         else {
             log.info("creating buffer - peerLink status: {}, channel: {}", this.peerLink.getStatus(), channel);
+            //// multi-destination: we might need to use different stream IDs from other destination (default is 0) (?)
+            //if (destinationType == RNSCommon.RNSDestinationType.DATA) {
+            //    this.receiveStreamId = 1;
+            //    this.sendStreamId = 1;
+            //}
             this.peerBuffer = Buffer.createBidirectionalBuffer(receiveStreamId, sendStreamId, channel, this::peerBufferReady);
         }
         return getPeerBuffer();
@@ -396,7 +402,7 @@ public class RNSPeer {
 
                     case PONG:
                         log.trace("PONG received");
-                        addToQueue(message);  // as response in blocking queue for ping getResponse
+                        //addToQueue(message);  // as response in blocking queue for ping getResponse
                         break;
 
                     // Do we need this ? (no need to relay peer list...)
