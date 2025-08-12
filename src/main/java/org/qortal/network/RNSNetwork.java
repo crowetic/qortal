@@ -174,7 +174,7 @@ public class RNSNetwork {
             log.error("unable to create Reticulum network", e);
         }
         log.info("reticulum instance created");
-        log.info("reticulum instance created: {}", reticulum);
+        log.debug("reticulum instance created: {}", reticulum);
 
         //        Settings.getInstance().getMaxRNSNetworkThreadPoolSize(),   // statically set to 5 below
         ExecutorService RNSNetworkExecutor = new ThreadPoolExecutor(1,
@@ -337,6 +337,7 @@ public class RNSNetwork {
         BlockData latestBlockData = Controller.getInstance().getChainTip();
         int latestHeight = latestBlockData.getHeight();
 
+        log.debug("broadcastOurChain latestHeight: {}", latestHeight);
         try (final Repository repository = RepositoryManager.getRepository()) {
             List<BlockSummaryData> latestBlockSummaries = repository.getBlockRepository().getBlockSummaries(latestHeight - BROADCAST_CHAIN_TIP_DEPTH, latestHeight);
             Message latestBlockSummariesMessage = new BlockSummariesV2Message(latestBlockSummaries);
