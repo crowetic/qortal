@@ -798,19 +798,20 @@ public class RNSNetwork {
     public void prunePeers() throws DataException {
         // prune initiator peers
         //var peerList = getImmutableLinkedPeers();
-        var initiatorPeerList = getImmutableLinkedPeers();
-        var initiatorActivePeerList = getActiveImmutableLinkedPeers();
-        var incomingPeerList = getImmutableIncomingPeers();
-        var numActiveIncomingPeers = incomingPeerList.size() - getNonActiveIncomingPeers().size();
+        Link pLink;
+        List<RNSPeer> initiatorPeerList = getImmutableLinkedPeers();
+        List<RNSPeer> initiatorActivePeerList = getActiveImmutableLinkedPeers();
+        List<RNSPeer> incomingPeerList = getImmutableIncomingPeers();
+        int numActiveIncomingPeers = incomingPeerList.size() - getNonActiveIncomingPeers().size();
         log.info("number of links (linkedPeers (active) / incomingPeers (active) before prunig: {} ({}), {} ({})",
                 initiatorPeerList.size(), getActiveImmutableLinkedPeers().size(),
                 incomingPeerList.size(), numActiveIncomingPeers);
         for (RNSPeer p: initiatorActivePeerList) {
-            var pLink = p.getOrInitPeerLink();
+            //pLink = p.getOrInitPeerLink();
             p.pingRemote();
         }
         for (RNSPeer p : initiatorPeerList) {
-            var pLink = p.getPeerLink();
+            pLink = p.getPeerLink();
             if (nonNull(pLink)) {
                 if (p.getPeerTimedOut()) {
                     // options: keep in case peer reconnects or remove => we'll remove it
@@ -835,7 +836,7 @@ public class RNSNetwork {
         List<RNSPeer> inaps = getNonActiveIncomingPeers();
         incomingPeerList = this.incomingPeers;
         for (RNSPeer p: incomingPeerList) {
-            var pLink = p.getOrInitPeerLink();
+            pLink = p.getOrInitPeerLink();
             if (nonNull(pLink) && (pLink.getStatus() == ACTIVE)) {
                 // make false active links to timeout (and teardown in timeout callback)
                 // note: actual removal of peer happens on the following pruning run.
@@ -843,7 +844,7 @@ public class RNSNetwork {
             }
         }
         for (RNSPeer p: inaps) {
-            var pLink = p.getPeerLink();
+            pLink = p.getPeerLink();
             if (nonNull(pLink)) {
                 // could be eg. PENDING
                 pLink.teardown();
@@ -858,6 +859,7 @@ public class RNSNetwork {
                 initiatorPeerList.size(), getActiveImmutableLinkedPeers().size(),
                 incomingPeerList.size(), numActiveIncomingPeers);
         maybeAnnounce(getBaseDestination());
+        //maybeAnnouce(getDataDestination());
     }
 
     public void maybeAnnounce(Destination d) {
