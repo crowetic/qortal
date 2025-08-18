@@ -381,8 +381,7 @@ public class RNSPeer {
             try {
                 //log.info("***> creating message from {} bytes", data.length);
                 Message message = Message.fromByteBuffer(bb);
-                //log.info("*=> type {} message received ({} bytes): {}", message.getType(), data.length, message);
-                log.info("*=> type {} message received ({} bytes, id: {})", message.getType(), data.length, message.getId());
+                log.debug("*=> type {} message received ({} bytes, id: {})", message.getType(), data.length, message.getId());
 
                 // Handle message based on type
                 switch (message.getType()) {
@@ -405,35 +404,40 @@ public class RNSPeer {
                         //addToQueue(message);  // as response in blocking queue for ping getResponse
                         break;
 
-                    // Do we need this ? (no need to relay peer list...)
-                    //case PEERS_V2:
-                    //    onPeersV2Message(peer, message);
+                    //// Do we need this ? (no need to relay peer list...)
+                    ////case PEERS_V2:
+                    ////    onPeersV2Message(peer, message);
+                    ////    break;
+
+                    //case BLOCK_SUMMARIES:
+                    //    // from Synchronizer
+                    //    addToQueue(message);
                     //    break;
-
-                    case BLOCK_SUMMARIES:
-                        // from Synchronizer
-                        addToQueue(message);
-
-                    case BLOCK_SUMMARIES_V2:
-                        // from Synchronizer
-                        addToQueue(message);
-
-                    case SIGNATURES:
-                        // from Synchronizer
-                        addToQueue(message);
-
-                    case BLOCK:
-                        // from Synchronizer
-                        addToQueue(message);
-
-                    case BLOCK_V2:
-                        // from Synchronizer
-                        addToQueue(message);
+                    //
+                    //case BLOCK_SUMMARIES_V2:
+                    //    // from Synchronizer
+                    //    addToQueue(message);
+                    //    break;
+                    //
+                    //case SIGNATURES:
+                    //    // from Synchronizer
+                    //    addToQueue(message);
+                    //    break;
+                    //
+                    //case BLOCK:
+                    //    // from Synchronizer
+                    //    addToQueue(message);
+                    //    break;
+                    //
+                    //case BLOCK_V2:
+                    //    // from Synchronizer
+                    //    addToQueue(message);
+                    //    break;
 
                     default:
                         log.info("default - type {} message received ({} bytes)", message.getType(), data.length);
                         // Bump up to controller for possible action
-                        addToQueue(message);
+                        //addToQueue(message);
                         Controller.getInstance().onRNSNetworkMessage(this, message);
                         break;
                 }

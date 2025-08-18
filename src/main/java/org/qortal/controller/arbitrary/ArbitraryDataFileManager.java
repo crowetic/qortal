@@ -252,7 +252,7 @@ public class ArbitraryDataFileManager extends Thread {
                 ArbitraryDataFileMessage peersArbitraryDataFileMessage = (ArbitraryDataFileMessage) response;
                 arbitraryDataFile = peersArbitraryDataFileMessage.getArbitraryDataFile();
                 byte[] fileBytes = arbitraryDataFile.getBytes();
-                if (fileBytes == null) {
+                if (fileBytes == null || fileBytes.length == 0) {
                     LOGGER.debug(String.format("Failed to read bytes for file hash %s", hash58));
                     return null;
                 }
@@ -262,14 +262,16 @@ public class ArbitraryDataFileManager extends Thread {
                     LOGGER.debug(String.format("Hash mismatch for chunk: expected %s but got %s",
                         hash58, Base58.encode(actualHash)));
                     return null; 
-                }
+                } 
+     
+        
             } else {
                 LOGGER.debug(String.format("File hash %s already exists, so skipping the request", hash58));
-                arbitraryDataFile = existingFile;
+                arbitraryDataFile = null;
             }
 
             if (arbitraryDataFile != null) {
-
+           
                 arbitraryDataFile.save();
 
                 // If this is a metadata file then we need to update the cache

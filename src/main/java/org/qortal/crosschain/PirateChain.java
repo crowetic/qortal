@@ -21,6 +21,9 @@ import org.qortal.utils.BitTwiddling;
 
 import java.nio.ByteBuffer;
 import java.util.*;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
 public class PirateChain extends Bitcoiny {
@@ -133,11 +136,16 @@ public class PirateChain extends Bitcoiny {
 
 	private final PirateChainNet pirateChainNet;
 
+	// Scheduled executor service to check connection to Pirate Chain server
+	private final ScheduledExecutorService pirateChainCheckScheduler = Executors.newScheduledThreadPool(1);
+
 	// Constructors and instance
 
 	private PirateChain(PirateChainNet pirateChainNet, BitcoinyBlockchainProvider blockchain, Context bitcoinjContext, String currencyCode) {
 		super(blockchain, bitcoinjContext, currencyCode, DEFAULT_FEE_PER_KB);
 		this.pirateChainNet = pirateChainNet;
+
+		pirateChainCheckScheduler.scheduleWithFixedDelay(this::establishConnection, 30, 300, TimeUnit.SECONDS);
 
 		LOGGER.info(() -> String.format("Starting Pirate Chain support using %s", this.pirateChainNet.name()));
 	}
@@ -272,6 +280,7 @@ public class PirateChain extends Bitcoiny {
 	}
 
 	public Long getWalletBalance(String entropy58) throws ForeignBlockchainException {
+
 		synchronized (this) {
 			PirateChainWalletController walletController = PirateChainWalletController.getInstance();
 			walletController.initWithEntropy58(entropy58);
@@ -290,7 +299,30 @@ public class PirateChain extends Bitcoiny {
 		}
 	}
 
+	/**
+	 * Establish Connection
+	 *
+	 * Some methods in this class need to establish a connection before proceeding and this is the best way
+	 * to do it as far as I know.
+	 */
+	private void establishConnection() {
+		try {
+
+			LOGGER.info("Checking Pirate Chain Connection ... ");
+
+			int height;
+			synchronized( this ) {
+				height = this.blockchainProvider.getCurrentHeight();
+			}
+
+			LOGGER.info("Checked Pirate Chain Connection: height = " + height);
+		} catch (ForeignBlockchainException e) {
+			LOGGER.error(e.getMessage(), e);
+		}
+	}
+
 	public List<SimpleTransaction> getWalletTransactions(String entropy58) throws ForeignBlockchainException {
+
 		synchronized (this) {
 			PirateChainWalletController walletController = PirateChainWalletController.getInstance();
 			walletController.initWithEntropy58(entropy58);
@@ -310,8 +342,8 @@ public class PirateChain extends Bitcoiny {
 					if (transactionJson.has("txid")) {
 						String txId = transactionJson.getString("txid");
 						Long timestamp = transactionJson.getLong("datetime");
-						Long amount = transactionJson.getLong("amount");
-						Long fee = transactionJson.getLong("fee");
+						Long amount = 0L;
+						Long fee = 0L;
 						String memo = null;
 
 						if (transactionJson.has("incoming_metadata")) {
@@ -322,7 +354,7 @@ public class PirateChain extends Bitcoiny {
 									if (incomingMetadata.has("value")) {
 										//String address = incomingMetadata.getString("address");
 										Long value = incomingMetadata.getLong("value");
-										amount = value; // TODO: figure out how to parse transactions with multiple incomingMetadata entries
+										amount += value;
 									}
 
 									if (incomingMetadata.has("memo") && !incomingMetadata.isNull("memo")) {
@@ -337,6 +369,11 @@ public class PirateChain extends Bitcoiny {
 							for (int j = 0; j < outgoingMetadatas.length(); j++) {
 								JSONObject outgoingMetadata = outgoingMetadatas.getJSONObject(j);
 
+								if(outgoingMetadata.has("value")) {
+									Long value = outgoingMetadata.getLong("value");
+									amount -= value;
+									fee += MAINNET_FEE; // add the standard fee for each send
+								}
 								if (outgoingMetadata.has("memo") && !outgoingMetadata.isNull("memo")) {
 									memo = outgoingMetadata.getString("memo");
 								}
@@ -349,6 +386,10 @@ public class PirateChain extends Bitcoiny {
 					}
 				}
 			}
+
+			double sum = transactions.stream().mapToDouble(SimpleTransaction::getTotalAmount).sum() / 100000000.0;
+			double fees = transactions.stream().mapToDouble(SimpleTransaction::getFeeAmount).sum() / 100000000.0;
+			LOGGER.info("balance = " + (sum - fees));
 
 			return transactions;
 		}
