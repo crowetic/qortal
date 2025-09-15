@@ -7,6 +7,9 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.qortal.network.message.Message;
 
+import org.qortal.network.ReticulumPeer;
+import static org.apache.commons.codec.binary.Hex.encodeHexString;
+
 public class PeerSendManager {
     private static final Logger LOGGER = LogManager.getLogger(PeerSendManager.class);
 
@@ -17,6 +20,7 @@ public class PeerSendManager {
     private static final long COOLDOWN_DURATION_MS = 20_000;
 
     private final Peer peer;
+    //private final ReticulumPeer rnsPeer;
     private final BlockingQueue<TimedMessage> queue = new LinkedBlockingQueue<>();
     private final ExecutorService executor;
     private final AtomicInteger failureCount = new AtomicInteger(0);
@@ -29,11 +33,22 @@ public class PeerSendManager {
         this.peer = peer;
         this.executor = Executors.newSingleThreadExecutor(r -> {
             Thread t = new Thread(r);
-            t.setName("PeerSendManager-" + peer.getResolvedAddress().getHostString() + "-" + threadCount.getAndIncrement());
+            //t.setName("PeerSendManager-" + peer.getResolvedAddress().getHostString() + "-" + threadCount.getAndIncrement());
+            t.setName("PeerSendManager-" + peer.getPeerIndexString() + "-" + threadCount.getAndIncrement());
             return t;
         });
         start();
     }
+
+    //public PeerSendManager(ReticulumPeer peer) {
+    //    this.rnsPeer = peer;
+    //    this.executor = Executors.newSingleThreadExecutor(r -> {
+    //        Thread t = new Thread(r);
+    //        t.setName("PeerSendManager-" + encodeHexString(peer.getDestinationHash()) + "-" + threadCount.getAndIncrement());
+    //        return t;
+    //    });
+    //    start();
+    //}
 
     private void start() {
         executor.submit(() -> {

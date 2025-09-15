@@ -1,16 +1,16 @@
 package org.qortal.network.task;
 
-import org.qortal.network.RNSNetwork;
-import org.qortal.network.RNSPeer;
+import org.qortal.network.Network;
+import org.qortal.network.ReticulumPeer;
 import org.qortal.network.message.Message;
 import org.qortal.utils.ExecuteProduceConsume.Task;
 
-public class RNSMessageTask implements Task {
-    private final RNSPeer peer;
+public class ReticulumMessageTask implements Task {
+    private final ReticulumPeer peer;
     private final Message nextMessage;
     private final String name;
 
-    public RNSMessageTask(RNSPeer peer, Message nextMessage) {
+    public ReticulumMessageTask(ReticulumPeer peer, Message nextMessage) {
         this.peer = peer;
         this.nextMessage = nextMessage;
         this.name = "MessageTask::" + peer + "::" + nextMessage.getType();

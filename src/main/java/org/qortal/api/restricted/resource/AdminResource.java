@@ -36,6 +36,7 @@ import org.qortal.data.system.DbConnectionInfo;
 import org.qortal.network.Network;
 import org.qortal.network.Peer;
 import org.qortal.network.PeerAddress;
+import org.qortal.network.PeerAddressFactory;
 import org.qortal.repository.ReindexManager;
 import org.qortal.repository.DataException;
 import org.qortal.repository.Repository;
@@ -676,7 +677,8 @@ public class AdminResource {
 
 		try {
 			// Try to resolve passed address to make things easier
-			PeerAddress peerAddress = PeerAddress.fromString(targetPeerAddress);
+			//PeerAddress peerAddress = PeerAddress.fromString(targetPeerAddress);
+            PeerAddress peerAddress = PeerAddressFactory.create("address", targetPeerAddress);
 			InetSocketAddress resolvedAddress = peerAddress.toSocketAddress();
 
 			List<Peer> peers = Network.getInstance().getImmutableHandshakedPeers();
@@ -706,7 +708,9 @@ public class AdminResource {
 			throw ApiExceptionFactory.INSTANCE.createException(request, ApiError.INVALID_DATA);
 		} catch (InterruptedException e) {
 			return SynchronizationResult.NO_BLOCKCHAIN_LOCK.name();
-		}
+		} catch (ReflectiveOperationException e) {
+            throw ApiExceptionFactory.INSTANCE.createException(request, ApiError.INVALID_ADDRESS, e);
+        }
 	}
 
 	@GET

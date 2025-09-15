@@ -20,6 +20,10 @@ public class PeerSendManagement {
         return peerSendManagers.computeIfAbsent(peer.toString(), p -> new PeerSendManager(peer));
     }
 
+    //public PeerSendManager getOrCreateSendManager(ReticulumPeer peer) {
+    //    return peerSendManagers.computeIfAbsent(peer.toString(), p -> new PeerSendManager(peer));
+    //}
+
     private PeerSendManagement() {
 
         ScheduledExecutorService cleaner = Executors.newSingleThreadScheduledExecutor();

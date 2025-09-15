@@ -53,7 +53,10 @@ public class PeerData {
 		this(peerAddress, null, null, null, null, null);
 	}
 
-	// Getters / setters
+    public PeerData(byte[] dhash) {
+    }
+
+    // Getters / setters
 
 	// Don't let JAXB use this getter
 	@XmlTransient

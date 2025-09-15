@@ -5,7 +5,9 @@ import org.apache.logging.log4j.Logger;
 import org.qortal.controller.arbitrary.ArbitraryDataFileManager;
 import org.qortal.network.Network;
 import org.qortal.network.Peer;
+import org.qortal.network.IPPeer;
 import org.qortal.network.PeerAddress;
+import org.qortal.network.IPPeerAddress;
 import org.qortal.settings.Settings;
 import org.qortal.utils.ExecuteProduceConsume.Task;
 import org.qortal.utils.NTP;
@@ -54,7 +56,7 @@ public class ChannelAcceptTask implements Task {
             return;
         }
 
-        PeerAddress address = PeerAddress.fromSocket(socketChannel.socket());
+        PeerAddress address = (PeerAddress) IPPeerAddress.fromSocket(socketChannel.socket());
         List<String> fixedNetwork = Settings.getInstance().getFixedNetwork();
         if (fixedNetwork != null && !fixedNetwork.isEmpty() && network.ipNotInFixedList(address, fixedNetwork)) {
             try {
@@ -119,11 +121,11 @@ public class ChannelAcceptTask implements Task {
 
             LOGGER.debug("Connection accepted from peer {}", address);
 
-            newPeer = new Peer(socketChannel);
+            newPeer = new IPPeer(socketChannel);
             if (isDataPeer) {
                 newPeer.setMaxConnectionAge(Settings.getInstance().getMaxDataPeerConnectionTime() * 1000L);
             }
-            newPeer.setIsDataPeer(isDataPeer);
+            ((IPPeer) newPeer).setIsDataPeer(isDataPeer);
             network.addConnectedPeer(newPeer);
 
         } catch (IOException e) {

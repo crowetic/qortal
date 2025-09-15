@@ -43,7 +43,10 @@ public class ConnectedPeer {
     }
 
     public ConnectedPeer(Peer peer) {
+
         this.direction = peer.isOutbound() ? Direction.OUTBOUND : Direction.INBOUND;
+        //this.handshakeStatus = peer.getHandshakeStatus();
+        //this.lastPing = peer.getLastPing();
         this.handshakeStatus = peer.getHandshakeStatus();
         this.lastPing = peer.getLastPing();
 

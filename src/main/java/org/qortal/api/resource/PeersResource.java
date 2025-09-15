@@ -24,6 +24,7 @@ import org.qortal.data.network.PeerData;
 import org.qortal.network.Network;
 import org.qortal.network.Peer;
 import org.qortal.network.PeerAddress;
+import org.qortal.network.PeerAddressFactory;
 import org.qortal.repository.DataException;
 import org.qortal.repository.Repository;
 import org.qortal.repository.RepositoryManager;
@@ -196,7 +197,8 @@ public class PeersResource {
 			throw ApiExceptionFactory.INSTANCE.createException(request, ApiError.NO_TIME_SYNC);
 
 		try {
-			PeerAddress peerAddress = PeerAddress.fromString(address);
+            //PeerAddress peerAddress = PeerAddress.fromString(address);
+            PeerAddress peerAddress = PeerAddressFactory.create("address", address);
 
 			List<PeerAddress> newPeerAddresses = new ArrayList<>(1);
 			newPeerAddresses.add(peerAddress);
@@ -208,7 +210,9 @@ public class PeersResource {
 			throw ApiExceptionFactory.INSTANCE.createException(request, ApiError.INVALID_NETWORK_ADDRESS);
 		} catch (DataException e) {
 			throw ApiExceptionFactory.INSTANCE.createException(request, ApiError.REPOSITORY_ISSUE, e);
-		}
+		} catch (ReflectiveOperationException e) {
+            throw ApiExceptionFactory.INSTANCE.createException(request, ApiError.INVALID_ADDRESS, e);
+        }
 	}
 
 	@DELETE
@@ -247,7 +251,8 @@ public class PeersResource {
 		Security.checkApiCallAllowed(request);
 
 		try {
-			PeerAddress peerAddress = PeerAddress.fromString(address);
+			//PeerAddress peerAddress = PeerAddress.fromString(address);
+            PeerAddress peerAddress = PeerAddressFactory.create("address", address);
 
 			boolean wasKnown = Network.getInstance().forgetPeer(peerAddress);
 			return wasKnown ? "true" : "false";
@@ -257,7 +262,9 @@ public class PeersResource {
 			throw e;
 		} catch (DataException e) {
 			throw ApiExceptionFactory.INSTANCE.createException(request, ApiError.REPOSITORY_ISSUE, e);
-		}
+		} catch (ReflectiveOperationException e) {
+            throw ApiExceptionFactory.INSTANCE.createException(request, ApiError.INVALID_ADDRESS, e);
+        }
 	}
 
 	@DELETE
@@ -324,7 +331,8 @@ public class PeersResource {
 
 		try {
 			// Try to resolve passed address to make things easier
-			PeerAddress peerAddress = PeerAddress.fromString(targetPeerAddress);
+			//PeerAddress peerAddress = PeerAddress.fromString(targetPeerAddress);
+            PeerAddress peerAddress = PeerAddressFactory.create("address", targetPeerAddress);
 			InetSocketAddress resolvedAddress = peerAddress.toSocketAddress();
 
 			List<Peer> peers = Network.getInstance().getImmutableHandshakedPeers();
@@ -349,7 +357,9 @@ public class PeersResource {
 		} catch (UnknownHostException e) {
 			throw ApiExceptionFactory.INSTANCE.createException(request, ApiError.INVALID_DATA);
 		} catch (DataException e) {
-			throw ApiExceptionFactory.INSTANCE.createException(request, ApiError.REPOSITORY_ISSUE, e);
+            throw ApiExceptionFactory.INSTANCE.createException(request, ApiError.REPOSITORY_ISSUE, e);
+        } catch (ReflectiveOperationException e) {
+            throw ApiExceptionFactory.INSTANCE.createException(request, ApiError.INVALID_ADDRESS, e);
 		} catch (InterruptedException e) {
 			return null;
 		}

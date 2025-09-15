@@ -934,8 +934,14 @@ public class Network {
     }
 
     public void peerMisbehaved(Peer peer) {
-        PeerData peerData = peer.getPeerData();
-        peerData.setLastMisbehaved(NTP.getTime());
+        try {
+            if (Class.forName("org.qortal.network.Peer").isInstance(peer)) {
+                PeerData peerData = (PeerData) peer.getPeerData();
+                peerData.setLastMisbehaved(NTP.getTime());
+            }
+        } catch(ClassNotFoundException e){
+            LOGGER.error("class 'Peer' not found", e);
+        }
     }
 
     /**
