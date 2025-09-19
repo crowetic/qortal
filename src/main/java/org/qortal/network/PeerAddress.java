@@ -8,11 +8,8 @@ import java.net.UnknownHostException;
 
 public interface PeerAddress {
 
-    //static PeerAddress fromSocket(Socket socket) {
-    //    //return null;
-    //}
-    default PeerAddress fromSocket(Socket socket) { return null; }
-    default PeerAddress fromString(String address) { return null; }
+    //default PeerAddress fromSocket(Socket socket) { return null; }
+    //default PeerAddress fromString(String address) { return null; }
     InetSocketAddress toSocketAddress() throws UnknownHostException;
 
     default String getHost() { return null; }

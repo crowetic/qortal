@@ -178,6 +178,12 @@ public class IPPeer implements Peer {
     public IPPeer(PeerData peerData) {
         this.isOutbound = true;
         this.peerData = peerData;
+        try {
+            InetAddress addr = InetAddress.getByName(peerData.getAddress().toString());
+            this.isLocal = isAddressLocal(addr);
+        } catch (UnknownHostException e) {
+            LOGGER.error("Cannot get IP address from " + peerData.getAddress().toString(), e);
+        }
     }
 
     /**
@@ -196,19 +202,19 @@ public class IPPeer implements Peer {
         this.peerData = new PeerData(peerAddress);
     }
 
-    /** 
-     * interface to instance
-     */
-    public IPPeer unwrap() {
-        //return (actualClass) this;
-        //return (T) this;
-        return (IPPeer) this;
-        //Class<?> actualClass = this.getClass();
-        //return (actualClass) this;
-    }
-    //public <T> T unwrap(Class<T> clazz) {
-    //    return clazz.cast(this);
+    ///**
+    // * interface to instance
+    // */
+    //public IPPeer unwrap() {
+    //    //return (actualClass) this;
+    //    //return (T) this;
+    //    return (IPPeer) this;
+    //    //Class<?> actualClass = this.getClass();
+    //    //return (actualClass) this;
     //}
+    ////public <T> T unwrap(Class<T> clazz) {
+    ////    return clazz.cast(this);
+    ////}
 
     // Getters / setters
 
@@ -274,7 +280,7 @@ public class IPPeer implements Peer {
 
     }
 
-    protected void resetHandshakeMessagePending() {
+    public void resetHandshakeMessagePending() {
         this.handshakeMessagePending = false;
     }
 
@@ -712,7 +718,7 @@ public class IPPeer implements Peer {
         }
     }
 
-    protected Task getMessageTask() {
+    public Task getMessageTask() {
         /*
          * If we are still handshaking and there is a message yet to be processed then
          * don't produce another message task. This allows us to process handshake
@@ -852,13 +858,13 @@ public class IPPeer implements Peer {
         }
     }
 
-    protected void startPings() {
+    public void startPings() {
         // Replacing initial null value allows getPingTask() to start sending pings.
         LOGGER.trace("[{}] Enabling pings for peer {}", this.peerConnectionId, this);
         this.lastPingSent = NTP.getTime();
     }
 
-    protected Task getPingTask(Long now) {
+    public Task getPingTask(Long now) {
         // Pings not enabled yet?
         if (now == null || this.lastPingSent == null) {
             return null;

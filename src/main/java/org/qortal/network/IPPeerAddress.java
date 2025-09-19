@@ -14,13 +14,13 @@ import java.net.*;
  */
 // All properties to be converted to JSON via JAXB
 @XmlAccessorType(XmlAccessType.FIELD)
-public class IPPeerAddress {
+public class IPPeerAddress implements PeerAddress {
 
 	// Properties
 	private String host;
 	private int port;
 
-  @PeerAddressCtor("host-port")
+    @PeerAddressCtor("host-port")
 	private IPPeerAddress(String host, int port) {
 		this.host = host;
 		this.port = port;

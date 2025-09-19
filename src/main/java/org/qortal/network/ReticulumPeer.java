@@ -32,6 +32,7 @@ import static io.reticulum.identity.IdentityKnownDestination.recall;
 //import static io.reticulum.identity.IdentityKnownDestination.recallAppData;
 import io.reticulum.buffer.Buffer;
 import io.reticulum.buffer.BufferedRWPair;
+import org.qortal.network.RNSCommon.ReticulumPeerType;
 import static io.reticulum.utils.IdentityUtils.concatArrays;
 
 import lombok.Getter;
@@ -44,6 +45,7 @@ import org.qortal.network.message.MessageType;
 import org.qortal.network.message.PingMessage;
 import org.qortal.network.message.*;
 import org.qortal.network.message.MessageException;
+import org.qortal.network.task.MessageTask;
 import org.qortal.network.task.ReticulumMessageTask;
 import org.qortal.network.task.ReticulumPingTask;
 import org.qortal.settings.Settings;
@@ -87,7 +89,7 @@ public class ReticulumPeer implements Peer {
 
     private byte[] destinationHash;   // remote destination hash
     Destination peerDestination;      // OUT destination created for this
-    RNSCommon.RNSDestinationType destinationType;
+    ReticulumPeerType peerType;
     private Identity serverIdentity;
     @Setter(AccessLevel.PACKAGE) private Instant creationTimestamp;
     @Setter(AccessLevel.PACKAGE) private Instant lastAccessTimestamp;
@@ -176,6 +178,7 @@ public class ReticulumPeer implements Peer {
     /**
      * Constructor for initiator peers
      */
+    @PeerCtor("destination-hash")
     public ReticulumPeer(byte[] dhash) {
         this.destinationHash = dhash;
         this.serverIdentity = recall(dhash);
@@ -191,6 +194,7 @@ public class ReticulumPeer implements Peer {
     /**
      * Constructor for non-initiator peers
      */
+    @PeerCtor("link")
     public ReticulumPeer(Link link) {
         this.peerLink = link;
         //this.peerLinkId = link.getLinkId();
@@ -529,7 +533,7 @@ public class ReticulumPeer implements Peer {
     }
 
     /**
-     * Set a packet to remote with the message format "close::<our_destination_hash>"
+     * Send a packet to remote with the message format "close::<our_destination_hash>"
      * This method is only useful for non-initiator links to close the remote initiator.
      *
      * @param link
@@ -799,7 +803,7 @@ public class ReticulumPeer implements Peer {
         }
     }
 
-    protected Task getMessageTask() {
+    public Task getMessageTask() {
         /*
          * If our peerLink is not in ACTIVE node and there is a message yet to be
          * processed then don't produce another message task.
@@ -816,7 +820,8 @@ public class ReticulumPeer implements Peer {
         }
 
         // Return a task to process message in queue
-        return new ReticulumMessageTask(this, nextMessage);
+        //return new ReticulumMessageTask(this, nextMessage);
+        return new MessageTask(this, nextMessage);
     }
 
     /**
@@ -845,13 +850,13 @@ public class ReticulumPeer implements Peer {
         }
     }
 
-    protected void startPings() {
+    public void startPings() {
         log.trace("[{}] Enabling pings for peer {}",
                 peerLink.getDestination().getHexHash(), this.toString());
         this.lastPingSent = NTP.getTime();
     }
 
-    protected Task getPingTask(Long now) {
+    public Task getPingTask(Long now) {
         // Pings not enabled yet?
         if (now == null || this.lastPingSent == null) {
             return null;
@@ -986,6 +991,11 @@ public class ReticulumPeer implements Peer {
         return linkEstablishedTime;
     }
 
+    public long getMaxConnectionAge() {
+        // We never want to get disconnected automatically
+        return System.currentTimeMillis() - linkEstablishedTime + 1000L;
+    }
+
     /**
      * legacy Peer compatibility
      */
@@ -1064,6 +1074,23 @@ public class ReticulumPeer implements Peer {
             this.lastPing = lastPing;
         //}
     }
+
+    @Override
+    public void setIsDataPeer(boolean b) {
+        setPeerType(ReticulumPeerType.BASE);
+        if (isTrue(b)) {
+            setPeerType(ReticulumPeerType.DATA);
+        }
+    }
+
+    public boolean isDataPeer () {
+        var result = false;
+        if (this.getPeerType() == RNSCommon.ReticulumPeerType.DATA) {
+            result = true;
+        }
+        return result;
+    }
+
     // end legacy Peer compatibility
 
 }
