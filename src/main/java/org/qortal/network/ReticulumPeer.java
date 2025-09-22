@@ -32,7 +32,8 @@ import static io.reticulum.identity.IdentityKnownDestination.recall;
 //import static io.reticulum.identity.IdentityKnownDestination.recallAppData;
 import io.reticulum.buffer.Buffer;
 import io.reticulum.buffer.BufferedRWPair;
-import org.qortal.network.RNSCommon.ReticulumPeerType;
+import org.qortal.network.RNSCommon.PeerAspect;
+//import org.qortal.network.RNSCommon.PeerType;
 import static io.reticulum.utils.IdentityUtils.concatArrays;
 
 import lombok.Getter;
@@ -89,7 +90,8 @@ public class ReticulumPeer implements Peer {
 
     private byte[] destinationHash;   // remote destination hash
     Destination peerDestination;      // OUT destination created for this
-    ReticulumPeerType peerType;
+    PeerAspect peerAspect;       // based on Destination
+    //PeerType peerKind = PeerType.RETICULUM;
     private Identity serverIdentity;
     @Setter(AccessLevel.PACKAGE) private Instant creationTimestamp;
     @Setter(AccessLevel.PACKAGE) private Instant lastAccessTimestamp;
@@ -189,6 +191,7 @@ public class ReticulumPeer implements Peer {
         this.replyQueues = new ConcurrentHashMap<>();
         this.pendingMessages = new LinkedBlockingQueue<>();
         this.peerData = new PeerData(dhash);
+        //this.peerData.setPeerType(PeerType.RETICULUM);
     }
 
     /**
@@ -212,6 +215,7 @@ public class ReticulumPeer implements Peer {
         //this.peerLink.setLinkClosedCallback(this::linkClosed);
         //this.peerLink.setPacketCallback(this::linkPacketReceived);
         this.peerData = new PeerData(this.destinationHash);
+        //this.peerData.setPeerType(PeerType.RETICULUM);
     }
 
     /** 
@@ -663,6 +667,8 @@ public class ReticulumPeer implements Peer {
 
     /** qortal networking specific (Tasks) */
 
+    // Send Ping Message to peer through buffer.
+    // Note: This keeps Buffer,Channel and Link alive and from timing out.
     private void onPingMessage(ReticulumPeer peer, Message message) {
         PingMessage pingMessage = (PingMessage) message;
     
@@ -672,6 +678,7 @@ public class ReticulumPeer implements Peer {
             this.peerBuffer.write(pongMessage.toBytes());
             this.peerBuffer.flush();
             this.lastAccessTimestamp = Instant.now();
+            setLastPingSent(Instant.now().toEpochMilli());
         } catch (MessageException e) {
             //log.error("{} from peer {}", e.getMessage(), this);
             log.error("{} from peer {}", e, this);
@@ -1077,15 +1084,15 @@ public class ReticulumPeer implements Peer {
 
     @Override
     public void setIsDataPeer(boolean b) {
-        setPeerType(ReticulumPeerType.BASE);
+        setPeerAspect(PeerAspect.BASE);
         if (isTrue(b)) {
-            setPeerType(ReticulumPeerType.DATA);
+            setPeerAspect(PeerAspect.DATA);
         }
     }
 
     public boolean isDataPeer () {
         var result = false;
-        if (this.getPeerType() == RNSCommon.ReticulumPeerType.DATA) {
+        if (this.getPeerAspect() == RNSCommon.PeerAspect.DATA) {
             result = true;
         }
         return result;

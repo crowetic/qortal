@@ -40,7 +40,6 @@ import lombok.Synchronized;
 import org.apache.commons.lang3.StringUtils;
 import org.qortal.repository.DataException;
 import org.qortal.settings.Settings;
-//import org.qortal.network.RNSCommon.ReticulumPeerType;
 
 import java.io.BufferedReader;
 import java.io.IOException;
@@ -107,7 +106,7 @@ import com.google.common.collect.Maps;
 @Slf4j
 public class RNS {
 
-    Reticulum reticulum;
+    public Reticulum reticulum;
     //private static final String APP_NAME = "qortal";
     static final String APP_NAME = Settings.getInstance().isTestNet() ? RNSCommon.TESTNET_APP_NAME: RNSCommon.MAINNET_APP_NAME;
     static final Integer TARGET_PORT = Settings.getInstance().isTestNet() ? RNSCommon.TESTNET_IF_TCP_PORT: RNSCommon.MAINNET_IF_TCP_PORT;
@@ -422,7 +421,7 @@ public class RNS {
         log.info("baseClientConnected - link hash: {}, {}", link.getHash(), encodeHexString(link.getHash()));
         ReticulumPeer newPeer = new ReticulumPeer(link);
         newPeer.setPeerLinkHash(link.getHash());
-        newPeer.setPeerType(RNSCommon.ReticulumPeerType.BASE);
+        newPeer.setPeerAspect(RNSCommon.PeerAspect.BASE);
         newPeer.setMessageMagic(getMessageMagic());
         // make sure the peer has a channel and buffer
         newPeer.getOrInitPeerBuffer();
@@ -436,7 +435,7 @@ public class RNS {
         log.info("dataClientConnected - link hash: {}, {}", link.getHash(), encodeHexString(link.getHash()));
         ReticulumPeer newPeer = new ReticulumPeer(link);
         newPeer.setPeerLinkHash(link.getHash());
-        newPeer.setPeerType(RNSCommon.ReticulumPeerType.DATA);
+        newPeer.setPeerAspect(RNSCommon.PeerAspect.DATA);
         newPeer.setMessageMagic(getMessageMagic());
         // make sure the peer has a channel and buffer
         newPeer.getOrInitPeerBuffer();
@@ -524,9 +523,9 @@ public class RNS {
                 if (!peerExists) {
                     ReticulumPeer newPeer = getNewPeer(destinationHash, announcedIdentity);
                     addLinkedPeer(newPeer);
-                    //Network.getInstance().addOutboundHandshakedPeer(newPeer);
+                    Network.getInstance().addHandshakedPeer(newPeer);
                     log.info("added new {} ReticulumPeer, destinationHash: {}",
-                            newPeer.getPeerType(), encodeHexString(destinationHash));
+                            newPeer.getPeerAspect(), encodeHexString(destinationHash));
                 }
             }
             // Chance to announce instead of waiting for next pruning.
@@ -539,9 +538,9 @@ public class RNS {
             newPeer.setServerIdentity(announcedIdentity);
             newPeer.setIsInitiator(true);
             if (getAspectFilter() == "qortal.data") {
-                newPeer.setPeerType(RNSCommon.ReticulumPeerType.DATA);
+                newPeer.setPeerAspect(RNSCommon.PeerAspect.DATA);
             } else {
-                newPeer.setPeerType(RNSCommon.ReticulumPeerType.BASE);
+                newPeer.setPeerAspect(RNSCommon.PeerAspect.BASE);
             }
             //if (aspectFilter == "qortal.qdn") {
             //    // data peer
@@ -684,6 +683,8 @@ public class RNS {
         List<ReticulumPeer> initiatorActivePeerList = getActiveImmutableLinkedPeers();
         List<ReticulumPeer> incomingPeerList = getImmutableIncomingPeers();
         int numActiveIncomingPeers = incomingPeerList.size() - getNonActiveIncomingPeers().size();
+        List<PeerData> allKnownReticulumPeers = new ArrayList<>();
+        var network = Network.getInstance();
         log.info("number of links (linkedPeers (active) / incomingPeers (active) before prunig: {} ({}), {} ({})",
                 initiatorPeerList.size(), getActiveImmutableLinkedPeers().size(),
                 incomingPeerList.size(), numActiveIncomingPeers);
@@ -697,6 +698,7 @@ public class RNS {
                 if (p.getPeerTimedOut()) {
                     // options: keep in case peer reconnects or remove => we'll remove it
                     removeLinkedPeer(p);
+                    network.removeHandshakedPeer(p);
                     continue;
                 }
                 if (pLink.getStatus() == ACTIVE) {
@@ -704,11 +706,13 @@ public class RNS {
                 }
                 if ((pLink.getStatus() == CLOSED) || (p.getDeleteMe()))  {
                     removeLinkedPeer(p);
+                    network.removeHandshakedPeer(p);
                     continue;
                 }
                 if (pLink.getStatus() == PENDING) {
                     pLink.teardown();
                     removeLinkedPeer(p);
+                    network.removeOutboundHandshakedPeer(p);
                     continue;
                 }
             }

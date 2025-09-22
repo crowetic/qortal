@@ -26,10 +26,13 @@ public class ReticulumPeerAddress implements PeerAddress {
 	protected ReticulumPeerAddress() {
 	}
 
-    @PeerAddressCtor("destination")
+    @PeerAddressCtor("destination-hash")
 	public ReticulumPeerAddress(byte[] dhash) {
       this.dhash = dhash;
   }
+
+    @Override
+    public byte[] getDestinationHash() { return dhash; }
 
     public static ReticulumPeerAddress fromString(String addressString) throws IllegalArgumentException {
         return null;

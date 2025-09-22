@@ -4,6 +4,7 @@ import org.qortal.controller.Controller;
 import org.qortal.data.block.BlockSummaryData;
 import org.qortal.data.block.CommonBlockData;
 import org.qortal.data.network.PeerData;
+import org.qortal.network.RNSCommon.PeerType;
 import org.qortal.network.message.Message;
 import org.qortal.utils.ExecuteProduceConsume.Task;
 
@@ -47,6 +48,10 @@ public interface Peer {
     long getConnectionEstablishedTime();
     Long getLastTooDivergentTime();
     boolean sendMessageWithTimeoutNow(Message message, int timeout);
+    //PeerType getPeerType();
+    void setPeersNodeId(String nodeAddress);
+    String getPeersNodeId();
+    boolean isStopping();
 
     // legacy from old Peer implementation as class (now IPPeer)
     public static final Pattern VERSION_PATTERN = Pattern.compile(Controller.VERSION_PREFIX
@@ -65,7 +70,6 @@ public interface Peer {
         return null;
     }
     String getPeersVersionString();
-    String getPeersNodeId();
     default UUID getPeerConnectionId() {
         return null;
     };
@@ -76,9 +80,7 @@ public interface Peer {
     default void setPeersChallenge(byte[] peersChallenge) { return; }
     default byte[] getOurChallenge() { return  null; }
     default byte[] getPeersPublicKey() { return null; }
-    void setPeersNodeId(String nodeAddress);
     default byte[] getPeersChallenge() { return null; }
-    boolean isStopping();
     default void setHandshakeStatus(Handshake handshake) { return; }
     default InetSocketAddress getResolvedAddress() { return null; }
     Message getResponseWithTimeout(Message getArbitraryDataFileMessage, int arbitraryRequestTimeout) throws InterruptedException;
