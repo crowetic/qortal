@@ -1701,6 +1701,7 @@ public class Network {
             }
         }
         // shut down Reticulum
+        LOGGER.info("Shutting down Reticulum...");
         RNS.getInstance().getReticulum().exitHandler();
     }
 
