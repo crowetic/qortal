@@ -180,13 +180,13 @@ public class IPPeer implements Peer {
     public IPPeer(PeerData peerData) {
         this.isOutbound = true;
         this.peerData = peerData;
-        //this.peerData.setPeerType(PeerType.IP);
-        try {
-            InetAddress addr = InetAddress.getByName(peerData.getAddress().toString());
-            this.isLocal = isAddressLocal(addr);
-        } catch (UnknownHostException e) {
-            LOGGER.error("Cannot get IP address from " + peerData.getAddress().toString(), e);
-        }
+        ////this.peerData.setPeerType(PeerType.IP);
+        //try {
+        //    InetAddress addr = InetAddress.getByName(peerData.getAddress().toString());
+        //    this.isLocal = isAddressLocal(addr);
+        //} catch (UnknownHostException e) {
+        //    LOGGER.error("Cannot get IP address from " + peerData.getAddress().toString(), e);
+        //}
     }
 
     /**
