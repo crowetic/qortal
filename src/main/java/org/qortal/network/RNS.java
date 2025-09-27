@@ -104,7 +104,7 @@ import com.google.common.collect.Maps;
 
 @Data
 @Slf4j
-public class RNS {
+public class RNS extends Thread {
 
     public Reticulum reticulum;
     //private static final String APP_NAME = "qortal";
@@ -177,7 +177,8 @@ public class RNS {
     }
 
     // Note: potentially create persistent serverIdentity (utility rnid) and load it from file
-    public void start() throws IOException, DataException {
+    //public void start() throws IOException, DataException {
+    public void start() {
 
         // create identity either from file or new (creating new keys)
         var serverIdentityPath = reticulum.getStoragePath().resolve("identities/"+APP_NAME);
@@ -362,7 +363,7 @@ public class RNS {
             //log.debug("peer: {}", p);
             p.shutdown();
             try {
-                TimeUnit.SECONDS.sleep(1); // allow for peers to disconnect gracefully
+                TimeUnit.MILLISECONDS.sleep(200); // allow for peers to disconnect gracefully
             } catch (InterruptedException e) {
                 log.error("exception: ", e);
             }

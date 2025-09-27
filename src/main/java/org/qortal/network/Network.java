@@ -170,6 +170,9 @@ public class Network {
         minOutboundPeers = Settings.getInstance().getMinOutboundPeers();
         maxPeers = Settings.getInstance().getMaxPeers();
 
+        // Instantiate Reticulum
+        rns = RNS.getInstance();
+
         // We'll use a cached thread pool but with more aggressive timeout.
         ExecutorService networkExecutor = new ThreadPoolExecutor(2,
                 Settings.getInstance().getMaxNetworkThreadPoolSize(),
@@ -177,12 +180,13 @@ public class Network {
                 new SynchronousQueue<Runnable>(),
                 new NamedThreadFactory("Network-EPC", Settings.getInstance().getNetworkThreadPriority()));
         networkEPC = new NetworkProcessor(networkExecutor);
-
-        // Initialize Reticulum
-        rns = RNS.getInstance();
     }
 
     public void start() throws IOException, DataException {
+
+        // initialize Retciculum and start Reticulum thread
+        rns.start();
+
         // Grab P2P port from settings
         int listenPort = Settings.getInstance().getListenPort();
 
@@ -261,9 +265,6 @@ public class Network {
         else {
             UPnP.closePortTCP(Settings.getInstance().getListenPort());
         }
-
-        // start Retciculum
-        rns.start();
 
         // Start up first networking thread
         networkEPC.start();
@@ -1497,6 +1498,9 @@ public class Network {
             return;
         }
 
+        // prune ReticulumPeer(s), primarily any peer that has no ACTIVE link
+        RNS.getInstance().prunePeers();
+
         // Disconnect peers that are stuck during handshake
         // Needs a mutable copy of the unmodifiableList
         List<Peer> handshakePeers = new ArrayList<>(this.getImmutableConnectedPeers());
@@ -1543,9 +1547,6 @@ public class Network {
                 this.allKnownPeers.remove(peerData);
             }
         }
-
-        // prune ReticulumPeer(s), primarily any peer that has no ACTIVE link
-        RNS.getInstance().prunePeers();
     }
 
     public boolean mergePeers(String addedBy, long addedWhen, List<PeerAddress> peerAddresses) throws DataException {
@@ -1641,6 +1642,31 @@ public class Network {
             }
         }
 
+        //// shutdown Reticulum peers and instance
+        //// gracefully close links of peers that point to us
+        //for (ReticulumPeer p: RNS.getInstance().getIncomingPeers()) {
+        //    var pl = p.getPeerLink();
+        //    if (nonNull(pl) & (pl.getStatus() == ACTIVE)) {
+        //        p.sendCloseToRemote(pl);
+        //    }
+        //}
+        //// gracefully disconnect outgoing peers
+        //for (ReticulumPeer p: RNS.getInstance().getLinkedPeers()) {
+        //    LOGGER.info("shutting down peer: {}", encodeHexString(p.getDestinationHash()));
+        //    p.shutdown();
+        //    try {
+        //        TimeUnit.SECONDS.sleep(1); // allow for peers to disconnect gracefully
+        //    } catch (InterruptedException e) {
+        //        LOGGER.error("exception: ", e);
+        //    }
+        //}
+        //// shut down Reticulum
+        //LOGGER.info("Shutting down Reticulum...");
+        //RNS.getInstance().getReticulum().exitHandler();
+
+        // shutdown Reticulum, try to gracefully shut down peers
+        rns.shutdown();
+
         // Stop processing threads
         try {
             if (!this.networkEPC.shutdown(5000)) {
@@ -1681,28 +1707,6 @@ public class Network {
         for (Peer peer : this.getImmutableConnectedPeers()) {
             peer.shutdown();
         }
-
-        // shutdown Reticulum peers and instance
-        // gracefully close links of peers that point to us
-        for (ReticulumPeer p: RNS.getInstance().getIncomingPeers()) {
-            var pl = p.getPeerLink();
-            if (nonNull(pl) & (pl.getStatus() == ACTIVE)) {
-                p.sendCloseToRemote(pl);
-            }
-        }
-        // gracefully disconnect outgoing peers
-        for (ReticulumPeer p: RNS.getInstance().getLinkedPeers()) {
-            LOGGER.info("shutting down peer: {}", encodeHexString(p.getDestinationHash()));
-            p.shutdown();
-            try {
-                TimeUnit.SECONDS.sleep(1); // allow for peers to disconnect gracefully
-            } catch (InterruptedException e) {
-                LOGGER.error("exception: ", e);
-            }
-        }
-        // shut down Reticulum
-        LOGGER.info("Shutting down Reticulum...");
-        RNS.getInstance().getReticulum().exitHandler();
     }
 
 }
