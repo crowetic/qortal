@@ -104,7 +104,8 @@ import com.google.common.collect.Maps;
 
 @Data
 @Slf4j
-public class RNS extends Thread {
+public class RNS {
+//public class RNS extends Thread {
 
     public Reticulum reticulum;
     //private static final String APP_NAME = "qortal";
@@ -113,7 +114,8 @@ public class RNS extends Thread {
     //static final String defaultConfigPath = ".reticulum"; // if empty will look in Reticulums default paths
     static final String defaultConfigPath = Settings.getInstance().isTestNet() ? RNSCommon.defaultRNSConfigPathTestnet: RNSCommon.defaultRNSConfigPath;
     private final int MAX_PEERS = Settings.getInstance().getReticulumMaxPeers();
-    private final int MIN_DESIRED_PEERS = Settings.getInstance().getReticulumMinDesiredPeers();
+    private final int MIN_DESIRED_CORE_PEERS = Settings.getInstance().getReticulumMinDesiredCorePeers();
+    private final int MIN_DESIRED_DATA_PEERS = Settings.getInstance().getReticulumMinDesiredDataPeers();
     // How long [ms] between pruning of peers
 	private long PRUNE_INTERVAL = 1 * 64 * 1000L; // ms;
     
@@ -137,7 +139,7 @@ public class RNS extends Thread {
     //private final ExecuteProduceConsume rnsNetworkEPC;
     private static final long NETWORK_EPC_KEEPALIVE = 1000L; // 1 second
     private int totalThreadCount = 0;
-    private final int reticulumMaxNetworkThreadPoolSize = Settings.getInstance().getReticulumMaxNetworkThreadPoolSize();
+    //private final int reticulumMaxNetworkThreadPoolSize = Settings.getInstance().getReticulumMaxNetworkThreadPoolSize();
 
     // replicating a feature from Network.class needed in for base Message.java,
     // just in case the classic TCP/IP Networking is turned off.
@@ -157,7 +159,7 @@ public class RNS extends Thread {
     //private static final Logger logger = LoggerFactory.getLogger(RNS.class);
     
     // Constructor
-    private RNS () {
+    public RNS () {
         log.info("RNS constructor");
         try {
             //String configPath = new java.io.File(defaultConfigPath).getCanonicalPath();
@@ -479,6 +481,7 @@ public class RNS extends Thread {
         public void receivedAnnounce(byte[] destinationHash, Identity announcedIdentity, byte[] appData) {
             var peerExists = false;
             var activePeerCount = 0; 
+            //var network = Network.getInstance();
 
             log.info("Received an announce from {}", encodeHexString(destinationHash));
 
@@ -524,32 +527,24 @@ public class RNS extends Thread {
                 if (!peerExists) {
                     ReticulumPeer newPeer = getNewPeer(destinationHash, announcedIdentity);
                     addLinkedPeer(newPeer);
-                    Network.getInstance().addHandshakedPeer(newPeer);
+                    //network.addHandshakedPeer(newPeer);
                     log.info("added new {} ReticulumPeer, destinationHash: {}",
                             newPeer.getPeerAspect(), encodeHexString(destinationHash));
                 }
             }
-            // Chance to announce instead of waiting for next pruning.
-            // Note: good in theory but leads to ping-pong of announces => not a good idea!
-            //maybeAnnounce(getBaseDestination());
         }
 
         private ReticulumPeer getNewPeer(byte[] destinationHash, Identity announcedIdentity) {
             ReticulumPeer newPeer = new ReticulumPeer(destinationHash);
             newPeer.setServerIdentity(announcedIdentity);
             newPeer.setIsInitiator(true);
-            if (getAspectFilter() == "qortal.data") {
+            if (getAspectFilter() == "qortal.qdn") {
+                // data peer
                 newPeer.setPeerAspect(RNSCommon.PeerAspect.DATA);
             } else {
+                // core peer
                 newPeer.setPeerAspect(RNSCommon.PeerAspect.BASE);
             }
-            //if (aspectFilter == "qortal.qdn") {
-            //    // data peer
-            //    newPeer.setDestinationType(RNSCommon.RNSDestinationType.DATA);
-            //} else {
-            //    // core peer
-            //    newPeer.setDestinationType(RNSCommon.RNSDestinationType.BASE);
-            //}
             newPeer.setMessageMagic(getMessageMagic());
             return newPeer;
         }
@@ -581,6 +576,8 @@ public class RNS extends Thread {
     public void addLinkedPeer(ReticulumPeer peer) {
         this.linkedPeers.add(peer);
         this.immutableLinkedPeers = List.copyOf(this.linkedPeers); // thread safe
+        //var network = Network.getInstance();
+        //network.addHandshakedPeer(peer);
     }
 
     public void removeLinkedPeer(ReticulumPeer peer) {
@@ -592,6 +589,9 @@ public class RNS extends Thread {
         }
         var p = this.linkedPeers.remove(this.linkedPeers.indexOf(peer)); // thread safe
         this.immutableLinkedPeers = List.copyOf(this.linkedPeers);
+        // TODO: which list in network do we add ACTIVE ReticulumPeer ?
+        //var network = Network.getInstance();
+        //network.removeHandshakedPeer(peer);
     }
 
     // note: we already have a lobok getter for this
@@ -685,7 +685,7 @@ public class RNS extends Thread {
         List<ReticulumPeer> incomingPeerList = getImmutableIncomingPeers();
         int numActiveIncomingPeers = incomingPeerList.size() - getNonActiveIncomingPeers().size();
         List<PeerData> allKnownReticulumPeers = new ArrayList<>();
-        var network = Network.getInstance();
+        //var network = Network.getInstance();
         log.info("number of links (linkedPeers (active) / incomingPeers (active) before prunig: {} ({}), {} ({})",
                 initiatorPeerList.size(), getActiveImmutableLinkedPeers().size(),
                 incomingPeerList.size(), numActiveIncomingPeers);
@@ -699,7 +699,7 @@ public class RNS extends Thread {
                 if (p.getPeerTimedOut()) {
                     // options: keep in case peer reconnects or remove => we'll remove it
                     removeLinkedPeer(p);
-                    network.removeHandshakedPeer(p);
+                    //network.removeHandshakedPeer(p);
                     continue;
                 }
                 if (pLink.getStatus() == ACTIVE) {
@@ -707,13 +707,13 @@ public class RNS extends Thread {
                 }
                 if ((pLink.getStatus() == CLOSED) || (p.getDeleteMe()))  {
                     removeLinkedPeer(p);
-                    network.removeHandshakedPeer(p);
+                    //network.removeHandshakedPeer(p);
                     continue;
                 }
                 if (pLink.getStatus() == PENDING) {
                     pLink.teardown();
                     removeLinkedPeer(p);
-                    network.removeOutboundHandshakedPeer(p);
+                    //network.removeOutboundHandshakedPeer(p);
                     continue;
                 }
             }
@@ -744,14 +744,27 @@ public class RNS extends Thread {
         log.info("number of links (linkedPeers (active) / incomingPeers (active) after prunig: {} ({}), {} ({})",
                 initiatorPeerList.size(), getActiveImmutableLinkedPeers().size(),
                 incomingPeerList.size(), numActiveIncomingPeers);
-        maybeAnnounce(getBaseDestination());
-        //maybeAnnouce(getDataDestination());
+        maybeAnnounce(getBaseDestination(), RNSCommon.PeerAspect.BASE);
+        maybeAnnounce(getDataDestination(), RNSCommon.PeerAspect.DATA);
     }
 
-    public void maybeAnnounce(Destination d) {
-        var activePeers = getActiveImmutableLinkedPeers().size();
-        if (activePeers <= MIN_DESIRED_PEERS) {
-            log.info("Active peers ({}) <= desired peers ({}). Announcing", activePeers, MIN_DESIRED_PEERS);
+    public void maybeAnnounce(Destination d, RNSCommon.PeerAspect pa) {
+        var activePeers = getActiveImmutableLinkedPeers();
+        int corePeerCount = 0;
+        int dataPeerCount = 0;
+        for (Peer p: activePeers) {
+            if (p.isDataPeer()) {
+                dataPeerCount++;
+            } else {
+                corePeerCount++;
+            }
+        }
+        if ((corePeerCount <= MIN_DESIRED_CORE_PEERS) && (pa == RNSCommon.PeerAspect.BASE)) {
+            log.info("Active core peers ({}) <= desired core peers ({}). Announcing", corePeerCount, MIN_DESIRED_CORE_PEERS);
+            d.announce();
+        }
+        if ((dataPeerCount <= MIN_DESIRED_DATA_PEERS) && (pa == RNSCommon.PeerAspect.DATA)) {
+            log.info("Active qdn peers ({}) <= desired data peers ({}). Announcing", dataPeerCount, MIN_DESIRED_CORE_PEERS);
             d.announce();
         }
     }

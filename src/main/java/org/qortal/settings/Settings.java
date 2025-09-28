@@ -620,10 +620,12 @@ public class Settings {
 	private String preferredNetwork = "reticulum";
 	/** Maximum number of Reticulum peers allowed. */
 	private int reticulumMaxPeers = 55;
-	/** Minimum number of Reticulum peers desired. */
-	private int reticulumMinDesiredPeers = 8;
+	/** Minimum number of Reticulum Core peers desired. */
+	private int reticulumMinDesiredCorePeers = 5;
+    /** Minimum number of Reticulum Data peers desired. */
+    private int reticulumMinDesiredDataPeers = 8;
 	/** Maximum number of task executor network threads */
-	private int reticulumMaxNetworkThreadPoolSize = 89;
+	//private int reticulumMaxNetworkThreadPoolSize = 89;
 	/** Node provides a TCPServerInterface or other "qortal"/"qortaltest" gateway interface */
 	private boolean reticulumHasServerInterface = false;
 	/** Number of desired client Interfaces (taken from core server list) */
@@ -1403,13 +1405,17 @@ public class Settings {
 		return this.reticulumMaxPeers;
 	}
 
-	public int getReticulumMinDesiredPeers() {
-		return this.reticulumMinDesiredPeers;
+	public int getReticulumMinDesiredCorePeers() {
+		return this.reticulumMinDesiredCorePeers;
 	}
 
-	public int getReticulumMaxNetworkThreadPoolSize() {
-		return this.reticulumMaxNetworkThreadPoolSize;
-  	}
+    public int getReticulumMinDesiredDataPeers() {
+        return this.reticulumMinDesiredDataPeers;
+    }
+
+	//public int getReticulumMaxNetworkThreadPoolSize() {
+	//	return this.reticulumMaxNetworkThreadPoolSize;
+  	//}
 
 	public boolean getReticulumIsGateway() { return this.reticulumHasServerInterface; }
 

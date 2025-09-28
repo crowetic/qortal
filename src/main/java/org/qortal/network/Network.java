@@ -171,7 +171,8 @@ public class Network {
         maxPeers = Settings.getInstance().getMaxPeers();
 
         // Instantiate Reticulum
-        rns = RNS.getInstance();
+        //rns = RNS.getInstance();
+        rns = new RNS();
 
         // We'll use a cached thread pool but with more aggressive timeout.
         ExecutorService networkExecutor = new ThreadPoolExecutor(2,
@@ -1499,7 +1500,8 @@ public class Network {
         }
 
         // prune ReticulumPeer(s), primarily any peer that has no ACTIVE link
-        RNS.getInstance().prunePeers();
+        //RNS.getInstance().prunePeers();
+        rns.prunePeers();
 
         // Disconnect peers that are stuck during handshake
         // Needs a mutable copy of the unmodifiableList
