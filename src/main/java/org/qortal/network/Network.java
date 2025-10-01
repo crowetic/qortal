@@ -160,7 +160,7 @@ public class Network {
 
     private volatile boolean isShuttingDown = false;
 
-    public RNS rns;
+    private static volatile RNS rns;
 
     // Constructors
 
@@ -171,8 +171,8 @@ public class Network {
         maxPeers = Settings.getInstance().getMaxPeers();
 
         // Instantiate Reticulum
-        //rns = RNS.getInstance();
-        rns = new RNS();
+        rns = RNS.getInstance();
+        //rns = new RNS();
 
         // We'll use a cached thread pool but with more aggressive timeout.
         ExecutorService networkExecutor = new ThreadPoolExecutor(2,
