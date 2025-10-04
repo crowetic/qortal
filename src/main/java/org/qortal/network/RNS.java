@@ -527,7 +527,7 @@ public class RNS {
                 if (!peerExists) {
                     ReticulumPeer newPeer = getNewPeer(destinationHash, announcedIdentity);
                     addLinkedPeer(newPeer);
-                    //network.addHandshakedPeer(newPeer);
+                    //network.addConnectedPeer(newPeer);
                     log.info("added new {} ReticulumPeer, destinationHash: {}",
                             newPeer.getPeerAspect(), encodeHexString(destinationHash));
                 }
@@ -541,9 +541,11 @@ public class RNS {
             if (getAspectFilter() == "qortal.qdn") {
                 // data peer
                 newPeer.setPeerAspect(RNSCommon.PeerAspect.DATA);
+                newPeer.setIsDataPeer(true);
             } else {
                 // core peer
                 newPeer.setPeerAspect(RNSCommon.PeerAspect.BASE);
+                newPeer.setIsDataPeer(false);
             }
             newPeer.setMessageMagic(getMessageMagic());
             return newPeer;

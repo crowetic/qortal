@@ -265,6 +265,7 @@ public class ReticulumPeer implements Peer {
 
     public BufferedRWPair getOrInitPeerBuffer() {
         var channel = this.peerLink.getChannel();
+        var network = Network.getInstance();
         if (nonNull(this.peerBuffer)) {
             //log.info("peerBuffer exists: {}, link status: {}", this.peerBuffer, this.peerLink.getStatus());
             try {
@@ -277,6 +278,8 @@ public class ReticulumPeer implements Peer {
                 this.peerLink.teardown();
                 this.peerLink = null;
                 //log.error("(handled) IllegalStateException - can't establish Channel/Buffer: {}", e);
+                network.removeOutboundHandshakedPeer(this);
+                network.removeConnectedPeer(this);
             }
         }
         else {
@@ -287,6 +290,7 @@ public class ReticulumPeer implements Peer {
             //    this.sendStreamId = 1;
             //}
             this.peerBuffer = Buffer.createBidirectionalBuffer(receiveStreamId, sendStreamId, channel, this::peerBufferReady);
+            network.addOutboundHandshakedPeer(this);
         }
         return getPeerBuffer();
     }
@@ -321,6 +325,10 @@ public class ReticulumPeer implements Peer {
             this.peerLink = null;
         }
         this.deleteMe = true;
+        var network = Network.getInstance();
+        network.removeHandshakedPeer(this);
+        network.removeConnectedPeer(this);
+
     }
 
     public Channel getChannel() {
@@ -356,6 +364,11 @@ public class ReticulumPeer implements Peer {
             encodeHexString(link.getDestination().getHash()));
         if (isInitiator) {
             startPings();
+            var network = Network.getInstance();
+            network.addConnectedPeer(this);
+            // is a "handshaked" peer one with an established link or an established buffer?
+            // if the latter is correct we don't need the following line.
+            //network.addOutboundHandshakedPeer(this);
         }
     }
     
@@ -376,6 +389,11 @@ public class ReticulumPeer implements Peer {
             this.peerBuffer = null;
         } else {
             log.info("Link closed callback");
+        }
+        if (isInitiator) {
+            var network = Network.getInstance();
+            network.removeOutboundHandshakedPeer(this);
+            network.removeConnectedPeer(this);
         }
     }
     
