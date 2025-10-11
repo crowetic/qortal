@@ -192,7 +192,7 @@ public class ReticulumPeer implements Peer {
         this.replyQueues = new ConcurrentHashMap<>();
         this.pendingMessages = new LinkedBlockingQueue<>();
         this.peerAddress = new ReticulumPeerAddress(dhash);
-        this.peerData = new PeerData(peerAddress);
+        this.peerData = new PeerData(peerAddress,NTP.getTime(),"ReticulumPeer");
         //this.peerData.setPeerType(PeerType.RETICULUM);
     }
 
@@ -217,7 +217,7 @@ public class ReticulumPeer implements Peer {
         //this.peerLink.setLinkClosedCallback(this::linkClosed);
         //this.peerLink.setPacketCallback(this::linkPacketReceived);
         this.peerAddress = new ReticulumPeerAddress(this.destinationHash);
-        this.peerData = new PeerData(this.peerAddress);
+        this.peerData = new PeerData(this.peerAddress, NTP.getTime(),"ReticulumPeer");
         //this.peerData.setPeerType(PeerType.RETICULUM);
     }
 
@@ -269,6 +269,7 @@ public class ReticulumPeer implements Peer {
     public BufferedRWPair getOrInitPeerBuffer() {
         var channel = this.peerLink.getChannel();
         var network = Network.getInstance();
+        var ntpNow = NTP.getTime();
         if (nonNull(this.peerBuffer)) {
             //log.info("peerBuffer exists: {}, link status: {}", this.peerBuffer, this.peerLink.getStatus());
             try {
@@ -283,6 +284,8 @@ public class ReticulumPeer implements Peer {
                 //log.error("(handled) IllegalStateException - can't establish Channel/Buffer: {}", e);
                 network.removeOutboundHandshakedPeer(this);
                 network.removeConnectedPeer(this);
+                this.peerData.setLastAttempted(ntpNow);
+                this.peerData.setLastMisbehaved(ntpNow);
             }
         }
         else {
@@ -294,6 +297,8 @@ public class ReticulumPeer implements Peer {
             //}
             this.peerBuffer = Buffer.createBidirectionalBuffer(receiveStreamId, sendStreamId, channel, this::peerBufferReady);
             network.addOutboundHandshakedPeer(this);
+            this.peerData.setLastAttempted(ntpNow);
+            this.peerData.setLastConnected(ntpNow);
         }
         return getPeerBuffer();
     }

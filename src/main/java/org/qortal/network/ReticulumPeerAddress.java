@@ -7,6 +7,7 @@ package org.qortal.network;
 import javax.xml.bind.annotation.XmlAccessType;
 import javax.xml.bind.annotation.XmlAccessorType;
 import java.net.InetSocketAddress;
+import static org.apache.commons.codec.binary.Hex.encodeHexString;
 
 /**
  * Convenience class for encapsulating/parsing/rendering/converting IP peer addresses
@@ -42,5 +43,7 @@ public class ReticulumPeerAddress implements PeerAddress {
     public InetSocketAddress toSocketAddress() {
         return null;
     }
+    @Override
+    public String toString() { return encodeHexString(dhash); }
 
-}
+    }
