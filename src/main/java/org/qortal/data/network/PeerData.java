@@ -59,12 +59,6 @@ public class PeerData {
         //this.peerType = PeerType.IP;
 	}
 
-    public PeerData(byte[] dhash) {
-        this(null, null, null, null, null, null);
-        this.peerAddress = new ReticulumPeerAddress(dhash);
-        //this.peerType = PeerType.RETICULUM;
-    }
-
     // Getters / setters
 
 	// Don't let JAXB use this getter

@@ -40,6 +40,7 @@ import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 import static io.reticulum.link.LinkStatus.ACTIVE;
 import static java.util.Objects.nonNull;
@@ -326,7 +327,10 @@ public class Network {
 
     public List<PeerData> getAllKnownPeers() {
         synchronized (this.allKnownPeers) {
-            return new ArrayList<>(this.allKnownPeers);
+            //return new ArrayList<>(this.allKnownPeers);
+            return Stream.concat(this.allKnownPeers.stream(), RNS.getInstance().getAllKnownPeers().stream())
+                    .distinct()
+                    .collect(Collectors.toList());
         }
     }
 

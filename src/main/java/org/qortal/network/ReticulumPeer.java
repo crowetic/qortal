@@ -101,6 +101,7 @@ public class ReticulumPeer implements Peer {
     BufferedRWPair peerBuffer;
     int receiveStreamId = 0;
     int sendStreamId = 0;
+    ReticulumPeerAddress peerAddress;
     //private Boolean isInitiator;
     @Getter public Boolean isInitiator;
     private Boolean deleteMe = false;
@@ -126,7 +127,7 @@ public class ReticulumPeer implements Peer {
     private Map<Integer, BlockingQueue<Message>> replyQueues;
     private LinkedBlockingQueue<Message> pendingMessages;
     private boolean syncInProgress = false;
-    private PeerData peerData = null;
+    private PeerData peerData;
     private long linkEstablishedTime = -1L; // equivalent of (tcpip) Peer 'handshakeComplete'
     // Versioning
     public static final Pattern VERSION_PATTERN = Pattern.compile(Controller.VERSION_PREFIX
@@ -190,7 +191,8 @@ public class ReticulumPeer implements Peer {
         //this.isVacant = true;
         this.replyQueues = new ConcurrentHashMap<>();
         this.pendingMessages = new LinkedBlockingQueue<>();
-        this.peerData = new PeerData(dhash);
+        this.peerAddress = new ReticulumPeerAddress(dhash);
+        this.peerData = new PeerData(peerAddress);
         //this.peerData.setPeerType(PeerType.RETICULUM);
     }
 
@@ -214,7 +216,8 @@ public class ReticulumPeer implements Peer {
         //this.peerLink.setLinkEstablishedCallback(this::linkEstablished);
         //this.peerLink.setLinkClosedCallback(this::linkClosed);
         //this.peerLink.setPacketCallback(this::linkPacketReceived);
-        this.peerData = new PeerData(this.destinationHash);
+        this.peerAddress = new ReticulumPeerAddress(this.destinationHash);
+        this.peerData = new PeerData(this.peerAddress);
         //this.peerData.setPeerType(PeerType.RETICULUM);
     }
 

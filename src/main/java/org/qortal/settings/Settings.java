@@ -616,8 +616,12 @@ public class Settings {
 
 	// Related to mesh networking
 
-	/** Preferred network: "tcpip" or "reticulum" */
-	private String preferredNetwork = "reticulum";
+    public enum NetworkType {
+        IP,
+        RETICULUM;
+    }
+	/** Preferred network (from above, one of "IP","RETICULUM") */
+	private String preferredNetwork = NetworkType.RETICULUM.name();
 	/** Maximum number of Reticulum peers allowed. */
 	private int reticulumMaxPeers = 55;
 	/** Minimum number of Reticulum Core peers desired. */
@@ -1397,8 +1401,12 @@ public class Settings {
 		return connectionPoolMonitorEnabled;
 	}
 
-	public String getPreferredNetwork () {
-		return this.preferredNetwork.toLowerCase(Locale.getDefault());
+	public NetworkType getPreferredNetwork () {
+		if (this.preferredNetwork.compareToIgnoreCase("RETICULUM") == 0) {
+            return NetworkType.RETICULUM;
+        } else {
+            return NetworkType.IP;
+        }
 	}
 
 	public int getReticulumMaxPeers() {

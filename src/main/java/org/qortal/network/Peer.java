@@ -4,7 +4,6 @@ import org.qortal.controller.Controller;
 import org.qortal.data.block.BlockSummaryData;
 import org.qortal.data.block.CommonBlockData;
 import org.qortal.data.network.PeerData;
-import org.qortal.network.RNSCommon.PeerType;
 import org.qortal.network.message.Message;
 import org.qortal.utils.ExecuteProduceConsume.Task;
 
@@ -48,7 +47,6 @@ public interface Peer {
     long getConnectionEstablishedTime();
     Long getLastTooDivergentTime();
     boolean sendMessageWithTimeoutNow(Message message, int timeout);
-    //PeerType getPeerType();
     void setPeersNodeId(String nodeAddress);
     String getPeersNodeId();
     boolean isStopping();

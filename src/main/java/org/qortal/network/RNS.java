@@ -775,6 +775,26 @@ public class RNS {
      * Helper methods
      */
 
+    public List<PeerData> getAllKnownPeers() {
+        return getImmutableIncomingPeers().stream()
+                .map(ReticulumPeer::getPeerData)
+                .collect(Collectors.toList());
+    }
+
+    public List<PeerData> getAllKnownCorePeers() {
+        return getImmutableIncomingPeers().stream()
+                .filter(p -> p.isDataPeer())
+                .map(ReticulumPeer::getPeerData)
+                .collect(Collectors.toList());
+    }
+
+    public List<PeerData> getAllKnownDataPeers() {
+        return getImmutableIncomingPeers().stream()
+                .filter(p -> !p.isDataPeer())
+                .map(ReticulumPeer::getPeerData)
+                .collect(Collectors.toList());
+    }
+
     public ReticulumPeer findPeerByLink(Link link) {
         List<ReticulumPeer> lps =  RNS.getInstance().getImmutableLinkedPeers();
         ReticulumPeer peer = null;
