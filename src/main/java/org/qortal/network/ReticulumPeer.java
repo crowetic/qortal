@@ -370,6 +370,9 @@ public class ReticulumPeer implements Peer {
         log.info("peerLink {} established (link: {}) with peer: hash - {}, link destination hash: {}", 
             encodeHexString(peerLink.getLinkId()), encodeHexString(link.getLinkId()), encodeHexString(destinationHash),
             encodeHexString(link.getDestination().getHash()));
+        var ntpNow = NTP.getTime();
+        this.peerData.setLastConnected(ntpNow);
+        //this.peerData.setLastAttempted(ntpNow);
         if (isInitiator) {
             startPings();
             var network = Network.getInstance();
@@ -398,6 +401,7 @@ public class ReticulumPeer implements Peer {
         } else {
             log.info("Link closed callback");
         }
+        RNS.getInstance().removePeer(this);
         if (isInitiator) {
             var network = Network.getInstance();
             network.removeOutboundHandshakedPeer(this);
@@ -410,6 +414,7 @@ public class ReticulumPeer implements Peer {
         if (msgText.equals("ping")) {
             log.info("received ping on link");
             this.lastLinkProbeTimestamp = Instant.now();
+            this.peerData.setLastAttempted(NTP.getTime());
         } else if (msgText.startsWith("close::")) {
             var targetPeerHash = subarray(message, 7, message.length);
             log.info("peer dest hash: {}, target hash: {}",
@@ -423,15 +428,21 @@ public class ReticulumPeer implements Peer {
                 }
                 this.peerLink.teardown();
             }
+            if (isInitiator) {
+                var network = Network.getInstance();
+                network.removeOutboundHandshakedPeer(this);
+                network.removeConnectedPeer(this);
+            }
         } else if (msgText.startsWith("open::")) {
             var targetPeerHash = subarray(message, 7, message.length);
             log.info("peer dest hash: {}, target hash: {}",
                 encodeHexString(destinationHash),
                 encodeHexString(targetPeerHash));
             if (Arrays.equals(destinationHash, targetPeerHash)) {
-                log.info("closing link: {}", peerLink.getDestination().getHexHash());
+                log.info("re-opening existing link: {}", peerLink.getDestination().getHexHash());
                 getOrInitPeerLink();
             }
+            this.peerData.setLastConnected(NTP.getTime());
         }
     }
 

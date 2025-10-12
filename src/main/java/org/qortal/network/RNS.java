@@ -582,6 +582,14 @@ public class RNS {
         //network.addHandshakedPeer(peer);
     }
 
+    public void removePeer(ReticulumPeer peer) {
+        if (peer.isInitiator) {
+            removeLinkedPeer(peer);
+        } else {
+            removeIncomingPeer(peer);
+        }
+    }
+
     public void removeLinkedPeer(ReticulumPeer peer) {
         //if (nonNull(peer.getPeerBuffer())) {
         //    peer.getPeerBuffer().close();
