@@ -24,6 +24,7 @@ public interface Peer {
     void setChainTipData(BlockSummaryData chainTipData);
     PeerData getPeerData();
     String getPeerIndexString();
+    boolean hasActivePeerLink();
     void startPings();
     default boolean isLocal() { return false; }
     void shutdown();

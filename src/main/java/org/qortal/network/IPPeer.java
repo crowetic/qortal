@@ -462,11 +462,15 @@ public class IPPeer implements Peer {
         return this.pendingSignatureRequests;
     }
 
-
     @Override
     public String toString() {
         // Easier, and nicer output, than peer.getRemoteSocketAddress()
         return this.peerData.getAddress().toString();
+    }
+
+    @Override
+    public boolean hasActivePeerLink() {
+        return false;
     }
 
     // Processing

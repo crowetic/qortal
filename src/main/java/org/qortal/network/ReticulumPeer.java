@@ -360,6 +360,12 @@ public class ReticulumPeer implements Peer {
         return encodeHexString(getDestinationHash());
     }
 
+    public boolean hasActivePeerLink() {
+        var result = false;
+        if (nonNull(this.peerLink) && this.peerLink.getStatus() == ACTIVE) { result = true; }
+        return result;
+    }
+
     public ReticulumPeer getInstance() { return this; }
     //public Peer getInstance() { return null; }
 
