@@ -2,6 +2,7 @@ package org.qortal.network.message;
 
 import com.google.common.primitives.Ints;
 import org.qortal.network.PeerAddress;
+import org.qortal.network.PeerAddressFactory;
 import org.qortal.settings.Settings;
 
 import java.io.ByteArrayOutputStream;
@@ -72,12 +73,16 @@ public class PeersV2Message extends Message {
 			String addressString = new String(addressBytes, StandardCharsets.UTF_8);
 
 			try {
-				PeerAddress peerAddress = PeerAddress.fromString(addressString);
+				//PeerAddress peerAddress = PeerAddress.fromString(addressString);
+                PeerAddress peerAddress = (PeerAddress) PeerAddressFactory.create("address", addressString);
 				peerAddresses.add(peerAddress);
 			} catch (IllegalArgumentException e) {
 				throw new MessageException("Invalid peer address in received PEERS_V2 message");
-			}
-		}
+			} catch (ReflectiveOperationException e) {
+                throw new MessageException("Failed to create peer address from received PEERS_V2 message");
+            }
+
+        }
 
 		return new PeersV2Message(id, peerAddresses);
 	}

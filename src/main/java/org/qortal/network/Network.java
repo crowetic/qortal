@@ -40,6 +40,11 @@ import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+import static io.reticulum.link.LinkStatus.ACTIVE;
+import static java.util.Objects.nonNull;
+import static org.apache.commons.codec.binary.Hex.encodeHexString;
 
 // For managing peers
 public class Network {
@@ -156,6 +161,8 @@ public class Network {
 
     private volatile boolean isShuttingDown = false;
 
+    private static volatile RNS rns;
+
     // Constructors
 
     private Network() {
@@ -163,6 +170,10 @@ public class Network {
 
         minOutboundPeers = Settings.getInstance().getMinOutboundPeers();
         maxPeers = Settings.getInstance().getMaxPeers();
+
+        // Instantiate Reticulum
+        rns = RNS.getInstance();
+        //rns = new RNS();
 
         // We'll use a cached thread pool but with more aggressive timeout.
         ExecutorService networkExecutor = new ThreadPoolExecutor(2,
@@ -174,6 +185,10 @@ public class Network {
     }
 
     public void start() throws IOException, DataException {
+
+        // initialize Retciculum and start Reticulum thread
+        rns.start();
+
         // Grab P2P port from settings
         int listenPort = Settings.getInstance().getListenPort();
 
@@ -223,9 +238,14 @@ public class Network {
                 Long addedWhen = NTP.getTime();
                 String addedBy = "fixedNetwork";
                 List<PeerAddress> peerAddresses = new ArrayList<>();
-                for (String address : fixedNetwork) {
-                    PeerAddress peerAddress = PeerAddress.fromString(address);
-                    peerAddresses.add(peerAddress);
+                try {
+                    for (String address : fixedNetwork) {
+                        //PeerAddress peerAddress = PeerAddress.fromString(address);
+                        PeerAddress peerAddress = PeerAddressFactory.create("address", address); // only IPPeer
+                        peerAddresses.add(peerAddress);
+                    }
+                } catch (ReflectiveOperationException e) {
+                    LOGGER.error("Can't add peer address to fixed network: {}", e.getMessage());
                 }
                 List<PeerData> peers = peerAddresses.stream()
                         .map(peerAddress -> new PeerData(peerAddress, addedWhen, addedBy))
@@ -307,7 +327,10 @@ public class Network {
 
     public List<PeerData> getAllKnownPeers() {
         synchronized (this.allKnownPeers) {
-            return new ArrayList<>(this.allKnownPeers);
+            //return new ArrayList<>(this.allKnownPeers);
+            return Stream.concat(this.allKnownPeers.stream(), RNS.getInstance().getAllKnownPeers().stream())
+                    .distinct()
+                    .collect(Collectors.toList());
         }
     }
 
@@ -348,65 +371,75 @@ public class Network {
 
     public boolean requestDataFromPeer(String peerAddressString, byte[] signature) {
         if (peerAddressString != null) {
-            PeerAddress peerAddress = PeerAddress.fromString(peerAddressString);
-            PeerData peerData = null;
+            //PeerAddress peerAddress = PeerAddress.fromString(peerAddressString);
+            try {
+                //PeerAddress peerAddress = null;
+                PeerData peerData = null;
 
-            // Reuse an existing PeerData instance if it's already in the known peers list
-            synchronized (this.allKnownPeers) {
-                peerData = this.allKnownPeers.stream()
-                        .filter(knownPeerData -> knownPeerData.getAddress().equals(peerAddress))
-                        .findFirst()
-                        .orElse(null);
-            }
+                final PeerAddress peerAddress = PeerAddressFactory.create("address", peerAddressString);
 
-            if (peerData == null) {
-                // Not a known peer, so we need to create one
-                Long addedWhen = NTP.getTime();
-                String addedBy = "requestDataFromPeer";
-                peerData = new PeerData(peerAddress, addedWhen, addedBy);
-            }
+                // Reuse an existing PeerData instance if it's already in the known peers list
+                synchronized (this.allKnownPeers) {
+                    peerData = this.allKnownPeers.stream()
+                            .filter(knownPeerData -> knownPeerData.getAddress().equals(peerAddress))
+                            .findFirst()
+                            .orElse(null);
+                }
 
-            if (peerData == null) {
-                LOGGER.info("PeerData is null when trying to request data from peer {}", peerAddressString);
-                return false;
-            }
+                if (peerData == null) {
+                    // Not a known peer, so we need to create one
+                    Long addedWhen = NTP.getTime();
+                    String addedBy = "requestDataFromPeer";
+                    peerData = new PeerData(peerAddress, addedWhen, addedBy);
+                }
 
-            // Check if we're already connected to and handshaked with this peer
-            Peer connectedPeer = this.getImmutableConnectedPeers().stream()
-                        .filter(p -> p.getPeerData().getAddress().equals(peerAddress))
-                        .findFirst()
-                        .orElse(null);
-
-            boolean isConnected = (connectedPeer != null);
-
-            boolean isHandshaked = this.getImmutableHandshakedPeers().stream()
-                    .anyMatch(p -> p.getPeerData().getAddress().equals(peerAddress));
-
-            if (isConnected && isHandshaked) {
-                // Already connected
-                return this.requestDataFromConnectedPeer(connectedPeer, signature);
-            }
-            else {
-                // We need to connect to this peer before we can request data
-                try {
-                    if (!isConnected) {
-                        // Add this signature to the list of pending requests for this peer
-                        LOGGER.debug("Making connection to peer {} to request files for signature {}...", peerAddressString, Base58.encode(signature));
-                        Peer peer = new Peer(peerData);
-                        peer.setIsDataPeer(true);
-                        peer.addPendingSignatureRequest(signature);
-                        return this.connectPeer(peer);
-                        // If connection (and handshake) is successful, data will automatically be requested
-                    }
-                    else if (!isHandshaked) {
-                        LOGGER.info("Peer {} is connected but not handshaked. Not attempting a new connection.", peerAddress);
-                        return false;
-                    }
-
-                } catch (InterruptedException e) {
-                    LOGGER.info("Interrupted when connecting to peer {}", peerAddress);
+                if (peerData == null) {
+                    LOGGER.info("PeerData is null when trying to request data from peer {}", peerAddressString);
                     return false;
                 }
+
+                // Check if we're already connected to and handshaked with this peer
+                Peer connectedPeer = this.getImmutableConnectedPeers().stream()
+                            .filter(p -> p.getPeerData().getAddress().equals(peerAddress))
+                            .findFirst()
+                            .orElse(null);
+
+                boolean isConnected = (connectedPeer != null);
+
+                boolean isHandshaked = this.getImmutableHandshakedPeers().stream()
+                        .anyMatch(p -> p.getPeerData().getAddress().equals(peerAddress));
+
+                if (isConnected && isHandshaked) {
+                    // Already connected
+                    return this.requestDataFromConnectedPeer(connectedPeer, signature);
+                }
+                else {
+                    // We need to connect to this peer before we can request data
+                    try {
+                        if (!isConnected) {
+                            // Add this signature to the list of pending requests for this peer
+                            LOGGER.debug("Making connection to peer {} to request files for signature {}...", peerAddressString, Base58.encode(signature));
+                            //Peer peer = new Peer(peerData);
+                            Peer peer = PeerFactory.create("peer-data", peerData);
+                            peer.setIsDataPeer(true);
+                            peer.addPendingSignatureRequest(signature);
+                            return this.connectPeer(peer);
+                            // If connection (and handshake) is successful, data will automatically be requested
+                        }
+                        else if (!isHandshaked) {
+                            LOGGER.info("Peer {} is connected but not handshaked. Not attempting a new connection.", peerAddress);
+                            return false;
+                        }
+
+                    } catch (InterruptedException e) {
+                        LOGGER.info("Interrupted when connecting to peer {}", peerAddress);
+                        return false;
+                    } catch (ReflectiveOperationException e) {
+                        LOGGER.warn("Exception when trying to request data from peer {}", peerAddress, e);
+                    }
+                }
+            } catch (ReflectiveOperationException e) {
+                LOGGER.error("Can't create peer address: {}", e.getMessage());
             }
         }
         return false;
@@ -511,10 +544,15 @@ public class Network {
 
     public static void installInitialPeers(Repository repository) throws DataException {
         for (String address : INITIAL_PEERS) {
-            PeerAddress peerAddress = PeerAddress.fromString(address);
+            try {
+                //PeerAddress peerAddress = PeerAddress.fromString(address);
+                PeerAddress peerAddress = PeerAddressFactory.create("address", address);
 
-            PeerData peerData = new PeerData(peerAddress, System.currentTimeMillis(), "INIT");
-            repository.getNetworkRepository().save(peerData);
+                PeerData peerData = new PeerData(peerAddress, System.currentTimeMillis(), "INIT");
+                repository.getNetworkRepository().save(peerData);
+            } catch (ReflectiveOperationException e) {
+                LOGGER.error("Can't create peer address: {}", e.getMessage());
+            }
         }
 
         repository.saveChanges();
@@ -750,8 +788,17 @@ public class Network {
 
         // Pick candidate
         PeerData peerData = peers.get(peerIndex);
-        Peer newPeer = new Peer(peerData);
-        newPeer.setIsDataPeer(false);
+        //Peer newPeer = new Peer(peerData);
+        //newPeer.setIsDataPeer(false);
+
+        Peer newPeer = null;
+        try {
+            newPeer = PeerFactory.create("peer-data", peerData);
+            newPeer.setIsDataPeer(false);
+            return newPeer;
+        } catch (ReflectiveOperationException e) {
+            LOGGER.error("Error while creating peer from peerData", e);
+        }
 
         // Update connection attempt info
         peerData.setLastAttempted(now);
@@ -934,8 +981,14 @@ public class Network {
     }
 
     public void peerMisbehaved(Peer peer) {
-        PeerData peerData = peer.getPeerData();
-        peerData.setLastMisbehaved(NTP.getTime());
+        try {
+            if (Class.forName("org.qortal.network.Peer").isInstance(peer)) {
+                PeerData peerData = (PeerData) peer.getPeerData();
+                peerData.setLastMisbehaved(NTP.getTime());
+            }
+        } catch(ClassNotFoundException e){
+            LOGGER.error("class 'Peer' not found", e);
+        }
     }
 
     /**
@@ -1096,10 +1149,15 @@ public class Network {
 
         // If inbound peer, use listen port and socket address to recreate first entry
         if (!peer.isOutbound()) {
-            String host = peer.getPeerData().getAddress().getHost();
-            PeerAddress sendingPeerAddress = PeerAddress.fromString(host + ":" + peerPort);
-            LOGGER.trace("PEERS_V2 sending peer's listen address: {}", sendingPeerAddress.toString());
-            peerV2Addresses.add(0, sendingPeerAddress);
+            try {
+                String host = peer.getPeerData().getAddress().getHost();
+                //PeerAddress sendingPeerAddress = PeerAddress.fromString(host + ":" + peerPort);
+                PeerAddress sendingPeerAddress = PeerAddressFactory.create("host-port", host, peerPort);
+                LOGGER.trace("PEERS_V2 sending peer's listen address: {}", sendingPeerAddress.toString());
+                peerV2Addresses.add(0, sendingPeerAddress);
+            } catch (ReflectiveOperationException e) {
+                LOGGER.error("Can't create peer address: {}", e.getMessage());
+            }
         }
 
         opportunisticMergePeers(peer.toString(), peerV2Addresses);
@@ -1137,6 +1195,7 @@ public class Network {
         // FUTURE: we may want to disconnect from this peer if we've finished requesting data from it
 
         // Start regular pings
+        // Note: For Reticulum peers regular ping is enabled the moment a Link is established
         peer.startPings();
 
         // Only the outbound side needs to send anything (after we've received handshake-completing response).
@@ -1213,7 +1272,9 @@ public class Network {
 
                 // Don't send 'local' addresses if peer is not 'local'.
                 // e.g. don't send localhost:9084 to node4.qortal.org
-                if (!peer.isLocal() && Peer.isAddressLocal(address)) {
+                //var p = PeerFactory.create("address", address);
+                //if (!peer.isLocal() && p.isAddressLocal(address)) {
+                if (!peer.isLocal()) {
                     continue;
                 }
 
@@ -1419,8 +1480,11 @@ public class Network {
         try {
             InetSocketAddress knownAddress = peerAddress.toSocketAddress();
 
+            //List<Peer> peers = this.getImmutableConnectedPeers().stream()
+            //        .filter(peer -> Peer.addressEquals(knownAddress, peer.getResolvedAddress()))
+            //        .collect(Collectors.toList());
             List<Peer> peers = this.getImmutableConnectedPeers().stream()
-                    .filter(peer -> Peer.addressEquals(knownAddress, peer.getResolvedAddress()))
+                    .filter(peer -> knownAddress.equals(peer.getResolvedAddress()))
                     .collect(Collectors.toList());
 
             for (Peer peer : peers) {
@@ -1438,6 +1502,10 @@ public class Network {
         if (now == null) {
             return;
         }
+
+        // prune ReticulumPeer(s), primarily any peer that has no ACTIVE link
+        //RNS.getInstance().prunePeers();
+        rns.prunePeers();
 
         // Disconnect peers that are stuck during handshake
         // Needs a mutable copy of the unmodifiableList
@@ -1579,6 +1647,31 @@ public class Network {
                 // Not important
             }
         }
+
+        //// shutdown Reticulum peers and instance
+        //// gracefully close links of peers that point to us
+        //for (ReticulumPeer p: RNS.getInstance().getIncomingPeers()) {
+        //    var pl = p.getPeerLink();
+        //    if (nonNull(pl) & (pl.getStatus() == ACTIVE)) {
+        //        p.sendCloseToRemote(pl);
+        //    }
+        //}
+        //// gracefully disconnect outgoing peers
+        //for (ReticulumPeer p: RNS.getInstance().getLinkedPeers()) {
+        //    LOGGER.info("shutting down peer: {}", encodeHexString(p.getDestinationHash()));
+        //    p.shutdown();
+        //    try {
+        //        TimeUnit.SECONDS.sleep(1); // allow for peers to disconnect gracefully
+        //    } catch (InterruptedException e) {
+        //        LOGGER.error("exception: ", e);
+        //    }
+        //}
+        //// shut down Reticulum
+        //LOGGER.info("Shutting down Reticulum...");
+        //RNS.getInstance().getReticulum().exitHandler();
+
+        // shutdown Reticulum, try to gracefully shut down peers
+        rns.shutdown();
 
         // Stop processing threads
         try {

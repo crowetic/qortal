@@ -2,6 +2,8 @@ package org.qortal.repository.hsqldb;
 
 import org.qortal.data.network.PeerData;
 import org.qortal.network.PeerAddress;
+import org.qortal.network.PeerAddressFactory;
+import org.qortal.network.message.MessageException;
 import org.qortal.repository.DataException;
 import org.qortal.repository.NetworkRepository;
 
@@ -31,7 +33,8 @@ public class HSQLDBNetworkRepository implements NetworkRepository {
 			// NOTE: do-while because checkedExecute() above has already called rs.next() for us
 			do {
 				String address = resultSet.getString(1);
-				PeerAddress peerAddress = PeerAddress.fromString(address);
+				//PeerAddress peerAddress = PeerAddress.fromString(address);
+                PeerAddress peerAddress = (PeerAddress) PeerAddressFactory.create("address", address);
 
 				Long lastConnected = resultSet.getLong(2);
 				if (lastConnected == 0 && resultSet.wasNull())
@@ -59,7 +62,9 @@ public class HSQLDBNetworkRepository implements NetworkRepository {
 			throw new DataException("Refusing to fetch invalid peer from repository", e);
 		} catch (SQLException e) {
 			throw new DataException("Unable to fetch peers from repository", e);
-		}
+		} catch (ReflectiveOperationException e) {
+            throw new DataException("Failed to create peer address from repository", e);
+        }
 	}
 
 	@Override

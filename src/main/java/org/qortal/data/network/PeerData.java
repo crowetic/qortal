@@ -2,11 +2,14 @@ package org.qortal.data.network;
 
 import io.swagger.v3.oas.annotations.media.Schema;
 import org.qortal.network.PeerAddress;
+import org.qortal.network.PeerAddressFactory;
+import org.qortal.network.ReticulumPeerAddress;
 
 import javax.xml.bind.annotation.XmlAccessType;
 import javax.xml.bind.annotation.XmlAccessorType;
 import javax.xml.bind.annotation.XmlElement;
 import javax.xml.bind.annotation.XmlTransient;
+//import org.qortal.network.RNSCommon.PeerType;
 
 // All properties to be converted to JSON via JAXB
 @XmlAccessorType(XmlAccessType.FIELD)
@@ -26,6 +29,8 @@ public class PeerData {
 	private Long lastMisbehaved;
 	private Long addedWhen;
 	private String addedBy;
+    private PeerData peerData;
+    //private PeerType peerType;
 
 	/** The number of consecutive times we failed to sync with this peer */
 	private int failedSyncCount = 0;
@@ -51,9 +56,10 @@ public class PeerData {
 
 	public PeerData(PeerAddress peerAddress) {
 		this(peerAddress, null, null, null, null, null);
+        //this.peerType = PeerType.IP;
 	}
 
-	// Getters / setters
+    // Getters / setters
 
 	// Don't let JAXB use this getter
 	@XmlTransient
@@ -105,6 +111,10 @@ public class PeerData {
 	public void incrementFailedSyncCount() {
 		this.failedSyncCount++;
 	}
+
+  //public void setPeerType(PeerType pt) {
+  //  this.peerType = pt;
+  //}
 
 	// Pretty peerAddress getter for JAXB
 	@XmlElement(name = "address")

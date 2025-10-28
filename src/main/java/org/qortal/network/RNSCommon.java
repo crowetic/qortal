@@ -32,11 +32,21 @@ public class RNSCommon {
     public static String jinjaConfigTemplateName = "reticulum_config_template.jinja";
 
     /**
-     * Qortal RNS Destination types
+     * Qortal Peer "aspect". For Reticulum, this translates to aspects:
+     * BASE ~= "qortal.core"
+     * DATA ~= "qortal.qdn"
      */
-    public enum RNSDestinationType {
+    public enum PeerAspect {
         BASE,
         DATA;
     }
-    
+
+    ///**
+    // * Qortal Peer Type
+    // */
+    //public enum PeerType {
+    //    IP,
+    //    RETICULUM;
+    //}
+
 }

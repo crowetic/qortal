@@ -6,11 +6,11 @@ package org.qortal.network;
 import static java.util.Objects.isNull;
 import static java.util.Objects.nonNull;
 //import java.io.IOException;
+import java.nio.channels.SelectionKey;
 import java.time.Instant;
 import java.util.*;
 
 //import io.reticulum.Reticulum;
-//import org.qortal.network.RNSNetwork;
 import io.reticulum.link.Link;
 import io.reticulum.link.RequestReceipt;
 import io.reticulum.packet.PacketReceiptStatus;
@@ -32,19 +32,23 @@ import static io.reticulum.identity.IdentityKnownDestination.recall;
 //import static io.reticulum.identity.IdentityKnownDestination.recallAppData;
 import io.reticulum.buffer.Buffer;
 import io.reticulum.buffer.BufferedRWPair;
+import org.qortal.network.RNSCommon.PeerAspect;
+//import org.qortal.network.RNSCommon.PeerType;
 import static io.reticulum.utils.IdentityUtils.concatArrays;
 
+import lombok.Getter;
 import org.qortal.controller.Controller;
 import org.qortal.data.block.BlockSummaryData;
 import org.qortal.data.block.CommonBlockData;
-import org.qortal.data.network.RNSPeerData;
+import org.qortal.data.network.PeerData;
 import org.qortal.network.message.Message;
 import org.qortal.network.message.MessageType;
 import org.qortal.network.message.PingMessage;
 import org.qortal.network.message.*;
 import org.qortal.network.message.MessageException;
-import org.qortal.network.task.RNSMessageTask;
-import org.qortal.network.task.RNSPingTask;
+import org.qortal.network.task.MessageTask;
+import org.qortal.network.task.ReticulumMessageTask;
+import org.qortal.network.task.ReticulumPingTask;
 import org.qortal.settings.Settings;
 import org.qortal.utils.ExecuteProduceConsume.Task;
 import org.qortal.utils.NTP;
@@ -78,7 +82,7 @@ import java.lang.IllegalStateException;
 
 @Data
 @Slf4j
-public class RNSPeer {
+public class ReticulumPeer implements Peer {
 
     static final String APP_NAME = Settings.getInstance().isTestNet() ? RNSCommon.TESTNET_APP_NAME: RNSCommon.MAINNET_APP_NAME;
     //static final String defaultConfigPath = new String(".reticulum");
@@ -86,7 +90,8 @@ public class RNSPeer {
 
     private byte[] destinationHash;   // remote destination hash
     Destination peerDestination;      // OUT destination created for this
-    RNSCommon.RNSDestinationType destinationType;
+    PeerAspect peerAspect;       // based on Destination
+    //PeerType peerKind = PeerType.RETICULUM;
     private Identity serverIdentity;
     @Setter(AccessLevel.PACKAGE) private Instant creationTimestamp;
     @Setter(AccessLevel.PACKAGE) private Instant lastAccessTimestamp;
@@ -96,7 +101,9 @@ public class RNSPeer {
     BufferedRWPair peerBuffer;
     int receiveStreamId = 0;
     int sendStreamId = 0;
-    private Boolean isInitiator;
+    ReticulumPeerAddress peerAddress;
+    //private Boolean isInitiator;
+    @Getter public Boolean isInitiator;
     private Boolean deleteMe = false;
     //private Boolean isVacant = true;
     private Long lastPacketRtt = null;
@@ -107,6 +114,10 @@ public class RNSPeer {
 
     // for qortal networking
     private static final int RESPONSE_TIMEOUT = 3000; // [ms]
+    /**
+     * Maximum time to wait for a message to be added to sendQueue (ms)
+     */
+    private static final int QUEUE_TIMEOUT = 1000; // ms
     private static final int PING_INTERVAL = 55_000; // [ms]
     private static final long LINK_PING_INTERVAL = 55 * 1000L; // ms
     private byte[] messageMagic;  // set in message creating classes
@@ -116,13 +127,14 @@ public class RNSPeer {
     private Map<Integer, BlockingQueue<Message>> replyQueues;
     private LinkedBlockingQueue<Message> pendingMessages;
     private boolean syncInProgress = false;
-    private RNSPeerData peerData = null;
+    private PeerData peerData;
     private long linkEstablishedTime = -1L; // equivalent of (tcpip) Peer 'handshakeComplete'
     // Versioning
     public static final Pattern VERSION_PATTERN = Pattern.compile(Controller.VERSION_PREFIX
             + "(\\d{1,3})\\.(\\d{1,5})\\.(\\d{1,5})");
     /* Pending signature requests */
     private List<byte[]> pendingSignatureRequests = Collections.synchronizedList(new ArrayList<>());
+    private TransferQueue<Message> sendQueue;
     /**
      * Latest block info as reported by peer.
      */
@@ -135,6 +147,22 @@ public class RNSPeer {
      * Last time we detected this peer as TOO_DIVERGENT
      */
     private Long lastTooDivergentTime;
+    /**
+     * Version string as reported by peer.
+     */
+    private String peersVersionString = null;
+    /**
+     * Numeric version of peer.
+     */
+    private Long peersVersion = null;
+    /**
+     * Peer's value of connectionTimestamp.
+     */
+    private Long peersConnectionTimestamp = null;
+    /**
+     * peer info
+     */
+    private String peersNodeId;
     ///**
     // * Known starting sequences for data received over buffer
     // */
@@ -147,13 +175,14 @@ public class RNSPeer {
         public final LongAdder totalBytes = new LongAdder();
     }
 
-    private final Map<MessageType, RNSPeer.MessageStats> receivedMessageStats = new ConcurrentHashMap<>();
-    private final Map<MessageType, RNSPeer.MessageStats> sentMessageStats = new ConcurrentHashMap<>();
+    private final Map<MessageType, ReticulumPeer.MessageStats> receivedMessageStats = new ConcurrentHashMap<>();
+    private final Map<MessageType, ReticulumPeer.MessageStats> sentMessageStats = new ConcurrentHashMap<>();
 
     /**
      * Constructor for initiator peers
      */
-    public RNSPeer(byte[] dhash) {
+    @PeerCtor("destination-hash")
+    public ReticulumPeer(byte[] dhash) {
         this.destinationHash = dhash;
         this.serverIdentity = recall(dhash);
         initPeerLink();
@@ -162,13 +191,16 @@ public class RNSPeer {
         //this.isVacant = true;
         this.replyQueues = new ConcurrentHashMap<>();
         this.pendingMessages = new LinkedBlockingQueue<>();
-        this.peerData = new RNSPeerData(dhash);
+        this.peerAddress = new ReticulumPeerAddress(dhash);
+        this.peerData = new PeerData(peerAddress,NTP.getTime(),"ReticulumPeer");
+        //this.peerData.setPeerType(PeerType.RETICULUM);
     }
 
     /**
      * Constructor for non-initiator peers
      */
-    public RNSPeer(Link link) {
+    @PeerCtor("link")
+    public ReticulumPeer(Link link) {
         this.peerLink = link;
         //this.peerLinkId = link.getLinkId();
         this.peerDestination = link.getDestination();
@@ -184,8 +216,24 @@ public class RNSPeer {
         //this.peerLink.setLinkEstablishedCallback(this::linkEstablished);
         //this.peerLink.setLinkClosedCallback(this::linkClosed);
         //this.peerLink.setPacketCallback(this::linkPacketReceived);
-        this.peerData = new RNSPeerData(this.destinationHash);
+        this.peerAddress = new ReticulumPeerAddress(this.destinationHash);
+        this.peerData = new PeerData(this.peerAddress, NTP.getTime(),"ReticulumPeer");
+        //this.peerData.setPeerType(PeerType.RETICULUM);
     }
+
+    /** 
+     * interface to instance
+     */
+    public ReticulumPeer unwrap() {
+        //Class<?> actualClass = myPeer.getClass();
+        //return (actualClass) this;
+        //return (T) this;
+        return (ReticulumPeer) this;
+    }
+    //public <T> T unwrap(Class<T> clazz) {
+    //    return clazz.cast(this);
+    //}
+
     public void initPeerLink() {
         peerDestination = new Destination(
             this.serverIdentity,
@@ -220,18 +268,24 @@ public class RNSPeer {
 
     public BufferedRWPair getOrInitPeerBuffer() {
         var channel = this.peerLink.getChannel();
+        var network = Network.getInstance();
+        var ntpNow = NTP.getTime();
         if (nonNull(this.peerBuffer)) {
             //log.info("peerBuffer exists: {}, link status: {}", this.peerBuffer, this.peerLink.getStatus());
             try {
                 log.trace("peerBuffer exists: {}, link status: {}", this.peerBuffer, this.peerLink.getStatus());
             } catch (IllegalStateException e) {
                 // Exception thrown by Reticulum if the buffer is unusable (Channel, Link, etc)
-                // This is a chance to correct links status when doing a RNSPingTask
+                // This is a chance to correct links status when doing a ReticulumPingTask
                 log.warn("can't establish Channel/Buffer (remote peer down?), closing link: {}");
                 this.peerBuffer.close();
                 this.peerLink.teardown();
                 this.peerLink = null;
                 //log.error("(handled) IllegalStateException - can't establish Channel/Buffer: {}", e);
+                network.removeOutboundHandshakedPeer(this);
+                network.removeConnectedPeer(this);
+                this.peerData.setLastAttempted(ntpNow);
+                this.peerData.setLastMisbehaved(ntpNow);
             }
         }
         else {
@@ -242,6 +296,9 @@ public class RNSPeer {
             //    this.sendStreamId = 1;
             //}
             this.peerBuffer = Buffer.createBidirectionalBuffer(receiveStreamId, sendStreamId, channel, this::peerBufferReady);
+            network.addOutboundHandshakedPeer(this);
+            this.peerData.setLastAttempted(ntpNow);
+            this.peerData.setLastConnected(ntpNow);
         }
         return getPeerBuffer();
     }
@@ -254,6 +311,11 @@ public class RNSPeer {
             initPeerLink();
         }
         return this.peerLink;
+    }
+
+    public void disconnect(String reason) {
+        log.debug("disconnecting peer - reason: {}", reason);
+        this.shutdown();
     }
 
     public void shutdown() {
@@ -271,6 +333,10 @@ public class RNSPeer {
             this.peerLink = null;
         }
         this.deleteMe = true;
+        var network = Network.getInstance();
+        network.removeHandshakedPeer(this);
+        network.removeConnectedPeer(this);
+
     }
 
     public Channel getChannel() {
@@ -282,9 +348,26 @@ public class RNSPeer {
         return getPeerLink().getChannel();
     }
 
-    public Boolean getIsInitiator() {
+    //public Boolean getIsInitiator() {
+    //    return this.isInitiator;
+    //}
+
+    public boolean isOutbound() {
         return this.isInitiator;
     }
+
+    public String getPeerIndexString() {
+        return encodeHexString(getDestinationHash());
+    }
+
+    public boolean hasActivePeerLink() {
+        var result = false;
+        if (nonNull(this.peerLink) && this.peerLink.getStatus() == ACTIVE) { result = true; }
+        return result;
+    }
+
+    public ReticulumPeer getInstance() { return this; }
+    //public Peer getInstance() { return null; }
 
     /** Link callbacks */
     public void linkEstablished(Link link) {
@@ -293,8 +376,16 @@ public class RNSPeer {
         log.info("peerLink {} established (link: {}) with peer: hash - {}, link destination hash: {}", 
             encodeHexString(peerLink.getLinkId()), encodeHexString(link.getLinkId()), encodeHexString(destinationHash),
             encodeHexString(link.getDestination().getHash()));
+        var ntpNow = NTP.getTime();
+        this.peerData.setLastConnected(ntpNow);
+        //this.peerData.setLastAttempted(ntpNow);
         if (isInitiator) {
             startPings();
+            var network = Network.getInstance();
+            network.addConnectedPeer(this);
+            // is a "handshaked" peer one with an established link or an established buffer?
+            // if the latter is correct we don't need the following line.
+            //network.addOutboundHandshakedPeer(this);
         }
     }
     
@@ -316,6 +407,12 @@ public class RNSPeer {
         } else {
             log.info("Link closed callback");
         }
+        RNS.getInstance().removePeer(this);
+        if (isInitiator) {
+            var network = Network.getInstance();
+            network.removeOutboundHandshakedPeer(this);
+            network.removeConnectedPeer(this);
+        }
     }
     
     public void linkPacketReceived(byte[] message, Packet packet) {
@@ -323,6 +420,7 @@ public class RNSPeer {
         if (msgText.equals("ping")) {
             log.info("received ping on link");
             this.lastLinkProbeTimestamp = Instant.now();
+            this.peerData.setLastAttempted(NTP.getTime());
         } else if (msgText.startsWith("close::")) {
             var targetPeerHash = subarray(message, 7, message.length);
             log.info("peer dest hash: {}, target hash: {}",
@@ -336,15 +434,21 @@ public class RNSPeer {
                 }
                 this.peerLink.teardown();
             }
+            if (isInitiator) {
+                var network = Network.getInstance();
+                network.removeOutboundHandshakedPeer(this);
+                network.removeConnectedPeer(this);
+            }
         } else if (msgText.startsWith("open::")) {
             var targetPeerHash = subarray(message, 7, message.length);
             log.info("peer dest hash: {}, target hash: {}",
                 encodeHexString(destinationHash),
                 encodeHexString(targetPeerHash));
             if (Arrays.equals(destinationHash, targetPeerHash)) {
-                log.info("closing link: {}", peerLink.getDestination().getHexHash());
+                log.info("re-opening existing link: {}", peerLink.getDestination().getHexHash());
                 getOrInitPeerLink();
             }
+            this.peerData.setLastConnected(NTP.getTime());
         }
     }
 
@@ -386,10 +490,10 @@ public class RNSPeer {
                 // Handle message based on type
                 switch (message.getType()) {
                     // Do we need this ? (seems like a TCP scenario only thing)
-                    // Does any RNSPeer ever require an other RNSPeer's peer list?
+                    // Does any ReticulumPeer ever require an other ReticulumPeer's peer list?
                     //case GET_PEERS:
                     //    //onGetPeersMessage(peer, message);
-                    //    onGetRNSPeersMessage(peer, message);
+                    //    onGetReticulumPeersMessage(peer, message);
                     //    break;
 
                     case PING:
@@ -409,36 +513,36 @@ public class RNSPeer {
                     ////    onPeersV2Message(peer, message);
                     ////    break;
 
-                    //case BLOCK_SUMMARIES:
-                    //    // from Synchronizer
-                    //    addToQueue(message);
-                    //    break;
-                    //
-                    //case BLOCK_SUMMARIES_V2:
-                    //    // from Synchronizer
-                    //    addToQueue(message);
-                    //    break;
-                    //
-                    //case SIGNATURES:
-                    //    // from Synchronizer
-                    //    addToQueue(message);
-                    //    break;
-                    //
-                    //case BLOCK:
-                    //    // from Synchronizer
-                    //    addToQueue(message);
-                    //    break;
-                    //
-                    //case BLOCK_V2:
-                    //    // from Synchronizer
-                    //    addToQueue(message);
-                    //    break;
+                    case BLOCK_SUMMARIES:
+                        // from Synchronizer
+                        addToQueue(message);
+                        break;
+
+                    case BLOCK_SUMMARIES_V2:
+                        // from Synchronizer
+                        addToQueue(message);
+                        break;
+
+                    case SIGNATURES:
+                        // from Synchronizer
+                        addToQueue(message);
+                        break;
+
+                    case BLOCK:
+                        // from Synchronizer
+                        addToQueue(message);
+                        break;
+
+                    case BLOCK_V2:
+                        // from Synchronizer
+                        addToQueue(message);
+                        break;
 
                     default:
-                        log.info("default - type {} message received ({} bytes)", message.getType(), data.length);
+                        log.debug("default - type {} message received ({} bytes)", message.getType(), data.length);
                         // Bump up to controller for possible action
                         //addToQueue(message);
-                        Controller.getInstance().onRNSNetworkMessage(this, message);
+                        Controller.getInstance().onNetworkMessage(this, message);
                         break;
                 }
             } catch (MessageException e) {
@@ -476,13 +580,13 @@ public class RNSPeer {
     }
 
     /**
-     * Set a packet to remote with the message format "close::<our_destination_hash>"
+     * Send a packet to remote with the message format "close::<our_destination_hash>"
      * This method is only useful for non-initiator links to close the remote initiator.
      *
      * @param link
      */
     public void sendCloseToRemote(Link link) {
-        var baseDestination = RNSNetwork.getInstance().getBaseDestination();
+        var baseDestination = RNS.getInstance().getBaseDestination();
         if (nonNull(link) & (isFalse(link.isInitiator()))) {
             // Note: if part of link we need to get the baseDesitination hash
             //var data = concatArrays("close::".getBytes(UTF_8),link.getDestination().getHash());
@@ -606,7 +710,9 @@ public class RNSPeer {
 
     /** qortal networking specific (Tasks) */
 
-    private void onPingMessage(RNSPeer peer, Message message) {
+    // Send Ping Message to peer through buffer.
+    // Note: This keeps Buffer,Channel and Link alive and from timing out.
+    private void onPingMessage(ReticulumPeer peer, Message message) {
         PingMessage pingMessage = (PingMessage) message;
     
         try {
@@ -615,6 +721,7 @@ public class RNSPeer {
             this.peerBuffer.write(pongMessage.toBytes());
             this.peerBuffer.flush();
             this.lastAccessTimestamp = Instant.now();
+            setLastPingSent(Instant.now().toEpochMilli());
         } catch (MessageException e) {
             //log.error("{} from peer {}", e.getMessage(), this);
             log.error("{} from peer {}", e, this);
@@ -634,8 +741,14 @@ public class RNSPeer {
      * @throws InterruptedException if interrupted while waiting
      */
     public Message getResponse(Message message) throws InterruptedException {
-        //log.info("RNSPingTask action - pinging peer {}", encodeHexString(getDestinationHash()));
-        return getResponseWithTimeout(message, RESPONSE_TIMEOUT);
+        //log.info("ReticulumPingTask action - pinging peer {}", encodeHexString(getDestinationHash()));
+        Message response = null;
+        try {
+            response = getResponseWithTimeout(message, RESPONSE_TIMEOUT);
+        } catch (InterruptedException e) {
+            log.error(e.getMessage(), e);
+        }
+        return response;
     }
 
     /**
@@ -715,7 +828,32 @@ public class RNSPeer {
         }
     }
 
-    protected Task getMessageTask() {
+    public boolean sendMessageWithTimeoutNow(Message message, int timeout) {
+        if (isNull(this.peerLink)) {
+            return false;
+        }
+        try {
+            // Queue message, to be picked up by ChannelWriteTask and then peer.writeChannel()
+            log.debug("Queuing {} message with ID {} to peer {}",
+                    message.getType().name(), message.getId(), this);
+
+            // Check message properly constructed
+            message.checkValidOutgoing();
+
+            // Possible race condition:
+            // We set OP_WRITE, EPC creates ChannelWriteTask which calls Peer.writeChannel, writeChannel's poll() finds no message to send
+            // Avoided by poll-with-timeout in writeChannel() above.
+            return this.sendQueue.tryTransfer(message, timeout, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            // Send failure
+            return false;
+        } catch (MessageException e) {
+            log.error(e.getMessage(), e);
+            return false;
+        }
+    }
+
+    public Task getMessageTask() {
         /*
          * If our peerLink is not in ACTIVE node and there is a message yet to be
          * processed then don't produce another message task.
@@ -732,7 +870,8 @@ public class RNSPeer {
         }
 
         // Return a task to process message in queue
-        return new RNSMessageTask(this, nextMessage);
+        //return new ReticulumMessageTask(this, nextMessage);
+        return new MessageTask(this, nextMessage);
     }
 
     /**
@@ -761,13 +900,13 @@ public class RNSPeer {
         }
     }
 
-    protected void startPings() {
+    public void startPings() {
         log.trace("[{}] Enabling pings for peer {}",
                 peerLink.getDestination().getHexHash(), this.toString());
         this.lastPingSent = NTP.getTime();
     }
 
-    protected Task getPingTask(Long now) {
+    public Task getPingTask(Long now) {
         // Pings not enabled yet?
         if (now == null || this.lastPingSent == null) {
             return null;
@@ -790,7 +929,7 @@ public class RNSPeer {
         // Not strictly true, but prevents this peer from being immediately chosen again
         this.lastPingSent = now;
 
-        return new RNSPingTask(this, now);
+        return new ReticulumPingTask(this, now);
     }
 
     // low-level Link (packet) ping
@@ -901,4 +1040,107 @@ public class RNSPeer {
         }
         return linkEstablishedTime;
     }
+
+    public long getMaxConnectionAge() {
+        // We never want to get disconnected automatically
+        return System.currentTimeMillis() - linkEstablishedTime + 1000L;
+    }
+
+    /**
+     * legacy Peer compatibility
+     */
+    public Long getPeersVersion() {
+        // set to the highest value we can find in legacy stack
+        return 0x300060001L;
+    }
+
+    public String getPeersVersionString() {
+        return "0x300060001L";
+    }
+
+    public void setPeersVersion(String versionString, long version) {
+        //synchronized (this.peerInfoLock) {
+            this.peersVersionString = versionString;
+            this.peersVersion = version;
+        //}
+    }
+    public String getPeersNodeId() {
+        //this.peersNodeId = RNS.getInstance().getServerIdentity().getHexHash();
+        if (nonNull(this.peerLink)) {
+            this.peersNodeId = this.peerLink.getDestination().getHexHash();
+        }
+        return this.peersNodeId;
+    }
+
+    public boolean isStopping() { return false; }
+
+    public UUID getPeerConnectionId() {
+        return null;
+    }
+
+    public Long getPeersConnectionTimestamp() {
+        //synchronized (this.peerInfoLock) {
+            return this.peersConnectionTimestamp;
+        //}
+    }
+
+    public void setPeersConnectionTimestamp(long peersConnectionTimestamp) {
+        //synchronized (this.peerInfoLock) {
+            this.peersConnectionTimestamp = peersConnectionTimestamp;
+        //}
+    }
+
+    public boolean isAtLeastVersion(String minVersionString) {
+        if (minVersionString == null) {
+            return false;
+        }
+
+        // Add the version prefix
+        minVersionString = Controller.VERSION_PREFIX + minVersionString;
+
+        Matcher matcher = VERSION_PATTERN.matcher(minVersionString);
+        if (!matcher.lookingAt()) {
+            return false;
+        }
+
+        // We're expecting 3 positive shorts, so we can convert 1.2.3 into 0x0100020003
+        long minVersion = 0;
+        for (int g = 1; g <= 3; ++g) {
+            long value = Long.parseLong(matcher.group(g));
+
+            if (value < 0 || value > Short.MAX_VALUE) {
+                return false;
+            }
+
+            minVersion <<= 16;
+            minVersion |= value;
+        }
+
+        return this.getPeersVersion() >= minVersion;
+    }
+
+    public void setLastPing(long lastPing) {
+        //synchronized (this.peerInfoLock) {
+            this.lastPing = lastPing;
+        //}
+    }
+
+    @Override
+    public void setIsDataPeer(boolean b) {
+        setPeerAspect(PeerAspect.BASE);
+        if (isTrue(b)) {
+            setPeerAspect(PeerAspect.DATA);
+        }
+    }
+
+    public boolean isDataPeer () {
+        var result = false;
+        if (this.getPeerAspect() == RNSCommon.PeerAspect.DATA) {
+            result = true;
+        }
+        return result;
+    }
+
+    // end legacy Peer compatibility
+
 }
