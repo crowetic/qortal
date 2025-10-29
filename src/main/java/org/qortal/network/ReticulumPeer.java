@@ -399,13 +399,13 @@ public class ReticulumPeer implements Peer {
             log.info("peerLink {} closed (link: {}), link destination hash: {}",
                 encodeHexString(peerLink.getLinkId()), encodeHexString(link.getLinkId()), encodeHexString(link.getDestination().getHash()));
             //this.peerBuffer = null;
-            peerLink.teardown();
+            //peerLink.teardown();
         } else if (link.getTeardownReason() == DESTINATION_CLOSED) {
             log.info("Link closed callback: The link was closed by the peer, removing peer");
             log.info("peerLink {} closed (link: {}), link destination hash: {}",
                 encodeHexString(peerLink.getLinkId()), encodeHexString(link.getLinkId()), encodeHexString(link.getDestination().getHash()));
             //this.peerBuffer = null;
-            peerLink.teardown();
+            //peerLink.teardown();
         } else {
             log.info("Link closed callback");
         }
