@@ -513,7 +513,7 @@ public class RNS {
                         break;
                     } else {
                         if (nonNull(p.getPeerLink())) {
-                            log.info("QAnnounceHandler - other peer - link: {}, status: {}",
+                            log.debug("QAnnounceHandler - other peer - link: {}, status: {}",
                                     encodeHexString(p.getPeerLink().getLinkId()), p.getPeerLink().getStatus());
                             if (p.getPeerLink().getStatus() == CLOSED) {
                                 // mark peer for deletion on nexe pruning

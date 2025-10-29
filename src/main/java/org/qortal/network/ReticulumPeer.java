@@ -421,7 +421,7 @@ public class ReticulumPeer implements Peer {
     public void linkPacketReceived(byte[] message, Packet packet) {
         var msgText = new String(message, StandardCharsets.UTF_8);
         if (msgText.equals("ping")) {
-            log.info("received ping on link");
+            log.debug("received ping on link");
             this.lastLinkProbeTimestamp = Instant.now();
             this.peerData.setLastAttempted(NTP.getTime());
         } else if (msgText.startsWith("close::")) {
@@ -690,7 +690,7 @@ public class ReticulumPeer implements Peer {
         var link = this.peerLink;
         if (nonNull(link)) {
             if (peerLink.getStatus() == ACTIVE) {
-                log.info("pinging remote (direct, 1 packet): {}", encodeHexString(link.getLinkId()));
+                log.debug("pinging remote (direct, 1 packet): {}", encodeHexString(link.getLinkId()));
                 var data = "ping".getBytes(UTF_8);
                 link.setPacketCallback(this::linkPacketReceived);
                 Packet pingPacket = new Packet(link, data);
