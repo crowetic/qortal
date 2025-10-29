@@ -398,21 +398,24 @@ public class ReticulumPeer implements Peer {
             log.info("Link closed callback: The initiator closed the link");
             log.info("peerLink {} closed (link: {}), link destination hash: {}",
                 encodeHexString(peerLink.getLinkId()), encodeHexString(link.getLinkId()), encodeHexString(link.getDestination().getHash()));
-            this.peerBuffer = null;
+            //this.peerBuffer = null;
+            peerLink.teardown();
         } else if (link.getTeardownReason() == DESTINATION_CLOSED) {
             log.info("Link closed callback: The link was closed by the peer, removing peer");
             log.info("peerLink {} closed (link: {}), link destination hash: {}",
                 encodeHexString(peerLink.getLinkId()), encodeHexString(link.getLinkId()), encodeHexString(link.getDestination().getHash()));
-            this.peerBuffer = null;
+            //this.peerBuffer = null;
+            peerLink.teardown();
         } else {
             log.info("Link closed callback");
         }
-        RNS.getInstance().removePeer(this);
-        if (isInitiator) {
-            var network = Network.getInstance();
-            network.removeOutboundHandshakedPeer(this);
-            network.removeConnectedPeer(this);
-        }
+        //// Note: leave removal to pruning
+        //RNS.getInstance().removePeer(this);
+        //if (isInitiator) {
+        //    var network = Network.getInstance();
+        //    network.removeOutboundHandshakedPeer(this);
+        //    network.removeConnectedPeer(this);
+        //}
     }
     
     public void linkPacketReceived(byte[] message, Packet packet) {
@@ -552,7 +555,11 @@ public class ReticulumPeer implements Peer {
                 // don't take any chances:
                 // can happen if link is closed by peer in which case we close this side of the link
                 this.peerData.setLastMisbehaved(NTP.getTime());
-                shutdown();
+                //shutdown();
+                //if (nonNull(this.peerBuffer)) {
+                //    this.peerBuffer.close();
+                //}
+                peerLink.teardown();
             }
         //}
     }
