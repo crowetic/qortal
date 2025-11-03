@@ -563,6 +563,7 @@ public class Controller extends Thread {
 		ArbitraryDataCleanupManager.getInstance().start();
 		ArbitraryDataStorageManager.getInstance().start();
 		ArbitraryDataRenderManager.getInstance().start();
+		ArbitraryDataHostMonitor.getInstance().start();
 
 		// start rebuild arbitrary resource cache timer task
 		if( Settings.getInstance().isRebuildArbitraryResourceCacheTaskEnabled() ) {
@@ -1273,6 +1274,7 @@ public class Controller extends Thread {
 				ArbitraryDataCleanupManager.getInstance().shutdown();
 				ArbitraryDataStorageManager.getInstance().shutdown();
 				ArbitraryDataRenderManager.getInstance().shutdown();
+				ArbitraryDataHostMonitor.getInstance().shutdown();
 
 				LOGGER.info("Shutting down online accounts manager");
 				OnlineAccountsManager.getInstance().shutdown();

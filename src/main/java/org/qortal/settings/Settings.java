@@ -549,7 +549,22 @@ public class Settings {
 	 */
 	private int rebuildArbitraryResourceCacheTaskPeriod = 24;
 
-	// Domain mapping
+	/**
+	 * Electrum Thread Count
+	 *
+	 * The number of threads ready to access Electrum servers for the supported foreign coins.
+	 */
+    private int electrumThreadCount = 12;
+
+	/**
+	 * Host Monitor Enabled
+	 *
+	 * The Host Monitor is a thread that runs in the background. It crawls through the QDN data directory to monitor
+	 * what is in there. If set to false, then it will not run.
+	 */
+    private  boolean hostMonitorEnabled = false;
+
+    // Domain mapping
 	public static class ThreadLimit {
 		private String messageType;
 		private Integer limit;
@@ -1471,5 +1486,13 @@ public class Settings {
 
 	public int getRebuildArbitraryResourceCacheTaskPeriod() {
 		return rebuildArbitraryResourceCacheTaskPeriod;
+	}
+
+	public int getElectrumThreadCount() {
+		return electrumThreadCount;
+	}
+
+	public boolean isHostMonitorEnabled() {
+		return hostMonitorEnabled;
 	}
 }
