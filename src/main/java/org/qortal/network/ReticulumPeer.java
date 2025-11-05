@@ -385,7 +385,7 @@ public class ReticulumPeer implements Peer {
             network.addConnectedPeer(this);
             // is a "handshaked" peer one with an established link or an established buffer?
             // if the latter is correct we don't need the following line.
-            //network.addOutboundHandshakedPeer(this);
+            network.addOutboundHandshakedPeer(this);
         }
     }
     

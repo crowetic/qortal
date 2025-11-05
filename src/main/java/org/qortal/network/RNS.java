@@ -578,8 +578,8 @@ public class RNS {
     public void addLinkedPeer(ReticulumPeer peer) {
         this.linkedPeers.add(peer);
         this.immutableLinkedPeers = List.copyOf(this.linkedPeers); // thread safe
-        //var network = Network.getInstance();
-        //network.addHandshakedPeer(peer);
+        var network = Network.getInstance();
+        network.addHandshakedPeer((Peer) peer);
     }
 
     public void removePeer(ReticulumPeer peer) {
@@ -600,8 +600,8 @@ public class RNS {
         var p = this.linkedPeers.remove(this.linkedPeers.indexOf(peer)); // thread safe
         this.immutableLinkedPeers = List.copyOf(this.linkedPeers);
         // TODO: which list in network do we add ACTIVE ReticulumPeer ?
-        //var network = Network.getInstance();
-        //network.removeHandshakedPeer(peer);
+        var network = Network.getInstance();
+        network.removeHandshakedPeer((Peer) peer);
     }
 
     // note: we already have a lobok getter for this
