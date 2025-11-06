@@ -96,6 +96,8 @@ public class ReticulumPeer implements Peer {
     @Setter(AccessLevel.PACKAGE) private Instant creationTimestamp;
     @Setter(AccessLevel.PACKAGE) private Instant lastAccessTimestamp;
     @Setter(AccessLevel.PACKAGE) private Instant lastLinkProbeTimestamp;
+    //@Setter(AccessLevel.PACKAGE) public boolean isPeerAvailable;
+    private boolean isPeerAvailable;  // peer is available in Network lists
     Link peerLink;
     byte[] peerLinkHash;
     BufferedRWPair peerBuffer;
@@ -314,6 +316,8 @@ public class ReticulumPeer implements Peer {
 
     public void disconnect(String reason) {
         log.debug("disconnecting peer - reason: {}", reason);
+        RNS.getInstance().makePeerUnavailable(this);
+        this.isPeerAvailable = false;
         this.shutdown();
     }
 
@@ -332,10 +336,6 @@ public class ReticulumPeer implements Peer {
             this.peerLink = null;
         }
         this.deleteMe = true;
-        //var network = Network.getInstance();
-        //network.removeHandshakedPeer(this);
-        //network.removeConnectedPeer(this);
-
     }
 
     public Channel getChannel() {
@@ -381,10 +381,12 @@ public class ReticulumPeer implements Peer {
         if (isInitiator) {
             startPings();
             // make the peer available to the network
-            var network = Network.getInstance();
-            network.addHandshakedPeer(this);
-            network.addConnectedPeer(this);
-            network.addOutboundHandshakedPeer(this);
+            RNS.getInstance().makePeerAvailable(this);
+            this.isPeerAvailable = true;
+            //var network = Network.getInstance();
+            //network.addHandshakedPeer(this);
+            //network.addConnectedPeer(this);
+            //network.addOutboundHandshakedPeer(this);
         }
     }
     
@@ -410,11 +412,13 @@ public class ReticulumPeer implements Peer {
         }
         //// Note: leave removal to pruning
         //RNS.getInstance().removePeer(this);
-        //if (isInitiator) {
-        //    var network = Network.getInstance();
-        //    network.removeOutboundHandshakedPeer(this);
-        //    network.removeConnectedPeer(this);
-        //}
+        if (isInitiator) {
+            RNS.getInstance().makePeerUnavailable(this);
+            this.isPeerAvailable = false;
+            //var network = Network.getInstance();
+            //network.removeOutboundHandshakedPeer(this);
+            //network.removeConnectedPeer(this);
+        }
     }
     
     public void linkPacketReceived(byte[] message, Packet packet) {
@@ -437,11 +441,13 @@ public class ReticulumPeer implements Peer {
                 this.peerLink.teardown();
             }
             // obsolete (?): Link status CLOSED means network ignores it until pruned
-            //if (isInitiator) {
-            //    var network = Network.getInstance();
-            //    network.removeOutboundHandshakedPeer(this);
-            //    network.removeConnectedPeer(this);
-            //}
+            if (isInitiator) {
+                RNS.getInstance().makePeerUnavailable(this);
+                this.isPeerAvailable = false;
+                //var network = Network.getInstance();
+                //network.removeOutboundHandshakedPeer(this);
+                //network.removeConnectedPeer(this);
+            }
         } else if (msgText.startsWith("open::")) {
             var targetPeerHash = subarray(message, 7, message.length);
             log.info("peer dest hash: {}, target hash: {}",
@@ -1146,6 +1152,10 @@ public class ReticulumPeer implements Peer {
             result = true;
         }
         return result;
+    }
+
+    public void setIsPeerAvailable(boolean b) {
+        this.isPeerAvailable = b;
     }
 
     // end legacy Peer compatibility
