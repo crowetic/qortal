@@ -316,8 +316,8 @@ public class ReticulumPeer implements Peer {
 
     public void disconnect(String reason) {
         log.debug("disconnecting peer - reason: {}", reason);
-        RNS.getInstance().makePeerUnavailable(this);
-        this.isPeerAvailable = false;
+        //RNS.getInstance().makePeerUnavailable(this);
+        //this.isPeerAvailable = false;
         this.shutdown();
     }
 
@@ -381,8 +381,8 @@ public class ReticulumPeer implements Peer {
         if (isInitiator) {
             startPings();
             // make the peer available to the network
-            RNS.getInstance().makePeerAvailable(this);
-            this.isPeerAvailable = true;
+            //RNS.getInstance().makePeerAvailable(this);
+            //this.isPeerAvailable = true;
             //var network = Network.getInstance();
             //network.addHandshakedPeer(this);
             //network.addConnectedPeer(this);
@@ -413,8 +413,8 @@ public class ReticulumPeer implements Peer {
         //// Note: leave removal to pruning
         //RNS.getInstance().removePeer(this);
         if (isInitiator) {
-            RNS.getInstance().makePeerUnavailable(this);
-            this.isPeerAvailable = false;
+            //RNS.getInstance().makePeerUnavailable(this);
+            //this.isPeerAvailable = false;
             //var network = Network.getInstance();
             //network.removeOutboundHandshakedPeer(this);
             //network.removeConnectedPeer(this);
@@ -442,8 +442,8 @@ public class ReticulumPeer implements Peer {
             }
             // obsolete (?): Link status CLOSED means network ignores it until pruned
             if (isInitiator) {
-                RNS.getInstance().makePeerUnavailable(this);
-                this.isPeerAvailable = false;
+                //RNS.getInstance().makePeerUnavailable(this);
+                //this.isPeerAvailable = false;
                 //var network = Network.getInstance();
                 //network.removeOutboundHandshakedPeer(this);
                 //network.removeConnectedPeer(this);

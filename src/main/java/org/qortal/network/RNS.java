@@ -576,21 +576,22 @@ public class RNS {
     //    return this.immutableLinkedPeers;
     //}
 
-    public void makePeerAvailable(ReticulumPeer peer) {
-        var network = Network.getInstance();
-        network.addConnectedPeer(peer);
-        network.addOutboundHandshakedPeer(peer);
-        network.addHandshakedPeer(peer);
-    }
+    //@Synchronized
+    //public void makePeerAvailable(ReticulumPeer peer) {
+    //    var network = Network.getInstance();
+    //    network.addConnectedPeer(peer);
+    //    network.addOutboundHandshakedPeer(peer);
+    //    network.addHandshakedPeer(peer);
+    //}
 
     public void addLinkedPeer(ReticulumPeer peer) {
         this.linkedPeers.add(peer);
         this.immutableLinkedPeers = List.copyOf(this.linkedPeers); // thread safe
         // Note: moved to ReticulumPeer linkEstablished
-        //var network = Network.getInstance();
-        //network.addConnectedPeer(peer);
-        //network.addOutboundHandshakedPeer(peer);
-        //network.addHandshakedPeer(peer);
+        var network = Network.getInstance();
+        network.addConnectedPeer(peer);
+        network.addOutboundHandshakedPeer(peer);
+        network.addHandshakedPeer(peer);
     }
 
     public void removePeer(ReticulumPeer peer) {
@@ -601,12 +602,13 @@ public class RNS {
         }
     }
 
-    public void makePeerUnavailable(ReticulumPeer peer) {
-        var network = Network.getInstance();
-        network.removeHandshakedPeer(peer);
-        network.removeOutboundHandshakedPeer(peer);
-        network.removeConnectedPeer(peer);
-    }
+    //@Synchronized
+    //public void makePeerUnavailable(ReticulumPeer peer) {
+    //    var network = Network.getInstance();
+    //    network.removeHandshakedPeer(peer);
+    //    network.removeOutboundHandshakedPeer(peer);
+    //    network.removeConnectedPeer(peer);
+    //}
 
     public void removeLinkedPeer(ReticulumPeer peer) {
         if (nonNull(peer.getPeerBuffer())) {
@@ -617,10 +619,10 @@ public class RNS {
         }
         var p = this.linkedPeers.remove(this.linkedPeers.indexOf(peer)); // thread safe
         this.immutableLinkedPeers = List.copyOf(this.linkedPeers);
-        //var network = Network.getInstance();
-        //network.removeHandshakedPeer(peer);
-        //network.removeOutboundHandshakedPeer(peer);
-        //network.removeConnectedPeer(peer);
+        var network = Network.getInstance();
+        network.removeHandshakedPeer(peer);
+        network.removeOutboundHandshakedPeer(peer);
+        network.removeConnectedPeer(peer);
     }
 
     // note: we already have a lobok getter for this
@@ -727,8 +729,8 @@ public class RNS {
             if (nonNull(pLink)) {
                 if (p.getPeerTimedOut()) {
                     // options: keep in case peer reconnects or remove => we'll remove it
-                    makePeerUnavailable(p);
-                    p.setPeerTimedOut(false);
+                    //makePeerUnavailable(p);
+                    //p.setPeerTimedOut(false);
                     removeLinkedPeer(p);
                     continue;
                 }
@@ -736,15 +738,15 @@ public class RNS {
                     continue;
                 }
                 if ((pLink.getStatus() == CLOSED) || (p.getDeleteMe()))  {
-                    makePeerUnavailable(p);
-                    p.setDeleteMe(false);
+                    //makePeerUnavailable(p);
+                    //p.setDeleteMe(false);
                     removeLinkedPeer(p);
                     continue;
                 }
                 if (pLink.getStatus() == PENDING) {
                     pLink.teardown();
-                    makePeerUnavailable(p);
-                    p.setIsPeerAvailable(false);
+                    //makePeerUnavailable(p);
+                    //p.setIsPeerAvailable(false);
                     removeLinkedPeer(p);
                     continue;
                 }
