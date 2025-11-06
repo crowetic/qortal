@@ -268,7 +268,7 @@ public class ReticulumPeer implements Peer {
 
     public BufferedRWPair getOrInitPeerBuffer() {
         var channel = this.peerLink.getChannel();
-        var network = Network.getInstance();
+        //var network = Network.getInstance();
         var ntpNow = NTP.getTime();
         if (nonNull(this.peerBuffer)) {
             //log.info("peerBuffer exists: {}, link status: {}", this.peerBuffer, this.peerLink.getStatus());
@@ -282,8 +282,8 @@ public class ReticulumPeer implements Peer {
                 this.peerLink.teardown();
                 this.peerLink = null;
                 //log.error("(handled) IllegalStateException - can't establish Channel/Buffer: {}", e);
-                network.removeOutboundHandshakedPeer(this);
-                network.removeConnectedPeer(this);
+                //network.removeOutboundHandshakedPeer(this);
+                //network.removeConnectedPeer(this);
                 this.peerData.setLastAttempted(ntpNow);
                 this.peerData.setLastMisbehaved(ntpNow);
             }
@@ -296,7 +296,6 @@ public class ReticulumPeer implements Peer {
             //    this.sendStreamId = 1;
             //}
             this.peerBuffer = Buffer.createBidirectionalBuffer(receiveStreamId, sendStreamId, channel, this::peerBufferReady);
-            network.addOutboundHandshakedPeer(this);
             this.peerData.setLastAttempted(ntpNow);
             this.peerData.setLastConnected(ntpNow);
         }
@@ -333,9 +332,9 @@ public class ReticulumPeer implements Peer {
             this.peerLink = null;
         }
         this.deleteMe = true;
-        var network = Network.getInstance();
-        network.removeHandshakedPeer(this);
-        network.removeConnectedPeer(this);
+        //var network = Network.getInstance();
+        //network.removeHandshakedPeer(this);
+        //network.removeConnectedPeer(this);
 
     }
 
@@ -381,10 +380,10 @@ public class ReticulumPeer implements Peer {
         //this.peerData.setLastAttempted(ntpNow);
         if (isInitiator) {
             startPings();
+            // make the peer available to the network
             var network = Network.getInstance();
+            network.addHandshakedPeer(this);
             network.addConnectedPeer(this);
-            // is a "handshaked" peer one with an established link or an established buffer?
-            // if the latter is correct we don't need the following line.
             network.addOutboundHandshakedPeer(this);
         }
     }
@@ -437,11 +436,12 @@ public class ReticulumPeer implements Peer {
                 }
                 this.peerLink.teardown();
             }
-            if (isInitiator) {
-                var network = Network.getInstance();
-                network.removeOutboundHandshakedPeer(this);
-                network.removeConnectedPeer(this);
-            }
+            // obsolete (?): Link status CLOSED means network ignores it until pruned
+            //if (isInitiator) {
+            //    var network = Network.getInstance();
+            //    network.removeOutboundHandshakedPeer(this);
+            //    network.removeConnectedPeer(this);
+            //}
         } else if (msgText.startsWith("open::")) {
             var targetPeerHash = subarray(message, 7, message.length);
             log.info("peer dest hash: {}, target hash: {}",

@@ -578,8 +578,11 @@ public class RNS {
     public void addLinkedPeer(ReticulumPeer peer) {
         this.linkedPeers.add(peer);
         this.immutableLinkedPeers = List.copyOf(this.linkedPeers); // thread safe
-        var network = Network.getInstance();
-        network.addHandshakedPeer((Peer) peer);
+        // Note: moved to ReticulumPeer linkEstablished
+        //var network = Network.getInstance();
+        //network.addConnectedPeer(peer);
+        //network.addOutboundHandshakedPeer(peer);
+        //network.addHandshakedPeer(peer);
     }
 
     public void removePeer(ReticulumPeer peer) {
@@ -591,17 +594,18 @@ public class RNS {
     }
 
     public void removeLinkedPeer(ReticulumPeer peer) {
-        //if (nonNull(peer.getPeerBuffer())) {
-        //    peer.getPeerBuffer().close();
-        //}
+        if (nonNull(peer.getPeerBuffer())) {
+            peer.getPeerBuffer().close();
+        }
         if (nonNull(peer.getPeerLink())) {
             peer.getPeerLink().teardown();
         }
         var p = this.linkedPeers.remove(this.linkedPeers.indexOf(peer)); // thread safe
         this.immutableLinkedPeers = List.copyOf(this.linkedPeers);
-        // TODO: which list in network do we add ACTIVE ReticulumPeer ?
         var network = Network.getInstance();
-        network.removeHandshakedPeer((Peer) peer);
+        network.removeHandshakedPeer(peer);
+        network.removeOutboundHandshakedPeer(peer);
+        network.removeConnectedPeer(peer);
     }
 
     // note: we already have a lobok getter for this
@@ -618,6 +622,9 @@ public class RNS {
     }
 
     public void removeIncomingPeer(ReticulumPeer peer) {
+        if (nonNull(peer.getPeerBuffer())) {
+            peer.getPeerBuffer().close();
+        }
         if (nonNull(peer.getPeerLink())) {
             peer.getPeerLink().teardown();
         }
@@ -695,7 +702,6 @@ public class RNS {
         List<ReticulumPeer> incomingPeerList = getImmutableIncomingPeers();
         int numActiveIncomingPeers = incomingPeerList.size() - getNonActiveIncomingPeers().size();
         List<PeerData> allKnownReticulumPeers = new ArrayList<>();
-        //var network = Network.getInstance();
         log.info("number of links (linkedPeers (active) / incomingPeers (active) before prunig: {} ({}), {} ({})",
                 initiatorPeerList.size(), getActiveImmutableLinkedPeers().size(),
                 incomingPeerList.size(), numActiveIncomingPeers);
@@ -709,7 +715,6 @@ public class RNS {
                 if (p.getPeerTimedOut()) {
                     // options: keep in case peer reconnects or remove => we'll remove it
                     removeLinkedPeer(p);
-                    //network.removeHandshakedPeer(p);
                     continue;
                 }
                 if (pLink.getStatus() == ACTIVE) {
@@ -717,13 +722,11 @@ public class RNS {
                 }
                 if ((pLink.getStatus() == CLOSED) || (p.getDeleteMe()))  {
                     removeLinkedPeer(p);
-                    //network.removeHandshakedPeer(p);
                     continue;
                 }
                 if (pLink.getStatus() == PENDING) {
                     pLink.teardown();
                     removeLinkedPeer(p);
-                    //network.removeOutboundHandshakedPeer(p);
                     continue;
                 }
             }
