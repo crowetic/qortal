@@ -101,8 +101,8 @@ public class ReticulumPeer implements Peer {
     Link peerLink;
     byte[] peerLinkHash;
     BufferedRWPair peerBuffer;
-    int receiveStreamId = 0;
-    int sendStreamId = 0;
+    int receiveStreamId = 1001;
+    int sendStreamId = 1001;
     ReticulumPeerAddress peerAddress;
     //private Boolean isInitiator;
     @Getter public Boolean isInitiator;
@@ -906,7 +906,8 @@ public class ReticulumPeer implements Peer {
             this.peerLink.teardown();
             this.peerBuffer = null;
             log.error("IllegalStateException - can't write to buffer: {}", e);
-            return false;
+            //return false;
+            return true;
         } catch (MessageException e) {
             log.error(e.getMessage(), e);
             return false;
