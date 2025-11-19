@@ -379,14 +379,13 @@ public class ReticulumPeer implements Peer {
         this.peerData.setLastConnected(ntpNow);
         //this.peerData.setLastAttempted(ntpNow);
         if (isInitiator) {
-            startPings();
             // make the peer available to the network
-            //RNS.getInstance().makePeerAvailable(this);
-            //this.isPeerAvailable = true;
-            //var network = Network.getInstance();
-            //network.addHandshakedPeer(this);
-            //network.addConnectedPeer(this);
-            //network.addOutboundHandshakedPeer(this);
+            var network = Network.getInstance();
+            network.addConnectedPeer(this);
+            network.addOutboundHandshakedPeer(this);
+            network.addHandshakedPeer(this);
+            this.isPeerAvailable = true;
+            startPings();
         }
     }
     
@@ -741,6 +740,10 @@ public class ReticulumPeer implements Peer {
         }
     }
 
+    //public void onPingMessage(Peer peer, Message message) {
+    //    onPingMessage(this, message);
+    //}
+
     /**
      * Send message to peer and await response, using default RESPONSE_TIMEOUT.
      * <p>
@@ -897,21 +900,22 @@ public class ReticulumPeer implements Peer {
     public boolean sendMessage(Message message) {
         try {
             log.trace("Sending {} message with ID {} to peer {}", message.getType().name(), message.getId(), this.toString());
-            //log.info("Sending {} message with ID {} to peer {}", message.getType().name(), message.getId(), this.toString());
             var peerBuffer = getOrInitPeerBuffer();
             peerBuffer.write(message.toBytes());
             peerBuffer.flush();
-            return true;
+            //return true;
         } catch (IllegalStateException e) {
             this.peerLink.teardown();
             this.peerBuffer = null;
             log.error("IllegalStateException - can't write to buffer: {}", e);
             //return false;
-            return true;
         } catch (MessageException e) {
             log.error(e.getMessage(), e);
-            return false;
+            //return false;
         }
+        // ReticulumPeer state is not governed by the network.
+        // Regardless we need to satisfy the Peer interface.
+        return true;
     }
 
     public void startPings() {

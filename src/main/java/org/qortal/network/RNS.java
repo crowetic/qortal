@@ -38,6 +38,7 @@ import lombok.Synchronized;
 
 //import org.apache.commons.io.FileUtils;
 import org.apache.commons.lang3.StringUtils;
+import org.qortal.network.message.*;
 import org.qortal.repository.DataException;
 import org.qortal.settings.Settings;
 
@@ -59,7 +60,7 @@ import static java.nio.charset.StandardCharsets.UTF_8;
 //import static java.util.Objects.isNull;
 import static java.util.Objects.nonNull;
 //import static org.apache.commons.lang3.BooleanUtils.isTrue;
-//import static org.apache.commons.lang3.BooleanUtils.isFalse;
+import static org.apache.commons.lang3.BooleanUtils.isFalse;
 
 import java.io.File;
 import java.util.*;
@@ -81,10 +82,6 @@ import static org.apache.commons.codec.binary.Hex.encodeHexString;
 //import org.qortal.utils.ExecuteProduceConsume.StatsSnapshot;
 import org.qortal.utils.NTP;
 //import org.qortal.utils.NamedThreadFactory;
-import org.qortal.network.message.Message;
-import org.qortal.network.message.BlockSummariesV2Message;
-import org.qortal.network.message.TransactionSignaturesMessage;
-import org.qortal.network.message.GetUnconfirmedTransactionsMessage;
 import org.qortal.data.network.PeerData;
 import org.qortal.controller.Controller;
 import org.qortal.repository.Repository;
@@ -360,6 +357,7 @@ public class RNS {
                 p.sendCloseToRemote(pl);
             }
         }
+        log.debug("Shutdown of incomingPeers completed");
         // Disconnect peers gracefully and terminate Reticulum
         for (ReticulumPeer p: linkedPeers) {
             log.info("shutting down peer: {}", encodeHexString(p.getDestinationHash()));
@@ -375,6 +373,7 @@ public class RNS {
             //    pl.teardown();
             //}
         }
+        log.debug("Shutdown of linkedPeers completed");
         //// Stop processing threads (the "server loop")
         //try {
         //    if (!this.rnsNetworkEPC.shutdown(5000)) {
@@ -478,7 +477,6 @@ public class RNS {
         }
 
         @Override
-        @Synchronized
         public void receivedAnnounce(byte[] destinationHash, Identity announcedIdentity, byte[] appData) {
             var peerExists = false;
             var activePeerCount = 0; 
@@ -587,11 +585,11 @@ public class RNS {
     public void addLinkedPeer(ReticulumPeer peer) {
         this.linkedPeers.add(peer);
         this.immutableLinkedPeers = List.copyOf(this.linkedPeers); // thread safe
-        // Note: moved to ReticulumPeer linkEstablished
-        var network = Network.getInstance();
-        network.addConnectedPeer(peer);
-        network.addOutboundHandshakedPeer(peer);
-        network.addHandshakedPeer(peer);
+        //// Note: moved to ReticulumPeer linkEstablished
+        //var network = Network.getInstance();
+        //network.addConnectedPeer(peer);
+        //network.addOutboundHandshakedPeer(peer);
+        //network.addHandshakedPeer(peer);
     }
 
     public void removePeer(ReticulumPeer peer) {
@@ -806,6 +804,34 @@ public class RNS {
     /**
      * Helper methods
      */
+
+    // Send Ping Message to peer through buffer.
+    // Note: This keeps Buffer,Channel and Link alive and from timing out.
+    public void onPingMessage(ReticulumPeer peer, Message message) {
+        PingMessage pingMessage = (PingMessage) message;
+
+        if (isFalse(peer.getIsInitiator())) {
+            return;
+        }
+
+        try {
+            var pb = peer.getPeerBuffer();
+            PongMessage pongMessage = new PongMessage();
+            pongMessage.setId(message.getId());  // use the ping message id (for ping getResponse)
+            pb.write(pongMessage.toBytes());
+            pb.flush();
+            peer.setLastAccessTimestamp(Instant.now());
+            peer.setLastPingSent(Instant.now().toEpochMilli());
+        } catch (MessageException e) {
+            //log.error("{} from peer {}", e.getMessage(), this);
+            log.error("{} from peer {}", e, this);
+        }
+    }
+
+    public void onPeersV2Message (Peer peer, Message message) {
+        // TODO: Do we do anything for ReticulumPeer (?)
+        log.debug("PeersV2Message - received {} message from {}", message.getType(), message);
+    }
 
     public List<PeerData> getAllKnownPeers() {
         return getImmutableIncomingPeers().stream()
