@@ -818,6 +818,10 @@ public class ReticulumPeer implements Peer {
      */
     public boolean sendMessageWithTimeout(Message message, int timeout) {
         try {
+            if ((isNull(this.peerLink)) || (this.peerLink.getStatus() != ACTIVE)) {
+                log.debug("sendMessage - skipping: link not ready (status: {})", this.peerLink.getStatus());
+                return false;
+            }
             // send the message
             log.trace("Sending {} message with ID {} to peer {}", message.getType().name(), message.getId(), this);
             var peerBuffer = getOrInitPeerBuffer();
@@ -899,6 +903,10 @@ public class ReticulumPeer implements Peer {
     //@Synchronized
     public boolean sendMessage(Message message) {
         try {
+            if ((isNull(this.peerLink)) || (this.peerLink.getStatus() != ACTIVE)) {
+                log.debug("sendMessage - skipping: link not ready (status: {})", this.peerLink.getStatus());
+                return false;
+            }
             log.trace("Sending {} message with ID {} to peer {}", message.getType().name(), message.getId(), this.toString());
             var peerBuffer = getOrInitPeerBuffer();
             peerBuffer.write(message.toBytes());
@@ -906,7 +914,7 @@ public class ReticulumPeer implements Peer {
             //return true;
         } catch (IllegalStateException e) {
             this.peerLink.teardown();
-            this.peerBuffer = null;
+            //this.peerBuffer = null;
             log.error("IllegalStateException - can't write to buffer: {}", e);
             //return false;
         } catch (MessageException e) {
