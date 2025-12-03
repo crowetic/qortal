@@ -173,10 +173,6 @@ public class Network {
         minOutboundPeers = settings.getMinOutboundPeers() + settings.getReticulumMinOutboundPeers();
         maxPeers = settings.getIpMaxPeers() + settings.getReticulumMaxPeers();
 
-        // Instantiate Reticulum
-        rns = RNS.getInstance();
-        //rns = new RNS();
-
         // We'll use a cached thread pool but with more aggressive timeout.
         ExecutorService networkExecutor = new ThreadPoolExecutor(2,
                 Settings.getInstance().getMaxNetworkThreadPoolSize(),
@@ -184,6 +180,9 @@ public class Network {
                 new SynchronousQueue<Runnable>(),
                 new NamedThreadFactory("Network-EPC", Settings.getInstance().getNetworkThreadPriority()));
         networkEPC = new NetworkProcessor(networkExecutor);
+
+        // Instantiate and initialise Reticulum
+        rns = RNS.getInstance();
     }
 
     public void start() throws IOException, DataException {
@@ -1084,11 +1083,7 @@ public class Network {
                 return;
 
             case PEERS_V2:
-                if (pType == PeerType.RETICULUM) {
-                    rns.onPeersV2Message(peer, message);
-                } else {
-                    onPeersV2Message(peer, message);
-                }
+                onPeersV2Message(peer, message);
                 break;
 
             default:
@@ -1170,6 +1165,14 @@ public class Network {
 
     private void onPeersV2Message(Peer peer, Message message) {
         PeersV2Message peersV2Message = (PeersV2Message) message;
+
+        //if (pType == PeerType.RETICULUM) {
+        //    rns.onPeersV2Message(peer, message);
+        //}
+        if (peer.hasActivePeerLink()) {
+            RNS.getInstance().onPeersV2Message(peer, peersV2Message);
+            return;
+        }
 
         List<PeerAddress> peerV2Addresses = peersV2Message.getPeerAddresses();
 
@@ -1659,7 +1662,11 @@ public class Network {
             }
 
             if (!peer.sendMessage(message)) {
-                peer.disconnect("failed to broadcast message");
+                if (peer.hasActivePeerLink()) {
+                    LOGGER.debug("broadcast - ReticulumPeer without ACTIVE link");
+                } else {
+                    peer.disconnect("failed to broadcast message");
+                }
             }
         }
     }

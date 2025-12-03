@@ -650,15 +650,14 @@ public class Settings {
     /** Minimum number of Reticulum Data peers desired. */
     private int reticulumMinDesiredDataPeers = 8;
 	/** Maximum number of task executor network threads */
-	//private int reticulumMaxNetworkThreadPoolSize = 89;
+	private int reticulumMaxNetworkThreadPoolSize = 55;
 	/** Node provides a TCPServerInterface or other "qortal"/"qortaltest" gateway interface */
 	private boolean reticulumHasServerInterface = false;
 	/** Number of desired client Interfaces (taken from core server list) */
 	private int reticulumDesiredClientInterfaces = 1;
 	/** Array of core Reticulum server hostnames. TCP only */
 	private String[] reticulumTcpGatewayServers = new String[]{
-			"phantom.mobilefabrik.com",
-			"phantom.tuergass.net"
+			"phantom.mobilefabrik.com:4242"
 	};
 	/** There is a Python rnsd running on the node with a gateway inteface to use */
 	private boolean reticulumUsePythonRNS = false;
@@ -1448,9 +1447,9 @@ public class Settings {
         return this.reticulumMinDesiredDataPeers;
     }
 
-	//public int getReticulumMaxNetworkThreadPoolSize() {
-	//	return this.reticulumMaxNetworkThreadPoolSize;
-  	//}
+	public int getReticulumMaxNetworkThreadPoolSize() {
+		return this.reticulumMaxNetworkThreadPoolSize;
+  	}
 
 	public boolean getReticulumIsGateway() { return this.reticulumHasServerInterface; }
 
