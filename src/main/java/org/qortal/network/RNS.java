@@ -71,6 +71,7 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicLong;
 //import java.util.concurrent.locks.Lock;
 //import java.util.concurrent.locks.ReentrantLock;
+//import java.util.concurrent.ThreadLocalRandom;
 import java.util.function.Function;
 import java.time.Instant;
 import java.util.stream.Collectors;
@@ -175,11 +176,15 @@ public class RNS {
         log.info("reticulum instance created");
         log.debug("reticulum instance created: {}", reticulum);
         //        Settings.getInstance().getMaxRNSNetworkThreadPoolSize(),   // statically set to 5 below
+        var networkDataPriority = Settings.getInstance().getNetworkThreadPriority();
+        //if (networkDataPriority > 1) {
+        //    networkDataPriority--; // keep network priority below the on of Network-EPC
+        //}
         ExecutorService RNSExecutor = new ThreadPoolExecutor(1,
-                5,
+                8,  // we don't need many max threads
                 NETWORK_EPC_KEEPALIVE, TimeUnit.SECONDS,
                 new SynchronousQueue<Runnable>(),
-                new NamedThreadFactory("RNS-EPC", Settings.getInstance().getNetworkThreadPriority()));
+                new NamedThreadFactory("RNS-EPC", networkDataPriority));
         rnsEPC = new RNSProcessor(RNSExecutor);
     }
 
@@ -208,7 +213,7 @@ public class RNS {
 
         // show the ifac_size of the configured interfaces (debug code)
         for (ConnectionInterface i: Transport.getInstance().getInterfaces() ) {
-            log.info("interface {}, length: {}", i.getInterfaceName(), i.getIfacSize());
+            log.debug("interface {}, length: {}", i.getInterfaceName(), i.getIfacSize());
         }
 
         baseDestination = new Destination(
@@ -219,14 +224,14 @@ public class RNS {
             "core"
         );
         log.info("Destination {} {} running", encodeHexString(baseDestination.getHash()), baseDestination.getName());
-        dataDestination = new Destination(
-            serverIdentity,
-            Direction.IN,
-            DestinationType.SINGLE,
-            APP_NAME,
-            "qdn"
-        );
-        log.info("Destination {} {} running", encodeHexString(dataDestination.getHash()), dataDestination.getName());
+        //dataDestination = new Destination(
+        //    serverIdentity,
+        //    Direction.IN,
+        //    DestinationType.SINGLE,
+        //    APP_NAME,
+        //    "qdn"
+        //);
+        //log.info("Destination {} {} running", encodeHexString(dataDestination.getHash()), dataDestination.getName());
    
         baseDestination.setProofStrategy(ProofStrategy.PROVE_ALL);
         baseDestination.setAcceptLinkRequests(true);
@@ -239,10 +244,10 @@ public class RNS {
         Transport.getInstance().registerAnnounceHandler(new QAnnounceHandler("qortal.core"));
         //Transport.getInstance().registerAnnounceHandler(new QAnnounceHandler("qortal.qdn"));
         log.debug("announceHandlers: {}", Transport.getInstance().getAnnounceHandlers());
-        // do a first announce
+        // do a first announce (across all configured interfaces)
         baseDestination.announce();
         log.debug("Sent initial announce from {} ({})", encodeHexString(baseDestination.getHash()), baseDestination.getName());
-        // announce QDN destination
+        // announce QDN destination (across all configured interfaces)
         //dataDestination.announce();
         //log.debug("Sent initial announce from {} ({})", encodeHexString(dataDestination.getHash()), dataDestination.getName());
 
@@ -363,6 +368,15 @@ public class RNS {
         log.info("shutting down Reticulum");
         baseDestination.setProofStrategy(ProofStrategy.PROVE_NONE);
         //dataDestination.setProofStrategy(ProofStrategy.PROVE_NONE);
+
+        // Stop processing threads
+        try {
+            if (!this.rnsEPC.shutdown(5000)) {
+                log.warn("Reticulum threads failed to terminate");
+            }
+        } catch (InterruptedException e) {
+            log.warn("Interrupted while waiting for rnsEPC threads to terminate");
+        }
         
         // gracefully close links of peers that point to us
         for (ReticulumPeer p: incomingPeers) {
@@ -375,27 +389,15 @@ public class RNS {
         // Disconnect peers gracefully and terminate Reticulum
         for (ReticulumPeer p: linkedPeers) {
             log.info("shutting down peer: {}", encodeHexString(p.getDestinationHash()));
-            //log.debug("peer: {}", p);
+            //p.makePeerUnavailable();
             p.shutdown();
             try {
                 TimeUnit.MILLISECONDS.sleep(200); // allow for peers to disconnect gracefully
             } catch (InterruptedException e) {
                 log.error("exception: ", e);
             }
-            //var pl = p.getPeerLink();
-            //if (nonNull(pl) & (pl.getStatus() == ACTIVE)) {
-            //    pl.teardown();
-            //}
         }
         log.debug("Shutdown of linkedPeers completed");
-        //// Stop processing threads (the "server loop")
-        //try {
-        //    if (!this.rnsEPC.shutdown(5000)) {
-        //        log.warn("RNS threads failed to terminate");
-        //    }
-        //} catch (InterruptedException e) {
-        //    log.warn("Interrupted while waiting for RNS threads to terminate");
-        //}
         // Note: we still need to get the packet timeout callback to work...
         reticulum.exitHandler();
     }
@@ -830,16 +832,16 @@ public class RNS {
         log.info("number of links (linkedPeers (active) / incomingPeers (active) before prunig: {} ({}), {} ({})",
                 initiatorPeerList.size(), getActiveImmutableLinkedPeers().size(),
                 incomingPeerList.size(), numActiveIncomingPeers);
-        for (ReticulumPeer p: initiatorActivePeerList) {
-            //pLink = p.getOrInitPeerLink();
-            p.pingRemote();
-        }
+        //for (ReticulumPeer p: initiatorActivePeerList) {
+        //    //pLink = p.getOrInitPeerLink();
+        //    p.pingRemote();
+        //}
         for (ReticulumPeer p : initiatorPeerList) {
             pLink = p.getPeerLink();
             if (nonNull(pLink)) {
                 if (p.getPeerTimedOut()) {
                     // options: keep in case peer reconnects or remove => we'll remove it
-                    //makePeerUnavailable(p);
+                    //p.makePeerUnavailable();
                     //p.setPeerTimedOut(false);
                     removeLinkedPeer(p);
                     continue;
@@ -848,15 +850,15 @@ public class RNS {
                     continue;
                 }
                 if ((pLink.getStatus() == CLOSED) || (p.getDeleteMe()))  {
-                    //makePeerUnavailable(p);
-                    //p.setDeleteMe(false);
+                    p.makePeerUnavailable();
+                    p.setDeleteMe(false);
                     removeLinkedPeer(p);
                     continue;
                 }
                 if (pLink.getStatus() == PENDING) {
                     pLink.teardown();
-                    //makePeerUnavailable(p);
-                    //p.setIsPeerAvailable(false);
+                    p.makePeerUnavailable();
+                    p.setIsPeerAvailable(false);
                     removeLinkedPeer(p);
                     continue;
                 }
@@ -865,14 +867,14 @@ public class RNS {
         // prune non-initiator peers
         List<ReticulumPeer> inaps = getNonActiveIncomingPeers();
         incomingPeerList = this.incomingPeers;
-        for (ReticulumPeer p: incomingPeerList) {
-            pLink = p.getOrInitPeerLink();
-            if (nonNull(pLink) && (pLink.getStatus() == ACTIVE)) {
-                // make false active links to timeout (and teardown in timeout callback)
-                // note: actual removal of peer happens on the following pruning run.
-                p.pingRemote();
-            }
-        }
+        //for (ReticulumPeer p: incomingPeerList) {
+        //    pLink = p.getOrInitPeerLink();
+        //    if (nonNull(pLink) && (pLink.getStatus() == ACTIVE)) {
+        //        // make false active links to timeout (and teardown in timeout callback)
+        //        // note: actual removal of peer happens on the following pruning run.
+        //        p.pingRemote();
+        //    }
+        //}
         for (ReticulumPeer p: inaps) {
             pLink = p.getPeerLink();
             if (nonNull(pLink)) {

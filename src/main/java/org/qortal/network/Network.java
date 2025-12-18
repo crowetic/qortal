@@ -339,6 +339,12 @@ public class Network {
         return this.immutableConnectedPeers;
     }
 
+    public List<Peer> getImmutableConnectedIPPeers() {
+        return this.immutableConnectedPeers.stream()
+                .filter(p -> p.getPeerData().getPeerType() == PeerType.IP)
+                .collect(Collectors.toList());
+    }
+
     public List<Peer> getImmutableConnectedDataPeers() {
         return this.getImmutableConnectedPeers().stream()
                 .filter(p -> p.isDataPeer())
@@ -462,6 +468,12 @@ public class Network {
         return this.immutableHandshakedPeers;
     }
 
+    public List<Peer> getImmutableHandshakedIPPeers() {
+        return this.immutableHandshakedPeers.stream()
+                .filter(p -> p.getPeerData().getPeerType() == PeerType.IP)
+                .collect(Collectors.toList());
+    }
+
     public void addHandshakedPeer(Peer peer) {
         this.handshakedPeers.add(peer); // thread safe thanks to synchronized list
         this.immutableHandshakedPeers = List.copyOf(this.handshakedPeers); // also thread safe thanks to synchronized collection's toArray() being fed to List.of(array)
@@ -509,7 +521,8 @@ public class Network {
      * Returns first peer that has completed handshaking and has matching public key.
      */
     public Peer getHandshakedPeerWithPublicKey(byte[] publicKey) {
-        return this.getImmutableConnectedPeers().stream()
+        //return this.getImmutableConnectedPeers().stream()
+        return this.getImmutableConnectedIPPeers().stream()
                 .filter(peer -> peer.getHandshakeStatus() == Handshake.COMPLETED
                         && Arrays.equals(peer.getPeersPublicKey(), publicKey))
                 .findFirst().orElse(null);
@@ -524,6 +537,11 @@ public class Network {
         PeerAddress peerAddress = peerData.getAddress();
         return this.selfPeers.stream().anyMatch(selfPeer -> selfPeer.equals(peerAddress));
     };
+
+    //private final Predicate<PeerData> isNotIPPeer = peerData -> {
+    //    PeerType peerType = peerData.getPeerType();
+    //    return this.getImmutableConnectedPeers().stream().anyMatch(Ppeer -> peerType.equals(PeerType.RETICULUM));
+    //};
 
     private final Predicate<PeerData> isConnectedPeer = peerData -> {
         PeerAddress peerAddress = peerData.getAddress();
@@ -619,7 +637,9 @@ public class Network {
         }
 
         private Task maybeProducePeerPingTask(Long now) {
-            return getImmutableHandshakedPeers().stream()
+            // non-IP peer task handled in respective module (eg. RNS)
+            //return getImmutableHandshakedPeers().stream()
+            return getImmutableHandshakedIPPeers().stream()
                     .map(peer -> peer.getPingTask(now))
                     .filter(Objects::nonNull)
                     .findFirst()
@@ -769,12 +789,20 @@ public class Network {
         peers.removeIf(peerData -> peerData.getLastAttempted() != null
                 && (peerData.getLastConnected() == null
                 || peerData.getLastConnected() < peerData.getLastAttempted())
-                && peerData.getLastAttempted() > lastAttemptedThreshold);
+                && peerData.getLastAttempted() > lastAttemptedThreshold
+                || peerData.getPeerType() == PeerType.RETICULUM);
 
         // Don't consider peers that we know loop back to ourself
         synchronized (this.selfPeers) {
             peers.removeIf(isSelfPeer);
         }
+
+        // Don't consider any non-IP peers (eg. ReticulumPeer)
+        Predicate<PeerData> isNotIPPeer = peerData -> {
+            PeerType peerType = peerData.getPeerType();
+            return this.getImmutableConnectedPeers().stream().anyMatch(Ppeer -> peerType == PeerType.RETICULUM);
+        };
+        peers.removeIf(isNotIPPeer);
 
         // Don't consider already connected peers (simple address match)
         peers.removeIf(isConnectedPeer);
@@ -817,7 +845,8 @@ public class Network {
     public boolean connectPeer(Peer newPeer) throws InterruptedException {
         // Also checked before creating PeerConnectTask
         var iOHP = getImmutableHandshakedPeers().stream()
-                                                .filter(peer -> peer.getHandshakeStatus() == Handshake.COMPLETED)
+                                                .filter(peer -> peer.getHandshakeStatus() == Handshake.COMPLETED
+                                                && peer.getPeerData().getPeerType() == PeerType.IP)
                                                 .collect(Collectors.toList());
         if (iOHP.size() >= minOutboundPeers) {
             return false;
@@ -855,10 +884,10 @@ public class Network {
             return;
         }
 
-        // Find peers that have reached their maximum connection age, and disconnect them
+        // Find (ip) peers that have reached their maximum connection age, and disconnect them
         List<Peer> peersToDisconnect = this.getImmutableConnectedPeers().stream()
                 .filter(peer -> !peer.isSyncInProgress())
-                .filter(peer -> peer.hasReachedMaxConnectionAge())
+                .filter(peer -> peer.hasReachedMaxConnectionAge() && peer.getPeerData().getPeerType() == PeerType.IP)
                 .collect(Collectors.toList());
 
         if (peersToDisconnect != null && !peersToDisconnect.isEmpty()) {
@@ -1014,17 +1043,22 @@ public class Network {
                     message.getType().name(), message.getId(), peer);
         }
 
-        RNSCommon.PeerType pType = PeerType.IP;
-        if (peer.hasActivePeerLink()) {
-            LOGGER.trace("[{}] Message for ReticulumPeer");
-            pType = PeerType.RETICULUM;
-        } else {
-            Handshake handshakeStatus = peer.getHandshakeStatus();
-            if (handshakeStatus != Handshake.COMPLETED) {
-                onHandshakingMessage(peer, message, handshakeStatus);
-                return;
-            }
-            //pType = PeerType.IP;
+        //RNSCommon.PeerType pType = PeerType.IP;
+        //if (peer.hasActivePeerLink()) {
+        //    LOGGER.trace("[{}] Message for ReticulumPeer");
+        //    pType = PeerType.RETICULUM;
+        //} else {
+        //    Handshake handshakeStatus = peer.getHandshakeStatus();
+        //    if (handshakeStatus != Handshake.COMPLETED) {
+        //        onHandshakingMessage(peer, message, handshakeStatus);
+        //        return;
+        //    }
+        //    //pType = PeerType.IP;
+        //}
+        Handshake handshakeStatus = peer.getHandshakeStatus();
+        if (handshakeStatus != Handshake.COMPLETED) {
+            onHandshakingMessage(peer, message, handshakeStatus);
+            return;
         }
 
         // Should be non-handshaking messages from now on
@@ -1060,6 +1094,8 @@ public class Network {
             }
         }
 
+        PeerType pType = peer.getPeerData().getPeerType();
+
         // Ordered by message type value
         switch (message.getType()) {
             case GET_PEERS:
@@ -1067,11 +1103,13 @@ public class Network {
                 break;
 
             case PING:
-                if (pType == PeerType.RETICULUM) {
-                    rns.onPingMessage((ReticulumPeer) peer, message);
-                } else {
-                    onPingMessage(peer, message);
-                }
+                // Note: probably not necessary as Reticulu PINGs are done by RNS module (non-blocking)
+                //if (pType == PeerType.RETICULUM) {
+                //    rns.onPingMessage((ReticulumPeer) peer, message);
+                //} else {
+                //    onPingMessage(peer, message);
+                //}
+                onPingMessage(peer, message);
                 break;
 
             case HELLO:
@@ -1544,9 +1582,16 @@ public class Network {
         // Needs a mutable copy of the unmodifiableList
         List<Peer> handshakePeers = new ArrayList<>(this.getImmutableConnectedPeers());
 
+        //// Disregard any ReticulumPeer (handled in RNS)
+        //Predicate<Peer> isReticulumPeer = peer -> {
+        //    return this.getImmutableConnectedPeers().stream().anyMatch(p -> p.getPeerData().getPeerType() == PeerType.RETICULUM);
+        //};
+        //handshakePeers.removeIf(isReticulumPeer);
+
         // Disregard peers that have completed handshake or only connected recently
         handshakePeers.removeIf(peer -> peer.getHandshakeStatus() == Handshake.COMPLETED
-                || peer.getConnectionTimestamp() == null || peer.getConnectionTimestamp() > now - HANDSHAKE_TIMEOUT);
+                || peer.getConnectionTimestamp() == null || peer.getConnectionTimestamp() > now - HANDSHAKE_TIMEOUT
+                || peer.getPeerData().getPeerType() == PeerType.RETICULUM);
 
         for (Peer peer : handshakePeers) {
             peer.disconnect(String.format("handshake timeout at %s", peer.getHandshakeStatus().name()));
@@ -1574,6 +1619,10 @@ public class Network {
 
                 return false;
             };
+            Predicate<PeerData> isRPeer = peerData -> {
+                PeerType peerType = peerData.getPeerType();
+                return this.getImmutableConnectedPeers().stream().anyMatch(Ppeer -> peerType == PeerType.RETICULUM);
+            };
 
             // Disregard peers that are NOT 'old'
             peers.removeIf(isNotOldPeer);
@@ -1581,9 +1630,16 @@ public class Network {
             // Don't consider already connected peers (simple address match)
             peers.removeIf(isConnectedPeer);
 
+            // Disregard any ReticulumPeer (handled in RNS)
+            peers.removeIf(isRPeer);
+
             for (PeerData peerData : peers) {
-                // Delete from known peer cache too
-                this.allKnownPeers.remove(peerData);
+                if (peerData.getPeerType() == PeerType.RETICULUM) {
+                    continue;
+                } else {
+                    // Delete from known peer cache too
+                    this.allKnownPeers.remove(peerData);
+                }
             }
         }
     }
@@ -1662,7 +1718,7 @@ public class Network {
             }
 
             if (!peer.sendMessage(message)) {
-                if (peer.hasActivePeerLink()) {
+                if (peer.getPeerData().getPeerType() == PeerType.RETICULUM) {
                     LOGGER.debug("broadcast - ReticulumPeer without ACTIVE link");
                 } else {
                     peer.disconnect("failed to broadcast message");
@@ -1707,6 +1763,11 @@ public class Network {
         //LOGGER.info("Shutting down Reticulum...");
         //RNS.getInstance().getReticulum().exitHandler();
 
+        // shutdown Reticulum, try to gracefully shut down peers
+        LOGGER.debug("Shutting down RNS");
+        rns.shutdown();
+        LOGGER.debug("RNS shutdown complete.");
+
         // Stop processing threads
         try {
             if (!this.networkEPC.shutdown(5000)) {
@@ -1732,6 +1793,10 @@ public class Network {
 
             // save all known peers for next start up
             for (PeerData knownPeerToProcess : knownPeersToProcess) {
+                if (knownPeerToProcess.getPeerType() == PeerType.RETICULUM) {
+                    // don't save any ReticulumPeer
+                    continue;
+                }
                 repository.getNetworkRepository().save(knownPeerToProcess);
                 addedPeerCount++;
             }

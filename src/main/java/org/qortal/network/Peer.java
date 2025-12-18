@@ -78,7 +78,7 @@ public interface Peer {
     default void setPeersPublicKey(byte[] peersPublicKey) { return; }
     default void setPeersChallenge(byte[] peersChallenge) { return; }
     default byte[] getOurChallenge() { return  null; }
-    default byte[] getPeersPublicKey() { return null; }
+    default byte[] getPeersPublicKey() { return new byte[]{}; }
     default byte[] getPeersChallenge() { return null; }
     default void setHandshakeStatus(Handshake handshake) { return; }
     default InetSocketAddress getResolvedAddress() { return null; }

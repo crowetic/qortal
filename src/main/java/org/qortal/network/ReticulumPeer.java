@@ -33,7 +33,7 @@ import static io.reticulum.identity.IdentityKnownDestination.recall;
 import io.reticulum.buffer.Buffer;
 import io.reticulum.buffer.BufferedRWPair;
 import org.qortal.network.RNSCommon.PeerAspect;
-//import org.qortal.network.RNSCommon.PeerType;
+import org.qortal.network.RNSCommon.PeerType;
 import static io.reticulum.utils.IdentityUtils.concatArrays;
 
 import lombok.Getter;
@@ -88,6 +88,7 @@ public class ReticulumPeer implements Peer {
     //static final String defaultConfigPath = new String(".reticulum");
     //static final String defaultConfigPath = RNSCommon.defaultRNSConfigPath;
 
+    private PeerType peerType = PeerType.RETICULUM;
     private byte[] destinationHash;   // remote destination hash
     Destination peerDestination;      // OUT destination created for this
     PeerAspect peerAspect;       // based on Destination
@@ -187,6 +188,8 @@ public class ReticulumPeer implements Peer {
     public ReticulumPeer(byte[] dhash) {
         this.destinationHash = dhash;
         this.serverIdentity = recall(dhash);
+        //this.sendStreamId = getRandomStreamId();
+        //this.receiveStreamId = sendStreamId;
         initPeerLink();
         //setCreationTimestamp(System.currentTimeMillis());
         this.creationTimestamp = Instant.now();
@@ -195,7 +198,7 @@ public class ReticulumPeer implements Peer {
         this.pendingMessages = new LinkedBlockingQueue<>();
         this.peerAddress = new ReticulumPeerAddress(dhash);
         this.peerData = new PeerData(peerAddress,NTP.getTime(),"ReticulumPeer");
-        //this.peerData.setPeerType(PeerType.RETICULUM);
+        this.peerData.setPeerType(this.peerType);
     }
 
     /**
@@ -208,6 +211,8 @@ public class ReticulumPeer implements Peer {
         this.peerDestination = link.getDestination();
         this.destinationHash = link.getDestination().getHash();
         this.serverIdentity = link.getRemoteIdentity();
+        //this.sendStreamId = getRandomStreamId();
+        //this.receiveStreamId = sendStreamId;
 
         this.creationTimestamp = Instant.now();
         this.lastAccessTimestamp = Instant.now();
@@ -220,7 +225,7 @@ public class ReticulumPeer implements Peer {
         //this.peerLink.setPacketCallback(this::linkPacketReceived);
         this.peerAddress = new ReticulumPeerAddress(this.destinationHash);
         this.peerData = new PeerData(this.peerAddress, NTP.getTime(),"ReticulumPeer");
-        //this.peerData.setPeerType(PeerType.RETICULUM);
+        this.peerData.setPeerType(this.peerType);
     }
 
     /** 
@@ -266,6 +271,11 @@ public class ReticulumPeer implements Peer {
         } else {
             return encodeHexString(this.getDestinationHash());
         }
+    }
+
+    public int getRandomStreamId() {
+        // Note: stream id must be between 0..16383
+        return ThreadLocalRandom.current().nextInt(1, 16383);
     }
 
     public BufferedRWPair getOrInitPeerBuffer() {
@@ -315,25 +325,30 @@ public class ReticulumPeer implements Peer {
     }
 
     public void disconnect(String reason) {
-        log.debug("disconnecting peer - reason: {}", reason);
-        //RNS.getInstance().makePeerUnavailable(this);
-        //this.isPeerAvailable = false;
-        this.shutdown();
+        log.debug("Disconnecting peer {} after {} - reason: {}", this.toString(), getConnectionAge(), reason);
+        makePeerUnavailable();
+        this.isPeerAvailable = false;
+        //this.shutdown();
+        ////if (nonNull(this.peerLink)) {
+        ////    this.peerLink.teardown();
+        ////} else {
+        ////    this.shutdown();
+        ////}
     }
 
     public void shutdown() {
         if (nonNull(this.peerLink)) {
-            log.info("shutdown - peerLink: {}, status: {}", peerLink, peerLink.getStatus());
+            log.info("shutdown - peerLink: {}, status: {}, channel: {}", peerLink.toString(), peerLink.getStatus(), peerBuffer);
             if (peerLink.getStatus() == ACTIVE) {
-                //if (nonNull(this.peerBuffer)) {
-                //    this.peerBuffer.close();
+                makePeerUnavailable();
+                if (nonNull(this.peerBuffer)) {
+                    this.peerBuffer.close();
                 //    this.peerBuffer = null;
-                //}
+                }
                 this.peerLink.teardown();
             } else {
                 log.info("shutdown - status (non-ACTIVE): {}", peerLink.getStatus());
             }
-            //this.peerLink = null;
         }
         this.deleteMe = true;
     }
@@ -407,35 +422,35 @@ public class ReticulumPeer implements Peer {
         this.peerData.setLastConnected(ntpNow);
         //this.peerData.setLastAttempted(ntpNow);
         if (isInitiator) {
-            //// make the peer available to the network
-            //makePeerAvailable();
+            // make the peer available to the network
+            makePeerAvailable();
             startPings();
         }
     }
     
     public void linkClosed(Link link) {
+        if (isInitiator) {
+            makePeerUnavailable();
+        }
         if (link.getTeardownReason() == TIMEOUT) {
-            log.info("The link timed out");
+            log.info("linkClosed callback: The link timed out");
             this.peerTimedOut = true;
             //this.peerBuffer = null;
         } else if (link.getTeardownReason() == INITIATOR_CLOSED) {
-            log.info("Link closed callback: The initiator closed the link");
+            log.info("linkClosed callback: The initiator closed the link");
             log.info("peerLink {} closed (link: {}), link destination hash: {}",
                 encodeHexString(peerLink.getLinkId()), encodeHexString(link.getLinkId()), encodeHexString(link.getDestination().getHash()));
             //this.peerBuffer = null;
             //peerLink.teardown();
         } else if (link.getTeardownReason() == DESTINATION_CLOSED) {
-            log.info("Link closed callback: The link was closed by the peer, removing peer");
+            log.info("linkClosed callback: The link was closed by the peer, removing peer");
             log.info("peerLink {} closed (link: {}), link destination hash: {}",
                 encodeHexString(peerLink.getLinkId()), encodeHexString(link.getLinkId()), encodeHexString(link.getDestination().getHash()));
             //this.peerBuffer = null;
             //peerLink.teardown();
         } else {
-            log.info("Link closed callback");
+            log.info("linkClosed callback: no handled standard reason");
         }
-        //if (isInitiator) {
-        //    makePeerAvailable();
-        //}
     }
     
     public void linkPacketReceived(byte[] message, Packet packet) {
@@ -963,7 +978,7 @@ public class ReticulumPeer implements Peer {
     }
 
     public void startPings() {
-        log.trace("[{}] Enabling pings for peer {}",
+        log.debug("[{}] Enabling pings for peer {}",
                 peerLink.getDestination().getHexHash(), this.toString());
         this.lastPingSent = NTP.getTime();
     }
