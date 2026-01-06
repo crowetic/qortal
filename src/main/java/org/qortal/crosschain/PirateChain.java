@@ -304,14 +304,18 @@ public class PirateChain extends Bitcoiny {
 			try {
 				// Get balance
 				String response = LiteWalletJni.execute("balance", "");
-				JSONObject json = new JSONObject(response);
-				if (!json.has("zbalance") || !json.has("verified_zbalance")) {
+				JSONObject json = parseLitewalletResponse(response, "balance");
+				if (!json.has("zbalance")) {
 					throw new ForeignBlockchainException("Unable to determine balance");
 				}
 
 				PirateChainBalance balance = new PirateChainBalance();
 				balance.zbalance = json.getLong("zbalance");
-				balance.verified_zbalance = json.getLong("verified_zbalance");
+				if (json.has("verified_zbalance")) {
+					balance.verified_zbalance = json.getLong("verified_zbalance");
+				} else {
+					balance.verified_zbalance = balance.zbalance;
+				}
 				return balance;
 			} finally {
 				walletController.endWalletUse();
@@ -507,8 +511,8 @@ public class PirateChain extends Bitcoiny {
 			String txnString = txn.toString();
 
 			// Send the coins
-			String response = LiteWalletJni.execute("sendp2sh", txnString);
-			JSONObject json = parseLitewalletResponse(response, "sendp2sh");
+			String response = LiteWalletJni.execute("send", txnString);
+			JSONObject json = parseLitewalletResponse(response, "send");
 			try {
 				if (json.has("txid")) { // Success
 					return json.getString("txid");
@@ -554,8 +558,8 @@ public class PirateChain extends Bitcoiny {
 			String txnString = txn.toString();
 
 			// Send the coins
-			String response = LiteWalletJni.execute("send", txnString);
-			JSONObject json = parseLitewalletResponse(response, "send");
+			String response = LiteWalletJni.execute("sendp2sh", txnString);
+			JSONObject json = parseLitewalletResponse(response, "sendp2sh");
 			try {
 				if (json.has("txid")) { // Success
 					return json.getString("txid");
@@ -681,6 +685,10 @@ public class PirateChain extends Bitcoiny {
 	}
 
 	private static JSONObject parseLitewalletResponse(String response, String command) throws ForeignBlockchainException {
+		if (response == null || response.trim().isEmpty()) {
+			throw new ForeignBlockchainException(
+					String.format("LiteWalletJni %s returned empty response", command));
+		}
 		try {
 			return new JSONObject(response);
 		} catch (JSONException e) {
@@ -691,12 +699,13 @@ public class PirateChain extends Bitcoiny {
 	}
 
 	public String getSyncStatus(String entropy58) throws ForeignBlockchainException {
-		synchronized (this) {
-			PirateChainWalletController walletController = PirateChainWalletController.getInstance();
-			walletController.initWithEntropy58(entropy58);
+		PirateChainWalletController walletController = PirateChainWalletController.getInstance();
+		return walletController.getSyncStatusWithInit(entropy58);
+	}
 
-			return walletController.getSyncStatus();
-		}
+	public String getSyncStatusJson(String entropy58) throws ForeignBlockchainException {
+		PirateChainWalletController walletController = PirateChainWalletController.getInstance();
+		return walletController.getSyncStatusJsonWithInit(entropy58);
 	}
 
 	public static BitcoinyTransaction deserializeRawTransaction(String rawTransactionHex) throws TransformationException {

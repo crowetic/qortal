@@ -17,16 +17,23 @@ import org.qortal.utils.Base58;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
+import java.util.ArrayList;
+import java.util.Comparator;
 import java.nio.file.StandardOpenOption;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.HashSet;
+import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
 import java.util.Random;
+import java.util.Set;
 
 public class PirateWallet {
 
@@ -70,8 +77,14 @@ public class PirateWallet {
             }
 
             // Pick a random server
-            ChainableServer server = PirateChain.getInstance().blockchainProvider.getCurrentServer();
+            BitcoinyBlockchainProvider provider = PirateChain.getInstance().blockchainProvider;
+            ChainableServer server = ensureServerAvailable(provider);
+            if (server == null) {
+                LOGGER.info("Unable to initialize Pirate wallet: no lightwallet server available");
+                return false;
+            }
             String serverUri = String.format("https://%s:%d/", server.getHostName(), server.getPort());
+            LOGGER.info("Initializing Pirate wallet using server {} (nullSeed={})", serverUri, this.isNullSeedWallet);
 
             // Pirate library uses base64 encoding
             String entropy64 = Base64.toBase64String(this.entropyBytes);
@@ -94,56 +107,72 @@ public class PirateWallet {
             String wallet = this.load();
             boolean loadedFromCache = wallet != null;
             if (wallet != null && forceFullRescan) {
+                LOGGER.info("Forcing full rescan due to configured birthday {}", configuredBirthday);
                 this.deleteWalletCache();
                 wallet = null;
                 loadedFromCache = false;
             }
             if (wallet == null) {
                 // Wallet doesn't exist, so create a new one
+                LOGGER.info("Creating new Pirate wallet (birthday={})", configuredBirthday);
 
                 int birthday = configuredBirthday;
                 if (this.isNullSeedWallet) {
                     try {
                         // Attempt to set birthday to the current block for null seed wallets
                         birthday = PirateChain.getInstance().blockchainProvider.getCurrentHeight();
-                    }
-                    catch (ForeignBlockchainException e) {
+                    } catch (ForeignBlockchainException e) {
                         // Use the default height
                     }
                 }
 
                 // Initialize new wallet
                 if (!this.initFromSeed(serverUri, inputSeedPhrase, birthday)) {
+                    LOGGER.info("Pirate wallet initFromSeed failed (birthday={})", birthday);
                     return false;
                 }
             } else {
                 // Restore existing wallet
                 String response = LiteWalletJni.initfromb64(serverUri, params, wallet, saplingOutput64, saplingSpend64);
-                if (response != null && !response.contains("\"initalized\":true")) {
-                    LOGGER.info("Unable to initialize Pirate Chain wallet at {}: {}", serverUri, response);
-                    return false;
+                if (response != null && !isInitSuccess(response)) {
+                    if (isBufferFillError(response)) {
+                        LOGGER.info("Pirate wallet init reported buffer error; backing up cache and retrying");
+                        this.backupAndDeleteWalletCache();
+                        response = LiteWalletJni.initfromb64(serverUri, params, wallet, saplingOutput64,
+                                saplingSpend64);
+                    }
+                    if (response != null && !isInitSuccess(response)) {
+                        LOGGER.info("Unable to initialize Pirate Chain wallet at {}: {}", serverUri, response);
+                        return false;
+                    }
                 }
+                LOGGER.info("Loaded Pirate wallet from cache");
                 this.seedPhrase = inputSeedPhrase;
             }
 
             // Check that we're able to communicate with the library
             Integer ourHeight = this.getHeight();
             if (ourHeight == null || ourHeight <= 0) {
+                LOGGER.info("Pirate wallet height unavailable after init (height={})", ourHeight);
                 return false;
             }
+            LOGGER.info("Pirate wallet height after init: {}", ourHeight);
 
             if (!this.isNullSeedWallet && configuredBirthday > 1 && ourHeight < configuredBirthday) {
                 if (loadedFromCache) {
-                    LOGGER.warn("Pirate wallet height {} below configured birthday {}. Recreating wallet cache.", ourHeight, configuredBirthday);
+                    LOGGER.warn("Pirate wallet height {} below configured birthday {}. Recreating wallet cache.",
+                            ourHeight, configuredBirthday);
                     this.deleteWalletCache();
                     if (!this.initFromSeed(serverUri, inputSeedPhrase, configuredBirthday)) {
+                        LOGGER.info("Pirate wallet re-init from seed failed (birthday={})", configuredBirthday);
                         return false;
                     }
                     ourHeight = this.getHeight();
                 }
 
                 if (ourHeight == null || ourHeight <= 0 || ourHeight < configuredBirthday) {
-                    LOGGER.warn("Pirate wallet initialized below configured birthday {} (height {}).", configuredBirthday, ourHeight);
+                    LOGGER.warn("Pirate wallet initialized below configured birthday {} (height {}).",
+                            configuredBirthday, ourHeight);
                     return false;
                 }
             }
@@ -159,12 +188,21 @@ public class PirateWallet {
 
     private boolean initFromSeed(String serverUri, String inputSeedPhrase, int birthday) {
         String birthdayString = String.format("%d", birthday);
-        String outputSeedResponse = LiteWalletJni.initfromseed(serverUri, this.params, inputSeedPhrase, birthdayString, this.saplingOutput64, this.saplingSpend64); // Thread-safe.
+        String outputSeedResponse = LiteWalletJni.initfromseed(serverUri, this.params, inputSeedPhrase, birthdayString,
+                this.saplingOutput64, this.saplingSpend64); // Thread-safe.
         String outputSeedPhrase = parseSeedPhrase(outputSeedResponse, "initfromseed");
+        if (outputSeedPhrase == null && isBufferFillError(outputSeedResponse)) {
+            LOGGER.info("Pirate wallet initfromseed reported buffer error; backing up cache and retrying");
+            this.backupAndDeleteWalletCache();
+            outputSeedResponse = LiteWalletJni.initfromseed(serverUri, this.params, inputSeedPhrase, birthdayString,
+                    this.saplingOutput64, this.saplingSpend64); // Thread-safe.
+            outputSeedPhrase = parseSeedPhrase(outputSeedResponse, "initfromseed");
+        }
         if (outputSeedPhrase == null && isWalletAlreadyExistsError(outputSeedResponse)) {
             LOGGER.info("Clearing litewallet cache after initfromseed reported existing wallet");
             this.deleteLitewalletCache();
-            outputSeedResponse = LiteWalletJni.initfromseed(serverUri, this.params, inputSeedPhrase, birthdayString, this.saplingOutput64, this.saplingSpend64); // Thread-safe.
+            outputSeedResponse = LiteWalletJni.initfromseed(serverUri, this.params, inputSeedPhrase, birthdayString,
+                    this.saplingOutput64, this.saplingSpend64); // Thread-safe.
             outputSeedPhrase = parseSeedPhrase(outputSeedResponse, "initfromseed");
         }
         if (outputSeedPhrase == null) {
@@ -182,6 +220,17 @@ public class PirateWallet {
         return true;
     }
 
+    private boolean isBufferFillError(String response) {
+        return response != null && response.contains("failed to fill whole buffer");
+    }
+
+    private boolean isInitSuccess(String response) {
+        if (response == null) {
+            return false;
+        }
+        return response.contains("\"initialized\":true") || response.contains("\"initalized\":true");
+    }
+
     private boolean isWalletAlreadyExistsError(String response) {
         if (response == null) {
             return false;
@@ -192,23 +241,109 @@ public class PirateWallet {
 
     private void deleteWalletCache() {
         Path walletPath = this.getCurrentWalletPath();
+        boolean walletExists = Files.exists(walletPath);
+        LOGGER.info(
+                "Deleting Pirate wallet cache file {} (exists={}, walletsPath={})",
+                walletPath,
+                walletExists,
+                Settings.getInstance().getWalletsPath());
+        if (walletExists) {
+            try {
+                LOGGER.info("Pirate wallet cache file size={}, lastModified={}",
+                        Files.size(walletPath),
+                        Files.getLastModifiedTime(walletPath));
+            } catch (IOException e) {
+                LOGGER.info("Unable to read Pirate wallet cache metadata at {}: {}", walletPath, e.getMessage());
+            }
+        }
         try {
             Files.deleteIfExists(walletPath);
         } catch (IOException e) {
             LOGGER.info("Unable to delete Pirate Chain wallet cache at {}: {}", walletPath, e.getMessage());
         }
+        boolean walletExistsAfterDelete = Files.exists(walletPath);
+        LOGGER.info("Pirate wallet cache file exists after delete: {}", walletExistsAfterDelete);
+        if (walletExistsAfterDelete) {
+            Path backupPath = walletPath.resolveSibling(walletPath.getFileName() + ".bak");
+            try {
+                Files.move(walletPath, backupPath, StandardCopyOption.REPLACE_EXISTING);
+                LOGGER.info("Moved Pirate wallet cache file to {}", backupPath);
+            } catch (IOException e) {
+                LOGGER.info("Unable to move Pirate wallet cache file to {}: {}", backupPath, e.getMessage());
+            }
+        }
 
         this.deleteLitewalletCache();
+    }
+
+    private void backupAndDeleteWalletCache() {
+        Path walletPath = this.getCurrentWalletPath();
+        if (walletPath == null) {
+            return;
+        }
+        if (!Files.exists(walletPath)) {
+            LOGGER.info("No Pirate wallet cache file to backup at {}", walletPath);
+            return;
+        }
+        Path backupPath = walletPath.resolveSibling(".bak-" + walletPath.getFileName());
+        try {
+            Files.copy(walletPath, backupPath, StandardCopyOption.REPLACE_EXISTING);
+            LOGGER.info("Backed up Pirate wallet cache file to {}", backupPath);
+        } catch (IOException e) {
+            LOGGER.info("Unable to backup Pirate wallet cache file to {}: {}", backupPath, e.getMessage());
+        }
+        try {
+            Files.deleteIfExists(walletPath);
+            LOGGER.info("Deleted Pirate wallet cache file after backup: {}", walletPath);
+        } catch (IOException e) {
+            LOGGER.info("Unable to delete Pirate wallet cache file {}: {}", walletPath, e.getMessage());
+        }
+        this.deleteLitewalletCache();
+    }
+
+    private ChainableServer ensureServerAvailable(BitcoinyBlockchainProvider provider) {
+        ChainableServer server = provider.getCurrentServer();
+        if (server != null) {
+            return server;
+        }
+
+        Set<ChainableServer> candidates = new HashSet<>(provider.getServers());
+        candidates.removeAll(provider.getUselessServers());
+        if (candidates.isEmpty()) {
+            candidates = new HashSet<>(provider.getServers());
+        }
+        if (candidates.isEmpty()) {
+            return null;
+        }
+
+        List<ChainableServer> candidateList = new ArrayList<>(candidates);
+        ChainableServer candidate = candidateList.get(new Random().nextInt(candidateList.size()));
+        LOGGER.info("Selecting Pirate lightwallet server {} (no current server)", candidate);
+        try {
+            provider.setCurrentServer(candidate, "PirateWallet");
+        } catch (ForeignBlockchainException e) {
+            LOGGER.info("Unable to set Pirate lightwallet server {}: {}", candidate, e.getMessage());
+            return null;
+        }
+        return provider.getCurrentServer();
+    }
+
+    public void resetCache() {
+        LOGGER.info("Clearing Pirate wallet cache");
+        this.deleteWalletCache();
     }
 
     private void deleteLitewalletCache() {
         Path pirateDir = this.getLitewalletDataDirectory();
         Path defaultWalletPath = pirateDir.resolve("arrr-light-wallet.dat");
+        LOGGER.info("Deleting litewallet cache file {} (exists={})", defaultWalletPath,
+                Files.exists(defaultWalletPath));
         try {
             Files.deleteIfExists(defaultWalletPath);
         } catch (IOException e) {
             LOGGER.info("Unable to delete litewallet cache at {}: {}", defaultWalletPath, e.getMessage());
         }
+        LOGGER.info("Litewallet cache file exists after delete: {}", Files.exists(defaultWalletPath));
 
         Path tempDir = pirateDir.resolve("temp");
         if (Files.isDirectory(tempDir)) {
@@ -223,6 +358,35 @@ public class PirateWallet {
             } catch (IOException e) {
                 LOGGER.info("Unable to scan litewallet temp directory at {}: {}", tempDir, e.getMessage());
             }
+        }
+
+        Path qortalCachePath = Paths.get(Settings.getInstance().getWalletsPath(), "PirateChain", "lib");
+        LOGGER.info("Deleting Pirate wallet lib cache path {} (exists={})", qortalCachePath,
+                Files.exists(qortalCachePath));
+        this.deletePathRecursive(qortalCachePath);
+        LOGGER.info("Pirate wallet lib cache path exists after delete: {}", Files.exists(qortalCachePath));
+    }
+
+    private void deletePathRecursive(Path path) {
+        if (path == null || !Files.exists(path)) {
+            return;
+        }
+        try {
+            if (Files.isDirectory(path)) {
+                try (var walk = Files.walk(path)) {
+                    walk.sorted(Comparator.reverseOrder()).forEach(entry -> {
+                        try {
+                            Files.deleteIfExists(entry);
+                        } catch (IOException e) {
+                            LOGGER.info("Unable to delete {}", entry);
+                        }
+                    });
+                }
+            } else {
+                Files.deleteIfExists(path);
+            }
+        } catch (IOException e) {
+            LOGGER.info("Unable to delete {}: {}", path, e.getMessage());
         }
     }
 
@@ -338,8 +502,7 @@ public class PirateWallet {
         byte[] wallet;
         try {
             wallet = Base64.decode(wallet64);
-        }
-        catch (DecoderException e) {
+        } catch (DecoderException e) {
             LOGGER.info("Unable to decode wallet");
             return false;
         }
@@ -350,9 +513,18 @@ public class PirateWallet {
 
         Path walletPath = this.getCurrentWalletPath();
         Files.createDirectories(walletPath.getParent());
-        Files.write(walletPath, wallet, StandardOpenOption.CREATE);
-
-        LOGGER.debug("Saved Pirate Chain wallet");
+        Path tempPath = walletPath.resolveSibling(walletPath.getFileName().toString() + ".tmp");
+        Files.write(tempPath, wallet, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+        try {
+            Files.move(tempPath, walletPath, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+        } catch (AtomicMoveNotSupportedException e) {
+            Files.move(tempPath, walletPath, StandardCopyOption.REPLACE_EXISTING);
+        }
+        try {
+            LOGGER.info("Saved Pirate Chain wallet to {} (size={})", walletPath, Files.size(walletPath));
+        } catch (IOException e) {
+            LOGGER.info("Saved Pirate Chain wallet to {}", walletPath);
+        }
 
         return true;
     }
@@ -391,7 +563,8 @@ public class PirateWallet {
             return null;
         }
 
-        // Prefix the bytes with a (deterministic) string, to ensure that the resulting hash is different
+        // Prefix the bytes with a (deterministic) string, to ensure that the resulting
+        // hash is different
         String prefix = "ARRRWalletEncryption";
 
         ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
@@ -513,7 +686,6 @@ public class PirateWallet {
         }
     }
 
-
     // APIs
 
     public Integer getHeight() {
@@ -602,9 +774,9 @@ public class PirateWallet {
         if (addressesJson != null && !addressesJson.isEmpty()) {
             JSONObject addressJson = addressesJson.getJSONObject(0);
             if (addressJson.has("private_key")) {
-                //String address = addressJson.getString("address");
+                // String address = addressJson.getString("address");
                 String privateKey = addressJson.getString("private_key");
-                //String viewingKey = addressJson.getString("viewing_key");
+                // String viewingKey = addressJson.getString("viewing_key");
 
                 return privateKey;
             }

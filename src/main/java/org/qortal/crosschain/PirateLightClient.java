@@ -1,6 +1,5 @@
 package org.qortal.crosschain;
 
-import pirate.wallet.sdk.rpc.CompactFormats;
 import pirate.wallet.sdk.rpc.CompactFormats.CompactBlock;
 import pirate.wallet.sdk.rpc.CompactTxStreamerGrpc;
 import pirate.wallet.sdk.rpc.Service;
@@ -21,7 +20,9 @@ import org.qortal.transform.TransformationException;
 
 import java.math.BigDecimal;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Pirate Chain network support for querying Bitcoiny-related info like block
@@ -35,6 +36,8 @@ public class PirateLightClient extends BitcoinyBlockchainProvider {
 	private static final int RESPONSE_TIME_READINGS = 5;
 	private static final long MAX_AVG_RESPONSE_TIME = 500L; // ms
 	private static final ChainSpec DEFAULT_CHAIN_SPEC = ChainSpec.newBuilder().build();
+	private static final int MAX_SERVER_HEIGHT_BEHIND = 100_000; // avoid connecting to servers that lag far behind the
+																																// best known height
 
 	public static class Server implements ChainableServer {
 		String hostname;
@@ -113,6 +116,8 @@ public class PirateLightClient extends BitcoinyBlockchainProvider {
 	private Set<ChainableServer> servers = new HashSet<>();
 	private List<ChainableServer> remainingServers = new ArrayList<>();
 	private Set<ChainableServer> uselessServers = Collections.synchronizedSet(new HashSet<>());
+	private final Map<ChainableServer, Integer> serverHeights = new ConcurrentHashMap<>();
+	private final Map<ChainableServer, Long> behindBirthdayServers = new ConcurrentHashMap<>();
 
 	private final String netId;
 	private final String expectedGenesisHash;
@@ -123,6 +128,7 @@ public class PirateLightClient extends BitcoinyBlockchainProvider {
 	private ChainableServer currentServer;
 	private ManagedChannel channel;
 	private int nextId = 1;
+	private final AtomicInteger highestObservedBlockHeight = new AtomicInteger(0);
 
 	private static final int TX_CACHE_SIZE = 1000;
 	@SuppressWarnings("serial")
@@ -136,6 +142,7 @@ public class PirateLightClient extends BitcoinyBlockchainProvider {
 			});
 
 	private ChainableServerConnectionRecorder recorder = new ChainableServerConnectionRecorder(100);
+	private static final long BEHIND_BIRTHDAY_RETRY_MS = 10 * 60 * 1000L;
 
 	// Constructors
 
@@ -598,6 +605,25 @@ public class PirateLightClient extends BitcoinyBlockchainProvider {
 		return this.currentServer;
 	}
 
+	public String getServerStatusSummary() {
+		ChainableServer server = this.currentServer;
+		Integer serverHeight = server != null ? this.serverHeights.get(server) : null;
+		int highestKnownHeight = this.highestObservedBlockHeight.get();
+		int totalServers = this.servers.size();
+		int remainingCount = this.remainingServers.size();
+		int uselessCount = this.uselessServers.size();
+		int behindBirthdayCount = this.behindBirthdayServers.size();
+		return String.format(
+				"current=%s height=%s highestKnown=%d total=%d remaining=%d useless=%d behindBirthday=%d",
+				server,
+				serverHeight,
+				highestKnownHeight,
+				totalServers,
+				remainingCount,
+				uselessCount,
+				behindBirthdayCount);
+	}
+
 	@Override
 	public boolean addServer(ChainableServer server) {
 		return this.servers.add(server);
@@ -607,6 +633,9 @@ public class PirateLightClient extends BitcoinyBlockchainProvider {
 	public boolean removeServer(ChainableServer server) {
 		boolean removedServer = this.servers.remove(server);
 		boolean removedRemaining = this.remainingServers.remove(server);
+		this.serverHeights.remove(server);
+		this.behindBirthdayServers.remove(server);
+		this.uselessServers.remove(server);
 
 		return removedServer || removedRemaining;
 	}
@@ -649,7 +678,7 @@ public class PirateLightClient extends BitcoinyBlockchainProvider {
 			throws ForeignBlockchainException {
 		synchronized (this.serverLock) {
 			if (this.remainingServers.isEmpty())
-				this.remainingServers.addAll(this.servers);
+				this.refillRemainingServers();
 
 			while (haveConnection()) {
 				// If we have more servers and the last one replied slowly, try another
@@ -682,8 +711,14 @@ public class PirateLightClient extends BitcoinyBlockchainProvider {
 		if (this.currentServer != null && this.channel != null && !this.channel.isShutdown())
 			return true;
 
+		if (this.remainingServers.isEmpty()) {
+			this.refillRemainingServers();
+		}
 		while (!this.remainingServers.isEmpty()) {
-			ChainableServer server = this.remainingServers.remove(RANDOM.nextInt(this.remainingServers.size()));
+			ChainableServer server = this.selectNextServer();
+			if (server == null) {
+				break;
+			}
 
 			Optional<ChainableServerConnection> chainableServerConnection = makeConnection(server,
 					this.getClass().getSimpleName());
@@ -692,6 +727,53 @@ public class PirateLightClient extends BitcoinyBlockchainProvider {
 		}
 
 		return false;
+	}
+
+	private void refillRemainingServers() {
+		long now = System.currentTimeMillis();
+		this.remainingServers.clear();
+		for (ChainableServer server : this.servers) {
+			Long behindAt = this.behindBirthdayServers.get(server);
+			if (behindAt != null && now - behindAt < BEHIND_BIRTHDAY_RETRY_MS) {
+				continue;
+			}
+			this.remainingServers.add(server);
+		}
+		if (this.remainingServers.isEmpty() && !this.servers.isEmpty()) {
+			LOGGER.info("All Pirate lightwallet servers recently flagged behind birthday; retrying full list");
+			this.remainingServers.addAll(this.servers);
+		}
+	}
+
+	private ChainableServer selectNextServer() {
+		if (this.remainingServers.isEmpty()) {
+			return null;
+		}
+		int configuredBirthday = Settings.getInstance().getArrrDefaultBirthday();
+		ChainableServer bestServer = null;
+		int bestHeight = -1;
+		for (ChainableServer server : this.remainingServers) {
+			Integer height = this.serverHeights.get(server);
+			if (height == null) {
+				continue;
+			}
+			if (configuredBirthday > 0 && height < configuredBirthday) {
+				continue;
+			}
+			if (height > bestHeight) {
+				bestHeight = height;
+				bestServer = server;
+			}
+		}
+		if (bestServer != null) {
+			this.remainingServers.remove(bestServer);
+			LOGGER.info("Selected Pirate lightwallet server {} (known height {})", bestServer, bestHeight);
+			return bestServer;
+		}
+		ChainableServer fallback = this.remainingServers.remove(RANDOM.nextInt(this.remainingServers.size()));
+		Integer fallbackHeight = this.serverHeights.get(fallback);
+		LOGGER.info("Selected Pirate lightwallet server {} (known height {})", fallback, fallbackHeight);
+		return fallback;
 	}
 
 	private Optional<ChainableServerConnection> makeConnection(ChainableServer server, String requestedBy) {
@@ -706,6 +788,31 @@ public class PirateLightClient extends BitcoinyBlockchainProvider {
 			if (lightdInfo == null || lightdInfo.getBlockHeight() <= 0)
 				return Optional.of(this.recorder.recordConnection(server, requestedBy, true, false, "lightd info issues"));
 
+			int serverHeight = (int) lightdInfo.getBlockHeight();
+			this.serverHeights.put(server, serverHeight);
+			int configuredBirthday = Settings.getInstance().getArrrDefaultBirthday();
+			LOGGER.info("Pirate lightwallet server {} reported height {} (configured birthday {})",
+					server, serverHeight, configuredBirthday);
+			if (configuredBirthday > 0 && serverHeight < configuredBirthday) {
+				String message = String.format("%s height %d is below configured birthday %d, skipping",
+						server, serverHeight, configuredBirthday);
+				LOGGER.info(message);
+				this.behindBirthdayServers.put(server, System.currentTimeMillis());
+				this.shutdownChannel();
+				return Optional.of(this.recorder.recordConnection(server, requestedBy, true, false, message));
+			}
+			this.behindBirthdayServers.remove(server);
+			int highestKnownHeight = this.highestObservedBlockHeight.get();
+			if (highestKnownHeight > 0 && highestKnownHeight - serverHeight > MAX_SERVER_HEIGHT_BEHIND) {
+				String message = String.format("%s height %d is %d blocks behind best known %d, skipping",
+						server, serverHeight, highestKnownHeight - serverHeight, highestKnownHeight);
+				LOGGER.info(message);
+
+				this.uselessServers.add(server);
+				this.shutdownChannel();
+				return Optional.of(this.recorder.recordConnection(server, requestedBy, true, false, message));
+			}
+
 			// TODO: find a way to verify that the server is using the expected chain
 
 			// if (featuresJson == null || Double.valueOf((String)
@@ -716,12 +823,41 @@ public class PirateLightClient extends BitcoinyBlockchainProvider {
 			// featuresJson.get("genesis_hash")).equals(this.expectedGenesisHash))
 			// continue;
 
+			this.highestObservedBlockHeight.accumulateAndGet(serverHeight, Math::max);
+
 			LOGGER.info(() -> String.format("Connected to %s", server));
 			this.currentServer = server;
 			return Optional.of(this.recorder.recordConnection(server, requestedBy, true, true, EMPTY));
 		} catch (Exception e) {
 			// Didn't work, try another server...
 			return Optional.of(this.recorder.recordConnection(server, requestedBy, true, false, CrossChainUtils.getNotes(e)));
+		}
+	}
+
+	private void shutdownChannel() {
+		if (this.channel == null)
+			return;
+
+		try {
+			if (!this.channel.isShutdown()) {
+				this.channel.shutdown();
+				if (!this.channel.awaitTermination(5, TimeUnit.SECONDS)) {
+					LOGGER.warn("Timed out gracefully shutting down connection: {}.", this.channel);
+				}
+			}
+
+			if (!this.channel.isTerminated()) {
+				this.channel.shutdownNow();
+				if (!this.channel.awaitTermination(5, TimeUnit.SECONDS)) {
+					LOGGER.warn("Timed out forcefully shutting down connection: {}.", this.channel);
+				}
+			}
+		} catch (InterruptedException e) {
+			Thread.currentThread().interrupt();
+			LOGGER.warn("Interrupted while shutting down connection", e);
+		} finally {
+			this.channel = null;
+			this.currentServer = null;
 		}
 	}
 
