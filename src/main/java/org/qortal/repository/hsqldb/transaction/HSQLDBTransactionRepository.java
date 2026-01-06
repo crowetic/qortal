@@ -157,20 +157,34 @@ public class HSQLDBTransactionRepository implements TransactionRepository {
 
 	@Override
 	public List<TransactionData> fromSignatures(List<byte[]> signatures) throws DataException {
+		if (signatures == null || signatures.isEmpty()) {
+			return new ArrayList<>(0);
+		}
+
+		List<byte[]> filteredSignatures = new ArrayList<>(signatures.size());
+		for (byte[] signature : signatures) {
+			if (signature != null && signature.length > 0) {
+				filteredSignatures.add(signature);
+			}
+		}
+		if (filteredSignatures.isEmpty()) {
+			return new ArrayList<>(0);
+		}
+
 		StringBuffer sql = new StringBuffer();
 
 		sql.append("SELECT type, reference, creator, created_when, fee, tx_group_id, block_height, approval_status, approval_height, signature ");
 		sql.append("FROM Transactions WHERE signature IN (");
-		sql.append(String.join(", ", Collections.nCopies(signatures.size(), "?")));
+		sql.append(String.join(", ", Collections.nCopies(filteredSignatures.size(), "?")));
 		sql.append(")");
 
 		List<TransactionData> list;
-		try (ResultSet resultSet = this.repository.checkedExecute(sql.toString(), signatures.toArray(new byte[0][]))) {
+		try (ResultSet resultSet = this.repository.checkedExecute(sql.toString(), filteredSignatures.toArray(new byte[0][]))) {
 			if (resultSet == null) {
 				return new ArrayList<>(0);
 			}
 
-			list = new ArrayList<>(signatures.size());
+			list = new ArrayList<>(filteredSignatures.size());
 
 			do {
 				TransactionType type = TransactionType.valueOf(resultSet.getInt(1));
