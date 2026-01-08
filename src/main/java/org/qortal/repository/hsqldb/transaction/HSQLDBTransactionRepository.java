@@ -171,25 +171,15 @@ public class HSQLDBTransactionRepository implements TransactionRepository {
 			return new ArrayList<>(0);
 		}
 
-		final int maxBatchSize = 500;
-		if (filteredSignatures.size() > maxBatchSize) {
-			List<TransactionData> batched = new ArrayList<>(filteredSignatures.size());
-			for (int i = 0; i < filteredSignatures.size(); i += maxBatchSize) {
-				int end = Math.min(filteredSignatures.size(), i + maxBatchSize);
-				batched.addAll(fromSignatures(filteredSignatures.subList(i, end)));
-			}
-			return batched;
-		}
-
 		StringBuffer sql = new StringBuffer();
 
 		sql.append("SELECT type, reference, creator, created_when, fee, tx_group_id, block_height, approval_status, approval_height, signature ");
-		sql.append("FROM Transactions WHERE ");
-		sql.append(String.join(" OR ", Collections.nCopies(filteredSignatures.size(), "signature = ?")));
+		sql.append("FROM Transactions WHERE signature IN (");
+		sql.append(String.join(", ", Collections.nCopies(filteredSignatures.size(), "?")));
+		sql.append(")");
 
 		List<TransactionData> list;
-		Object[] params = filteredSignatures.toArray();
-		try (ResultSet resultSet = this.repository.checkedExecute(sql.toString(), params)) {
+		try (ResultSet resultSet = this.repository.checkedExecute(sql.toString(), filteredSignatures.toArray(new byte[0][]))) {
 			if (resultSet == null) {
 				return new ArrayList<>(0);
 			}

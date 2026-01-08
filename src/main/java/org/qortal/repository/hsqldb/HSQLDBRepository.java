@@ -644,18 +644,6 @@ public class HSQLDBRepository implements Repository {
 				preparedStatement.setBigDecimal(i + 1, (BigDecimal) objects[i]);
 			} else if (objects[i] instanceof byte[]) {
 				preparedStatement.setBytes(i + 1, (byte[]) objects[i]);
-			} else if (objects[i] instanceof java.nio.ByteBuffer) {
-				java.nio.ByteBuffer buffer = ((java.nio.ByteBuffer) objects[i]).slice();
-				byte[] bytes = new byte[buffer.remaining()];
-				buffer.get(bytes);
-				preparedStatement.setBytes(i + 1, bytes);
-			} else if (objects[i] instanceof Byte[]) {
-				Byte[] boxed = (Byte[]) objects[i];
-				byte[] bytes = new byte[boxed.length];
-				for (int j = 0; j < boxed.length; j++) {
-					bytes[j] = boxed[j];
-				}
-				preparedStatement.setBytes(i + 1, bytes);
 			} else {
 				preparedStatement.setObject(i + 1, objects[i]);
 			}

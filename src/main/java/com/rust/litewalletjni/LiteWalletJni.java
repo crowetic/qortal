@@ -97,16 +97,4 @@ public class LiteWalletJni {
         return loaded;
     }
 
-    public static void loadLibraryFrom(Path libPath) {
-        if (loaded) {
-            return;
-        }
-        try {
-            System.load(libPath.toAbsolutePath().toString());
-            loaded = true;
-        } catch (UnsatisfiedLinkError e) {
-            LOGGER.info("Unable to load library");
-        }
-    }
-
 }
