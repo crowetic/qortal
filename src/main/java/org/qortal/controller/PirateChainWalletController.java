@@ -38,11 +38,8 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.Random;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.ReentrantLock;
 
 public class PirateChainWalletController extends Thread {
@@ -67,32 +64,29 @@ public class PirateChainWalletController extends Thread {
     }
 
     private static final long WALLET_LOCK_TIMEOUT_MS = 5_000L;
+    private static final long SAVE_LOCK_TIMEOUT_MS = 2_000L;
     private static final long SWITCH_LOCK_TIMEOUT_MS = 30_000L;
-    private static final long SYNC_STOP_TIMEOUT_MS = 30_000L;
-    private static final long SYNC_WAIT_INTERVAL_MS = 250L;
     private static final long STATUS_LOCK_TIMEOUT_MS = 500L;
     private static final long SKIP_LOG_INTERVAL_MS = 30_000L;
-    private static final long SYNC_RUNNING_LOG_INTERVAL_MS = 30_000L;
     private final Object statusLock = new Object();
 
     private static final String NULL_SEED_ENTROPY58 = Base58.encode(new byte[32]);
 
     private final ReentrantLock walletLock = new ReentrantLock(true);
-    private final Object syncMonitor = new Object();
     private final Object switchingMonitor = new Object();
-    private volatile boolean syncInProgress = false;
-    private volatile long syncStartTimeMs = 0L;
-    private volatile long lastSyncRunningLogTime = 0L;
     private static final long WALLET_INIT_RETRY_DELAY_MS = 100_000L;
     private static final int WALLET_INIT_MAX_RETRIES = 5;
-    private static final long SYNC_CALL_WARN_MS = 120_000L;
-    private static final long SYNC_FORCE_STOP_MS = 5 * 60 * 1000L;
-    private static final long SYNC_WATCHDOG_INTERVAL_MS = 30_000L;
+    private static final long SYNC_STATUS_TIMEOUT_MS = 10_000L;
+    private static final long SYNC_STATUS_INIT_TIMEOUT_MS = 30_000L;
+    private static final long SYNC_CALL_TIMEOUT_MS = 60_000L;
+    private static final int SYNC_STATUS_STALL_THRESHOLD = 8;
+    private static final int SYNC_STATUS_IDLE_THRESHOLD = 5;
+    private static final int SYNC_STATUS_REPEAT_THRESHOLD = 5;
+    private static final long SYNC_STATUS_ROTATE_COOLDOWN_MS = 5 * 60 * 1000L;
+    private static final int SYNC_STATUS_INIT_TIMEOUT_THRESHOLD = 1;
+    // Sync status polling timeout.
 
-    private volatile boolean walletReconnectRequested = false;
     private volatile long lastWalletInitFailureMs = 0L;
-    private volatile byte[] lastEntropyBytes;
-    private volatile boolean lastIsNullSeedWallet = false;
     private volatile Thread switchingThread = null;
     private int switchingDepth = 0;
     private final ThreadLocal<Integer> switchingClaims = ThreadLocal.withInitial(() -> 0);
@@ -100,12 +94,21 @@ public class PirateChainWalletController extends Thread {
     private volatile String lastSkipReason = null;
     private int walletInitRetryCount = 0;
     private final Semaphore syncStatusSemaphore = new Semaphore(1);
-    private final ScheduledExecutorService syncWatchdogExecutor = Executors.newSingleThreadScheduledExecutor();
-    private final AtomicBoolean syncWatchdogStarted = new AtomicBoolean(false);
-    private final AtomicBoolean forceSaveAfterSync = new AtomicBoolean(false);
-    private final AtomicBoolean syncStopRequested = new AtomicBoolean(false);
-    private final AtomicBoolean saveRequested = new AtomicBoolean(false);
-    private volatile Thread controllerThread = null;
+    private long lastSyncStatusId = -1L;
+    private String lastSyncProgress = null;
+    private int syncStatusStallCount = 0;
+    private long lastSyncStatusRotateMs = 0L;
+    private int syncStatusInitTimeoutCount = 0;
+    private int syncStatusIdleCount = 0;
+    private long lastSyncStatusIdleHeight = -1L;
+    private int syncStatusTimeoutCount = 0;
+    private long lastSyncStatusRepeatId = -1L;
+    private String lastSyncStatusRepeatProgress = null;
+    private long lastSyncStatusRepeatHeight = -1L;
+    private int syncStatusRepeatCount = 0;
+    private volatile Thread activeSyncThread = null;
+    private volatile boolean restartRequested = false;
+    private volatile String restartReason = null;
 
     private static String qdnWalletSignature = "4DtYWqBSsPaeY8u42zpWQuxogN1N9USbYFuidgaXfxNv5gneNtkVXSd7Lani7dGq7WpTZZzPfBcBhG349FXbQiUn";
 
@@ -178,26 +181,6 @@ public class PirateChainWalletController extends Thread {
         }
     }
 
-    private boolean waitForSyncIdle(long timeoutMs) {
-        long deadline = System.currentTimeMillis() + timeoutMs;
-        synchronized (this.syncMonitor) {
-            while (this.syncInProgress) {
-                long remaining = deadline - System.currentTimeMillis();
-                if (remaining <= 0) {
-                    return false;
-                }
-                long waitTime = Math.min(remaining, SYNC_WAIT_INTERVAL_MS);
-                try {
-                    this.syncMonitor.wait(waitTime);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    return false;
-                }
-            }
-        }
-        return true;
-    }
-
     private void logSyncSkip(String reason) {
         long now = System.currentTimeMillis();
         if (!Objects.equals(reason, this.lastSkipReason) || now - this.lastSkipLogTime >= SKIP_LOG_INTERVAL_MS) {
@@ -207,39 +190,11 @@ public class PirateChainWalletController extends Thread {
         }
     }
 
-    private void logSyncRunningIfNeeded() {
-        if (!this.syncInProgress || this.syncStartTimeMs <= 0L) {
-            return;
-        }
-        long now = System.currentTimeMillis();
-        if (now - this.lastSyncRunningLogTime >= SYNC_RUNNING_LOG_INTERVAL_MS) {
-            long elapsedMs = now - this.syncStartTimeMs;
-            LOGGER.info("Pirate wallet sync still running ({} ms elapsed)", elapsedMs);
-            this.lastSyncRunningLogTime = now;
-        }
-    }
-
     private String formatSwitchingStatus() {
         if (this.loadStatus != null) {
             return "Wallet switch in progress (" + this.loadStatus + ")";
         }
         return "Wallet switch in progress";
-    }
-
-    private void stopSyncIfRunning(long timeoutMs) {
-        if (!this.syncInProgress) {
-            return;
-        }
-
-        try {
-            LiteWalletJni.execute("stop", "");
-        } catch (RuntimeException e) {
-            LOGGER.debug("Unable to stop Pirate Chain sync: {}", e.getMessage());
-        }
-
-        if (!this.waitForSyncIdle(timeoutMs)) {
-            LOGGER.info("Timed out waiting for Pirate Chain sync to stop");
-        }
     }
 
     private void rotateLightwalletServer(String reason) {
@@ -266,21 +221,11 @@ public class PirateChainWalletController extends Thread {
             LOGGER.info("Switching Pirate lightwallet server to {} ({})", next, reason);
             lightClient.setCurrentServer(next, "PirateChainWalletController");
             if (this.currentWallet != null) {
-                this.walletReconnectRequested = true;
                 LOGGER.info("Pirate wallet reconnect requested after server switch");
             }
         } catch (ForeignBlockchainException e) {
             LOGGER.info("Unable to switch Pirate lightwallet server: {}", e.getMessage());
         }
-    }
-
-    private String getLightwalletStatusSummary() {
-        PirateChain pirateChain = PirateChain.getInstance();
-        if (pirateChain.getBlockchainProvider() instanceof PirateLightClient) {
-            PirateLightClient lightClient = (PirateLightClient) pirateChain.getBlockchainProvider();
-            return lightClient.getServerStatusSummary();
-        }
-        return "n/a";
     }
 
     private boolean needsWalletSwitch(byte[] entropyBytes, boolean isNullSeedWallet) {
@@ -305,12 +250,15 @@ public class PirateChainWalletController extends Thread {
     public void run() {
         Thread.currentThread().setName("Pirate Chain Wallet Controller");
         Thread.currentThread().setPriority(MIN_PRIORITY);
-        this.controllerThread = Thread.currentThread();
         // Sync watchdog disabled: never force-stop long syncs.
 
         try {
             while (running && !Controller.isStopping()) {
                 Thread.sleep(1000);
+
+                if (this.restartRequested) {
+                    this.performRestart();
+                }
 
                 // Wait until we have a request to load the wallet or an active wallet to sync
                 if (!shouldLoadWallet && this.currentWallet == null) {
@@ -343,164 +291,54 @@ public class PirateChainWalletController extends Thread {
                     this.logSyncSkip("null-seed wallet is not synced");
                     continue;
                 }
-
                 if (this.isSwitching()) {
                     this.logSyncSkip("wallet switching in progress");
                     continue;
                 }
-
                 if (!this.acquireWalletLock(0)) {
                     this.logSyncSkip("wallet lock busy");
                     continue;
                 }
-
-                boolean syncStarted = false;
                 try {
                     if (this.isSwitching()) {
                         this.logSyncSkip("wallet switching in progress");
                         continue;
                     }
-
-                    if (this.walletReconnectRequested) {
-                        if (!this.claimSwitching()) {
-                            this.logSyncSkip("wallet switching in progress");
-                            continue;
-                        }
-                        try {
-                            if (this.lastEntropyBytes == null) {
-                                LOGGER.info("Pirate wallet reconnect requested but no entropy available");
-                                this.walletReconnectRequested = false;
-                                continue;
-                            }
-                            this.closeCurrentWallet();
-                            LOGGER.info("Reconnecting Pirate wallet to current lightwallet server...");
-                            this.currentWallet = new PirateWallet(this.lastEntropyBytes, this.lastIsNullSeedWallet);
-                            LOGGER.info(
-                                    "Pirate wallet instance reconnected (ready={}, initialized={}, synchronized={})",
-                                    this.currentWallet.isReady(),
-                                    this.currentWallet.isInitialized(),
-                                    this.currentWallet.isSynchronized());
-                            if (!this.currentWallet.isReady()) {
-                                this.currentWallet = null;
-                                LOGGER.info("Pirate wallet reconnect failed: wallet not ready after initialization");
-                            } else {
-                                this.walletReconnectRequested = false;
-                            }
-                        } catch (IOException e) {
-                            LOGGER.info("Pirate wallet reconnect failed: {}", e.getMessage());
-                        } finally {
-                            this.releaseSwitchingClaim();
-                        }
-                        if (this.currentWallet == null) {
-                            this.logSyncSkip("wallet not initialized");
-                            continue;
-                        }
-                    }
-
-                    synchronized (this.syncMonitor) {
-                        this.syncInProgress = true;
-                        this.syncStartTimeMs = System.currentTimeMillis();
-                    }
-                    syncStarted = true;
-                    LOGGER.info("Pirate lightwallet status: {}", this.getLightwalletStatusSummary());
-
-                    long infoStartMs = System.currentTimeMillis();
-                    String infoResponse = LiteWalletJni.execute("info", "");
-                    if (infoResponse == null || infoResponse.trim().isEmpty()) {
-                        LOGGER.info("Pirate wallet info returned empty response");
-                    } else {
-                        long infoElapsedMs = System.currentTimeMillis() - infoStartMs;
-                        LOGGER.info("Pirate wallet info received in {} ms ({} chars)", infoElapsedMs,
-                                infoResponse.length());
-                        try {
-                            JSONObject infoJson = new JSONObject(infoResponse);
-                            long serverHeight = infoJson.optLong("latest_block_height", -1L);
-                            String chainName = infoJson.optString("chain_name", null);
-                            if (chainName != null && !chainName.isEmpty()) {
-                                LOGGER.info("Pirate wallet server chain name: {}", chainName);
-                            }
-                            int configuredBirthday = Settings.getInstance().getArrrDefaultBirthday();
-                            if (serverHeight > 0 && configuredBirthday > 0 && serverHeight < configuredBirthday) {
-                                LOGGER.info(
-                                        "Pirate wallet server height {} below configured birthday {} - switching server",
-                                        serverHeight,
-                                        configuredBirthday);
-                                this.rotateLightwalletServer("server behind configured birthday");
-                                continue;
-                            }
-                        } catch (JSONException e) {
-                            LOGGER.info("Unable to parse Pirate wallet info response: {}", e.getMessage());
-                        }
-                    }
-
-                    LOGGER.info("Syncing Pirate Chain wallet...");
+                    LOGGER.debug("Syncing Pirate Chain wallet...");
                     String response;
-                    long syncStartMs = System.currentTimeMillis();
                     try {
-                        response = LiteWalletJni.execute("sync", "");
+                        response = this.executeSyncWithTimeout();
                     } catch (RuntimeException e) {
                         LOGGER.info("Pirate wallet sync call failed: {}", e.getMessage());
                         response = null;
                     }
-                    long syncElapsedMs = System.currentTimeMillis() - syncStartMs;
-                    if (syncElapsedMs >= SYNC_CALL_WARN_MS) {
-                        LOGGER.warn("Pirate wallet sync call took {} ms", syncElapsedMs);
-                    } else {
-                        LOGGER.info("Pirate wallet sync call finished in {} ms", syncElapsedMs);
-                    }
                     if (response == null || response.trim().isEmpty()) {
                         LOGGER.info("Pirate wallet sync returned empty response");
-                    } else {
-                        LOGGER.info("Pirate wallet sync response: {}", response);
+                        continue;
                     }
-                    LOGGER.info("Pirate lightwallet status after sync call: {}", this.getLightwalletStatusSummary());
+                    LOGGER.debug("sync response: {}", response);
+                    try {
+                        JSONObject json = new JSONObject(response);
+                        if (json.has("result")) {
+                            String result = json.getString("result");
 
-                    if (response != null && !response.trim().isEmpty()) {
-                        try {
-                            JSONObject json = new JSONObject(response);
-                            if (json.has("result")) {
-                                String result = json.getString("result");
-
-                                // We may have to set wallet to ready if this is the first ever successful sync
-                                if (Objects.equals(result, "success")) {
-                                    this.currentWallet.setReady(true);
-                                } else {
-                                    String reason = json.optString("reason", null);
-                                    if (reason != null && !reason.isEmpty()) {
-                                        LOGGER.info("Pirate wallet sync reported result {}: {}", result, reason);
-                                    } else {
-                                        LOGGER.info("Pirate wallet sync reported result {}", result);
-                                    }
-                                    boolean stopRequested = this.syncStopRequested.getAndSet(false);
-                                    boolean interrupted = reason != null && reason.toLowerCase().contains("interupted");
-                                    if (stopRequested || interrupted) {
-                                        LOGGER.info("Skipping Pirate lightwallet server rotation after requested sync stop");
-                                    } else {
-                                        this.rotateLightwalletServer("sync failure");
-                                    }
-                                }
+                            // We may have to set wallet to ready if this is the first ever successful sync
+                            if (Objects.equals(result, "success")) {
+                                this.currentWallet.setReady(true);
+                            } else {
+                                this.rotateLightwalletServer("sync failure");
                             }
-                        } catch (JSONException e) {
-                            LOGGER.info("Unable to interpret JSON", e);
-                        } catch (RuntimeException e) {
-                            LOGGER.info("Unable to interpret sync response: {}", e.getMessage());
                         }
+                    } catch (JSONException e) {
+                        LOGGER.info("Unable to interpret JSON", e);
                     }
-
-                if (this.forceSaveAfterSync.getAndSet(false)) {
-                    LOGGER.info("Saving Pirate wallet cache after forced sync stop");
-                    this.saveCurrentWallet();
-                }
                 } finally {
-                    if (syncStarted) {
-                        synchronized (this.syncMonitor) {
-                            this.syncInProgress = false;
-                            this.syncStartTimeMs = 0L;
-                            this.syncMonitor.notifyAll();
-                        }
-                        this.syncStopRequested.set(false);
-                    }
                     this.releaseWalletLockIfHeld();
+                }
+
+                if (this.restartRequested) {
+                    this.performRestart();
+                    continue;
                 }
 
                 // Rate limit sync attempts
@@ -511,9 +349,6 @@ public class PirateChainWalletController extends Thread {
                 if (now - SAVE_INTERVAL >= this.lastSaveTime) {
                     this.saveCurrentWallet();
                 }
-                if (this.saveRequested.getAndSet(false)) {
-                    this.saveCurrentWallet();
-                }
             }
         } catch (InterruptedException e) {
             // Fall-through to exit
@@ -522,41 +357,15 @@ public class PirateChainWalletController extends Thread {
 
     public void shutdown() {
         // Save the wallet
-        this.stopSyncIfRunning(SYNC_STOP_TIMEOUT_MS);
-        this.waitForSyncIdle(SYNC_STOP_TIMEOUT_MS);
         this.saveCurrentWallet();
 
         this.running = false;
-        this.syncWatchdogExecutor.shutdownNow();
         this.interrupt();
     }
 
     private long getNowMillis() {
         Long now = NTP.getTime();
         return now != null ? now : System.currentTimeMillis();
-    }
-
-    private void startSyncWatchdog() {
-        if (!this.syncWatchdogStarted.compareAndSet(false, true)) {
-            return;
-        }
-        this.syncWatchdogExecutor.scheduleWithFixedDelay(() -> {
-            try {
-                if (!this.syncInProgress || this.syncStartTimeMs <= 0L) {
-                    return;
-                }
-                long elapsedMs = System.currentTimeMillis() - this.syncStartTimeMs;
-                if (elapsedMs < SYNC_FORCE_STOP_MS || this.syncStopRequested.get()) {
-                    return;
-                }
-                LOGGER.warn("Pirate wallet sync running {} ms; requesting stop to flush cache", elapsedMs);
-                this.syncStopRequested.set(true);
-                this.forceSaveAfterSync.set(true);
-                this.stopSyncIfRunning(SYNC_STOP_TIMEOUT_MS);
-            } catch (Exception e) {
-                LOGGER.info("Pirate wallet sync watchdog error: {}", e.getMessage());
-            }
-        }, SYNC_WATCHDOG_INTERVAL_MS, SYNC_WATCHDOG_INTERVAL_MS, TimeUnit.MILLISECONDS);
     }
 
     // QDN & wallet libraries
@@ -742,9 +551,6 @@ public class PirateChainWalletController extends Thread {
         if (entropyBytes == null || entropyBytes.length != 32) {
             throw new ForeignBlockchainException("Invalid entropy bytes");
         }
-        this.lastEntropyBytes = entropyBytes;
-        this.lastIsNullSeedWallet = isNullSeedWallet;
-
         boolean needsSwitch = this.needsWalletSwitch(entropyBytes, isNullSeedWallet);
         boolean claimedSwitching = false;
         if (!needsSwitch && this.isSwitching() && !this.isSwitchingByCurrentThread()) {
@@ -756,7 +562,6 @@ public class PirateChainWalletController extends Thread {
             if (!claimedSwitching) {
                 throw new ForeignBlockchainException("Wallet switch in progress");
             }
-            this.stopSyncIfRunning(SYNC_STOP_TIMEOUT_MS);
         } else if (this.isSwitchingByCurrentThread()) {
             claimedSwitching = this.claimSwitching();
         }
@@ -765,10 +570,6 @@ public class PirateChainWalletController extends Thread {
         if (!this.acquireWalletLock(timeoutMs)) {
             if (claimedSwitching) {
                 this.releaseSwitchingClaim();
-            }
-            if (this.syncInProgress) {
-                LOGGER.info("Pirate wallet init blocked: sync in progress");
-                throw new ForeignBlockchainException("Sync in progress. Please try again later.");
             }
             if (this.isSwitching()) {
                 LOGGER.info("Pirate wallet init blocked: wallet switch in progress");
@@ -786,7 +587,7 @@ public class PirateChainWalletController extends Thread {
                         && now - this.lastWalletInitFailureMs < WALLET_INIT_RETRY_DELAY_MS) {
                     throw new ForeignBlockchainException("Wallet init cooling down. Please try again shortly.");
                 }
-                this.closeCurrentWallet();
+                this.closeCurrentWallet(true);
                 LOGGER.info("Creating Pirate wallet instance (nullSeed={})", isNullSeedWallet);
                 PirateWallet wallet = new PirateWallet(entropyBytes, isNullSeedWallet);
                 while (!wallet.isReady() && this.walletInitRetryCount < WALLET_INIT_MAX_RETRIES) {
@@ -863,28 +664,13 @@ public class PirateChainWalletController extends Thread {
     }
 
     private void saveCurrentWallet() {
-        if (Thread.currentThread() != this.controllerThread) {
-            this.saveRequested.set(true);
-            return;
-        }
-        if (this.syncInProgress || this.isSwitching()) {
-            this.saveRequested.set(true);
-            return;
-        }
-        this.saveCurrentWalletInternal();
-    }
-
-    private void saveCurrentWalletInternal() {
         if (this.currentWallet == null) {
             // Nothing to do
             return;
         }
-        boolean lockedHere = false;
-        if (!this.walletLock.isHeldByCurrentThread()) {
-            lockedHere = this.acquireWalletLock(WALLET_LOCK_TIMEOUT_MS);
-            if (!lockedHere) {
-                return;
-            }
+        if (!this.acquireWalletLock(SAVE_LOCK_TIMEOUT_MS)) {
+            LOGGER.info("Skipping Pirate wallet save: wallet busy");
+            return;
         }
         try {
             if (this.currentWallet == null) {
@@ -894,11 +680,9 @@ public class PirateChainWalletController extends Thread {
                 this.lastSaveTime = this.getNowMillis();
             }
         } catch (IOException e) {
-            LOGGER.info("Unable to save wallet: {}", e.getMessage());
+            LOGGER.info("Unable to save wallet");
         } finally {
-            if (lockedHere) {
-                this.releaseWalletLockIfHeld();
-            }
+            this.releaseWalletLockIfHeld();
         }
     }
 
@@ -906,8 +690,10 @@ public class PirateChainWalletController extends Thread {
         return this.currentWallet;
     }
 
-    private void closeCurrentWallet() {
-        this.saveCurrentWallet();
+    private void closeCurrentWallet(boolean save) {
+        if (save) {
+            this.saveCurrentWallet();
+        }
         this.currentWallet = null;
     }
 
@@ -927,9 +713,6 @@ public class PirateChainWalletController extends Thread {
     public void ensureSynchronized() throws ForeignBlockchainException {
         if (this.isSwitching() && !this.isSwitchingByCurrentThread()) {
             throw new ForeignBlockchainException("Wallet switch in progress");
-        }
-        if (this.syncInProgress) {
-            throw new ForeignBlockchainException("Sync in progress. Please try again later.");
         }
         if (!this.walletLock.isHeldByCurrentThread()) {
             throw new ForeignBlockchainException("Wallet busy. Please try again later.");
@@ -1022,7 +805,7 @@ public class PirateChainWalletController extends Thread {
         }
         if (syncStatusResponse == null || syncStatusResponse.trim().isEmpty()) {
             LOGGER.info("Pirate wallet syncStatus returned empty response");
-            return this.syncInProgress ? "Sync in progress" : "Sync status unavailable";
+            return "Sync status unavailable";
         }
 
         JSONObject json;
@@ -1034,12 +817,11 @@ public class PirateChainWalletController extends Thread {
         }
 
         boolean inProgress = json.optBoolean("in_progress", false);
-        if (this.syncInProgress && !inProgress) {
-            LOGGER.info("Pirate wallet sync stalled (no in-progress marker); cache reset disabled");
-            return "Sync in progress";
-        }
         if (inProgress) {
             String progress = this.formatSyncProgress(json);
+            if (this.handleStalledSyncStatus(json, progress)) {
+                return "Switching servers";
+            }
             if (progress != null) {
                 LOGGER.info("Pirate wallet sync progress: {}", progress);
                 return String.format("Sync in progress (%s)", progress);
@@ -1048,20 +830,138 @@ public class PirateChainWalletController extends Thread {
             return "Sync in progress";
         }
 
-        if (this.syncInProgress) {
-            String progress = this.formatSyncProgress(json);
-            if (progress != null) {
-                LOGGER.info("Pirate wallet sync progress: {}", progress);
-                return String.format("Sync in progress (%s)", progress);
-            }
-            return "Sync in progress";
-        }
-
         if (wallet != null && wallet.isSynchronized()) {
             return "Synchronized";
         }
 
+        if (this.handleRepeatedSyncStatus(json, wallet)) {
+            return "Switching servers";
+        }
+        this.handleIdleSyncStatus(json, wallet);
         return "Initializing wallet...";
+    }
+
+    private boolean handleRepeatedSyncStatus(JSONObject json, PirateWallet wallet) {
+        if (wallet == null || wallet.isSynchronized()) {
+            this.resetRepeatTracker();
+            return false;
+        }
+        if (json.optBoolean("in_progress", false)) {
+            this.resetRepeatTracker();
+            return false;
+        }
+        long syncId = json.optLong("sync_id", -1);
+        long scannedHeight = json.optLong("scanned_height", -1);
+        String progress = this.formatSyncProgress(json);
+        boolean same = syncId == this.lastSyncStatusRepeatId
+                && scannedHeight == this.lastSyncStatusRepeatHeight
+                && Objects.equals(progress, this.lastSyncStatusRepeatProgress);
+        if (same) {
+            this.syncStatusRepeatCount++;
+        } else {
+            this.lastSyncStatusRepeatId = syncId;
+            this.lastSyncStatusRepeatHeight = scannedHeight;
+            this.lastSyncStatusRepeatProgress = progress;
+            this.syncStatusRepeatCount = 1;
+        }
+        if (this.syncStatusRepeatCount >= SYNC_STATUS_REPEAT_THRESHOLD) {
+            long now = System.currentTimeMillis();
+            if (now - this.lastSyncStatusRotateMs >= SYNC_STATUS_ROTATE_COOLDOWN_MS && !this.isSwitching()) {
+                this.lastSyncStatusRotateMs = now;
+                this.requestRestart("syncStatus repeated");
+            }
+            this.resetRepeatTracker();
+            return true;
+        }
+        return false;
+    }
+
+    private void resetRepeatTracker() {
+        this.lastSyncStatusRepeatId = -1L;
+        this.lastSyncStatusRepeatHeight = -1L;
+        this.lastSyncStatusRepeatProgress = null;
+        this.syncStatusRepeatCount = 0;
+    }
+
+    private void handleIdleSyncStatus(JSONObject json, PirateWallet wallet) {
+        if (wallet == null || wallet.isSynchronized()) {
+            this.syncStatusIdleCount = 0;
+            this.lastSyncStatusIdleHeight = -1L;
+            return;
+        }
+        if (json.optBoolean("in_progress", false)) {
+            this.syncStatusIdleCount = 0;
+            this.lastSyncStatusIdleHeight = -1L;
+            return;
+        }
+        long syncId = json.optLong("sync_id", -1);
+        long scannedHeight = json.optLong("scanned_height", -1);
+        int configuredBirthday = Settings.getInstance().getArrrDefaultBirthday();
+        if (syncId != 0 || scannedHeight < 0 || scannedHeight > configuredBirthday) {
+            this.syncStatusIdleCount = 0;
+            this.lastSyncStatusIdleHeight = -1L;
+            return;
+        }
+        if (scannedHeight == this.lastSyncStatusIdleHeight) {
+            this.syncStatusIdleCount++;
+        } else {
+            this.syncStatusIdleCount = 1;
+            this.lastSyncStatusIdleHeight = scannedHeight;
+        }
+        if (this.syncStatusIdleCount >= SYNC_STATUS_IDLE_THRESHOLD) {
+            long now = System.currentTimeMillis();
+            if (now - this.lastSyncStatusRotateMs >= SYNC_STATUS_ROTATE_COOLDOWN_MS && !this.isSwitching()) {
+                this.lastSyncStatusRotateMs = now;
+                this.requestRestart("syncStatus idle");
+            }
+            this.syncStatusIdleCount = 0;
+            this.lastSyncStatusIdleHeight = -1L;
+        }
+    }
+
+    private boolean handleStalledSyncStatus(JSONObject json, String progress) {
+        if (!json.optBoolean("in_progress", false)) {
+            this.resetSyncStatusStallTracker();
+            return false;
+        }
+
+        long syncId = json.optLong("sync_id", -1);
+        if (syncId < 0 || progress == null) {
+            this.resetSyncStatusStallTracker();
+            return false;
+        }
+
+        if (syncId == this.lastSyncStatusId && Objects.equals(progress, this.lastSyncProgress)) {
+            this.syncStatusStallCount++;
+        } else {
+            this.syncStatusStallCount = 0;
+            this.lastSyncStatusId = syncId;
+            this.lastSyncProgress = progress;
+        }
+
+        if (this.syncStatusStallCount >= SYNC_STATUS_STALL_THRESHOLD) {
+            long now = System.currentTimeMillis();
+            if (now - this.lastSyncStatusRotateMs >= SYNC_STATUS_ROTATE_COOLDOWN_MS && !this.isSwitching()) {
+                LOGGER.info("Pirate wallet syncStatus stalled; rotating server (syncId={}, progress={})",
+                        syncId, progress);
+                this.lastSyncStatusRotateMs = now;
+                this.requestRestart("syncStatus stalled");
+            }
+            this.syncStatusStallCount = 0;
+            return true;
+        }
+
+        return false;
+    }
+
+    private void resetSyncStatusStallTracker() {
+        this.lastSyncStatusId = -1L;
+        this.lastSyncProgress = null;
+        this.syncStatusStallCount = 0;
+        this.syncStatusIdleCount = 0;
+        this.lastSyncStatusIdleHeight = -1L;
+        this.syncStatusTimeoutCount = 0;
+        this.resetRepeatTracker();
     }
 
     private String buildSyncStatusJson(String status, String rawResponse) {
@@ -1092,27 +992,15 @@ public class PirateChainWalletController extends Thread {
             return "Not initialized yet";
         }
 
-        if (this.syncInProgress) {
-            this.logSyncRunningIfNeeded();
-            String status = this.formatSyncStatus(wallet);
-            if ("Initializing wallet...".equals(status)) {
-                status = "Sync in progress";
-            }
-            LOGGER.info("Pirate wallet sync status: {}", status);
-            return status;
-        }
-
         boolean lockedHere = false;
         if (!this.walletLock.isHeldByCurrentThread()) {
             lockedHere = this.acquireWalletLock(STATUS_LOCK_TIMEOUT_MS);
             if (!lockedHere) {
-                if (this.syncInProgress) {
-                    return this.formatSyncStatus(wallet);
-                }
                 if (this.isSwitching()) {
                     return this.formatSwitchingStatus();
                 }
-                return "Wallet busy";
+                String rawResponse = this.fetchSyncStatusResponse();
+                return this.formatSyncStatus(wallet, rawResponse);
             }
         }
 
@@ -1151,16 +1039,10 @@ public class PirateChainWalletController extends Thread {
 
         String status;
         String rawResponse = this.fetchSyncStatusResponse();
-        if (this.syncInProgress) {
-            this.logSyncRunningIfNeeded();
-            status = this.formatSyncStatus(wallet, rawResponse);
-            if ("Initializing wallet...".equals(status)) {
-                status = "Sync in progress";
-            }
-            LOGGER.info("Pirate wallet sync status: {}", status);
-        } else {
-            status = this.formatSyncStatus(wallet, rawResponse);
+        if (rawResponse == null) {
+            LOGGER.info("Pirate wallet syncStatus unavailable");
         }
+        status = this.formatSyncStatus(wallet, rawResponse);
 
         return this.buildSyncStatusJson(status, rawResponse);
     }
@@ -1170,14 +1052,79 @@ public class PirateChainWalletController extends Thread {
             LOGGER.info("Pirate wallet syncStatus skipped: busy");
             return null;
         }
+        final String[] responseHolder = new String[1];
+        Thread syncStatusThread = new Thread(() -> {
+            try {
+                responseHolder[0] = LiteWalletJni.execute("syncStatus", "");
+            } catch (Exception e) {
+                LOGGER.info("Pirate wallet syncStatus failed: {}", e.getClass().getSimpleName());
+            }
+        }, "PirateWalletSyncStatus");
+        syncStatusThread.setDaemon(true);
+        syncStatusThread.start();
         try {
-            return LiteWalletJni.execute("syncStatus", "");
-        } catch (Exception e) {
-            LOGGER.info("Pirate wallet syncStatus failed: {}", e.getClass().getSimpleName());
+            syncStatusThread.join(SYNC_STATUS_TIMEOUT_MS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            LOGGER.info("Pirate wallet syncStatus interrupted");
             return null;
         } finally {
+            if (syncStatusThread.isAlive()) {
+                LOGGER.info("Pirate wallet syncStatus timed out after {} ms", SYNC_STATUS_TIMEOUT_MS);
+                syncStatusThread.interrupt();
+                this.handleSyncStatusTimeout();
+            }
             this.syncStatusSemaphore.release();
         }
+
+        if (syncStatusThread.isAlive()) {
+            return null;
+        }
+
+        return responseHolder[0];
+    }
+
+    private void handleSyncStatusTimeout() {
+        this.syncStatusTimeoutCount++;
+        if (this.syncStatusTimeoutCount < SYNC_STATUS_INIT_TIMEOUT_THRESHOLD) {
+            return;
+        }
+        this.syncStatusTimeoutCount = 0;
+        if (this.isSwitching()) {
+            return;
+        }
+        this.requestRestart("syncStatus timeout");
+    }
+
+    private String executeSyncWithTimeout() {
+        final String[] responseHolder = new String[1];
+        Thread syncThread = new Thread(() -> {
+            try {
+                responseHolder[0] = LiteWalletJni.execute("sync", "");
+            } catch (Exception e) {
+                LOGGER.info("Pirate wallet sync failed: {}", e.getClass().getSimpleName());
+            }
+        }, "PirateWalletSync");
+        syncThread.setDaemon(true);
+        this.activeSyncThread = syncThread;
+        syncThread.start();
+        try {
+            syncThread.join(SYNC_CALL_TIMEOUT_MS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            LOGGER.info("Pirate wallet sync interrupted");
+            this.activeSyncThread = null;
+            return null;
+        }
+        if (syncThread.isAlive()) {
+            LOGGER.info("Pirate wallet sync timed out after {} ms", SYNC_CALL_TIMEOUT_MS);
+            syncThread.interrupt();
+            this.requestRestart("sync timeout");
+            this.activeSyncThread = null;
+            return null;
+        }
+        this.activeSyncThread = null;
+        return responseHolder[0];
     }
 
     public String getSyncStatusWithInit(String entropy58) throws ForeignBlockchainException {
@@ -1191,6 +1138,111 @@ public class PirateChainWalletController extends Thread {
         synchronized (this.statusLock) {
             this.initWithEntropy58(entropy58);
             return this.getSyncStatusJson();
+        }
+    }
+
+    public String getSyncStatusWithInitTimeout(String entropy58) throws ForeignBlockchainException {
+        return this.getSyncStatusWithInitTimeout(entropy58, false);
+    }
+
+    public String getSyncStatusJsonWithInitTimeout(String entropy58) throws ForeignBlockchainException {
+        return this.getSyncStatusWithInitTimeout(entropy58, true);
+    }
+
+    private String getSyncStatusWithInitTimeout(String entropy58, boolean json) throws ForeignBlockchainException {
+        if (this.isSwitching() && !this.isSwitchingByCurrentThread()) {
+            String status = "Switching servers";
+            return json ? this.buildSyncStatusJson(status, null) : status;
+        }
+        final String[] responseHolder = new String[1];
+        final ForeignBlockchainException[] exceptionHolder = new ForeignBlockchainException[1];
+        Thread statusThread = new Thread(() -> {
+            try {
+                responseHolder[0] = json ? this.getSyncStatusJsonWithInit(entropy58)
+                        : this.getSyncStatusWithInit(entropy58);
+            } catch (ForeignBlockchainException e) {
+                exceptionHolder[0] = e;
+            } catch (Exception e) {
+                exceptionHolder[0] = new ForeignBlockchainException(e.getMessage());
+            }
+        }, "PirateWalletSyncStatusInit");
+        statusThread.setDaemon(true);
+        statusThread.start();
+
+        try {
+            statusThread.join(SYNC_STATUS_INIT_TIMEOUT_MS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new ForeignBlockchainException("Sync status interrupted");
+        }
+
+        if (statusThread.isAlive()) {
+            LOGGER.info("Pirate wallet syncStatus init timed out after {} ms", SYNC_STATUS_INIT_TIMEOUT_MS);
+            this.handleSyncStatusInitTimeout();
+            return json ? this.buildSyncStatusJson("Sync status unavailable", null) : "Sync status unavailable";
+        }
+
+        if (exceptionHolder[0] != null) {
+            throw exceptionHolder[0];
+        }
+
+        this.syncStatusInitTimeoutCount = 0;
+        return responseHolder[0];
+    }
+
+    private void handleSyncStatusInitTimeout() {
+        this.syncStatusInitTimeoutCount++;
+        if (this.syncStatusInitTimeoutCount < SYNC_STATUS_INIT_TIMEOUT_THRESHOLD) {
+            return;
+        }
+        this.syncStatusInitTimeoutCount = 0;
+        this.requestRestart("syncStatus init timeout");
+    }
+
+    private void requestRestart(String reason) {
+        this.restartReason = reason;
+        this.restartRequested = true;
+        LOGGER.info("Pirate wallet restart requested ({})", reason);
+        this.stopActiveSync();
+        this.interrupt();
+    }
+
+    private void performRestart() {
+        String reason = this.restartReason != null ? this.restartReason : "unknown";
+        LOGGER.info("Restarting Pirate wallet controller ({})", reason);
+        this.restartRequested = false;
+        this.restartReason = null;
+
+        if (!this.isSyncThreadActive()) {
+            this.saveCurrentWallet();
+        } else {
+            LOGGER.info("Skipping Pirate wallet save during restart: sync still active");
+        }
+        this.closeCurrentWallet(false);
+        this.resetSyncStatusStallTracker();
+        this.syncStatusInitTimeoutCount = 0;
+        this.lastSyncStatusRotateMs = 0L;
+        this.walletInitRetryCount = 0;
+        this.lastWalletInitFailureMs = 0L;
+        this.rotateLightwalletServer("restart requested");
+        this.shouldLoadWallet = true;
+        this.updateLoadStatus("Restarting Pirate wallet...");
+    }
+
+    private boolean isSyncThreadActive() {
+        Thread syncThread = this.activeSyncThread;
+        return syncThread != null && syncThread.isAlive();
+    }
+
+    private void stopActiveSync() {
+        Thread syncThread = this.activeSyncThread;
+        if (syncThread != null && syncThread.isAlive()) {
+            syncThread.interrupt();
+        }
+        try {
+            LiteWalletJni.execute("stop", "");
+        } catch (RuntimeException e) {
+            LOGGER.debug("Unable to stop Pirate Chain sync: {}", e.getMessage());
         }
     }
 

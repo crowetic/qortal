@@ -823,7 +823,11 @@ public class PirateLightClient extends BitcoinyBlockchainProvider {
 			// featuresJson.get("genesis_hash")).equals(this.expectedGenesisHash))
 			// continue;
 
-			this.highestObservedBlockHeight.accumulateAndGet(serverHeight, Math::max);
+			if (highestKnownHeight == 0 || serverHeight <= highestKnownHeight + MAX_SERVER_HEIGHT_BEHIND) {
+				this.highestObservedBlockHeight.accumulateAndGet(serverHeight, Math::max);
+			} else {
+				LOGGER.info("Ignoring implausible server height {} (highestKnown={})", serverHeight, highestKnownHeight);
+			}
 
 			LOGGER.info(() -> String.format("Connected to %s", server));
 			this.currentServer = server;
