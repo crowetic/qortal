@@ -1,6 +1,6 @@
 package org.qortal.crosschain;
 
-import cash.z.wallet.sdk.rpc.CompactFormats;
+import pirate.wallet.sdk.rpc.CompactFormats;
 import com.google.common.hash.HashCode;
 import com.rust.litewalletjni.LiteWalletJni;
 import org.bitcoinj.core.*;
