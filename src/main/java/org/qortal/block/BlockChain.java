@@ -1088,9 +1088,18 @@ public class BlockChain {
 					LOGGER.info(String.format("Forcably orphaning block %d", height));
 
 					Block block = new Block(repository, orphanBlockData);
-					block.orphan();
-
-					repository.saveChanges();
+					try {
+						block.orphan();
+						repository.saveChanges();
+					} catch (DataException | RuntimeException e) {
+						LOGGER.error(String.format("Failed to orphan block %d (sig %.8s)", height, Base58.encode(orphanBlockData.getSignature())), e);
+						try {
+							repository.discardChanges();
+						} catch (DataException discardException) {
+							LOGGER.warn("Failed to discard changes after orphan failure", discardException);
+						}
+						throw e;
+					}
 
 					--height;
 					orphanBlockData = repository.getBlockRepository().fromHeight(height);

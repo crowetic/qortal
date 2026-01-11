@@ -417,7 +417,7 @@
 									<pluginExecutionFilter>
 										<groupId>org.apache.maven.plugins</groupId>
 										<artifactId>maven-dependency-plugin</artifactId>
-										<version>${maven-dependency-plugin.version}</version>
+										<versionRange>[${maven-dependency-plugin.version},)</versionRange>
 										<goals>
 											<goal>unpack</goal>
 										</goals>
@@ -430,7 +430,7 @@
 									<pluginExecutionFilter>
 										<groupId>com.google.code.maven-replacer-plugin</groupId>
 										<artifactId>replacer</artifactId>
-										<version>${replacer.version}</version>
+										<versionRange>[${replacer.version},)</versionRange>
 										<goals>
 											<goal>replace</goal>
 										</goals>

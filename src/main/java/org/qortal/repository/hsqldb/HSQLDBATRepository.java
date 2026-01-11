@@ -741,7 +741,7 @@ public class HSQLDBATRepository implements ATRepository {
 		synchronized (this.repository.latestATStatesLock) {
 			LOGGER.trace("Rebuilding latest AT states...");
 
-			// Rebuild cache of latest AT states that we can't trim
+			// Rebuild cache of latest AT states (and their immediate predecessors) that we can't trim
 			String deleteSql = "DELETE FROM LatestATStates";
 			try {
 				this.repository.executeCheckedUpdate(deleteSql);
@@ -756,7 +756,7 @@ public class HSQLDBATRepository implements ATRepository {
 					+ "SELECT height FROM ATStates "
 					+ "WHERE ATStates.AT_address = ATs.AT_address "
 					+ "AND height <= ?"
-					+ "ORDER BY AT_address DESC, height DESC LIMIT 1"
+					+ "ORDER BY AT_address DESC, height DESC LIMIT 2"
 					+ ") "
 					+ ")";
 			try {

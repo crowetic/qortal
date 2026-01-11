@@ -1994,35 +1994,41 @@ public class Block {
 			Transaction transaction = blocksTransactions.get(sequence);
 			TransactionData transactionData = transaction.getTransactionData();
 
-			// Orphan transaction
-			// Only orphan transactions that didn't require group-approval.
-			// Group-approval transactions are dealt with later.
-			if (transactionData.getApprovalStatus() == ApprovalStatus.NOT_REQUIRED)
-				transaction.orphan();
+			try {
+				// Orphan transaction
+				// Only orphan transactions that didn't require group-approval.
+				// Group-approval transactions are dealt with later.
+				if (transactionData.getApprovalStatus() == ApprovalStatus.NOT_REQUIRED)
+					transaction.orphan();
 
-			// Regardless of group-approval, update relevant info for creator (e.g. lastReference)
-			transaction.orphanReferencesAndFees();
+				// Regardless of group-approval, update relevant info for creator (e.g. lastReference)
+				transaction.orphanReferencesAndFees();
 
-			// Unlink transaction from this block
-			BlockTransactionData blockTransactionData = new BlockTransactionData(this.getSignature(), sequence,
-					transactionData.getSignature());
-			this.repository.getBlockRepository().delete(blockTransactionData);
+				// Unlink transaction from this block
+				BlockTransactionData blockTransactionData = new BlockTransactionData(this.getSignature(), sequence,
+						transactionData.getSignature());
+				this.repository.getBlockRepository().delete(blockTransactionData);
 
-			// Add to unconfirmed pile and remove height, or delete if AT_TRANSACTION
-			if (transaction.getTransactionData().getType() == TransactionType.AT) {
-				transactionRepository.delete(transactionData);
-			} else {
-				// Add to unconfirmed pile
-				transactionRepository.unconfirmTransaction(transactionData);
+				// Add to unconfirmed pile and remove height, or delete if AT_TRANSACTION
+				if (transaction.getTransactionData().getType() == TransactionType.AT) {
+					transactionRepository.delete(transactionData);
+				} else {
+					// Add to unconfirmed pile
+					transactionRepository.unconfirmTransaction(transactionData);
 
-				// Unset height
-				transactionRepository.updateBlockHeight(transactionData.getSignature(), null);
+					// Unset height
+					transactionRepository.updateBlockHeight(transactionData.getSignature(), null);
 
-				// Unset sequence
-				transactionRepository.updateBlockSequence(transactionData.getSignature(), null);
+					// Unset sequence
+					transactionRepository.updateBlockSequence(transactionData.getSignature(), null);
+				}
+
+				transactionRepository.deleteParticipants(transactionData);
+			} catch (DataException | RuntimeException e) {
+				LOGGER.error(String.format("Error orphaning tx %.8s (%s) in block %d", Base58.encode(transactionData.getSignature()),
+						transactionData.getType().name(), this.blockData.getHeight()), e);
+				throw e;
 			}
-
-			transactionRepository.deleteParticipants(transactionData);
 		}
 	}
 
