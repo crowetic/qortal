@@ -5,6 +5,7 @@ import org.apache.logging.log4j.Logger;
 import org.qortal.api.resource.TransactionsResource.ConfirmationStatus;
 import org.qortal.arbitrary.misc.Service;
 import org.qortal.data.PaymentData;
+import org.qortal.data.account.AccountData;
 import org.qortal.data.group.GroupApprovalData;
 import org.qortal.data.transaction.BaseTransactionData;
 import org.qortal.data.transaction.GroupApprovalTransactionData;
@@ -1580,6 +1581,142 @@ public class HSQLDBTransactionRepository implements TransactionRepository {
 			return transactions;
 		} catch (SQLException | DataException e) {
 			throw new DataException("Unable to fetch unconfirmed transactions from repository", e);
+		}
+	}
+
+	@Override
+	public List<TransactionData> getPaymentsBetweenAddresses(String recipientAddress, String senderAddress,
+			Long amount, Integer startBlock, Integer blockLimit, ConfirmationStatus confirmationStatus, 
+			Integer limit, Integer offset, Boolean reverse) throws DataException {
+		// Validate that at least one address is provided
+		boolean hasRecipient = recipientAddress != null && !recipientAddress.isEmpty();
+		boolean hasSender = senderAddress != null && !senderAddress.isEmpty();
+		
+		if (!hasRecipient && !hasSender)
+			throw new IllegalArgumentException("At least one of recipientAddress or senderAddress must be provided");
+
+		// Step 1: Look up sender's public key from address if provided (fast - primary key lookup)
+		byte[] senderPublicKey = null;
+		if (hasSender) {
+			AccountData senderAccount = this.repository.getAccountRepository().getAccount(senderAddress);
+			if (senderAccount == null || senderAccount.getPublicKey() == null) {
+				// Sender account doesn't exist yet or has no public key, return empty list
+				return new ArrayList<>();
+			}
+			senderPublicKey = senderAccount.getPublicKey();
+		}
+
+		boolean hasHeightRange = startBlock != null || blockLimit != null;
+
+		// Calculate startBlock if blockLimit is specified without startBlock
+		if (hasHeightRange && startBlock == null)
+			startBlock = (reverse == null || !reverse) ? 1 : this.repository.getBlockRepository().getBlockchainHeight() - blockLimit;
+
+		// Step 2: Query payments - optimize table order based on filters
+		StringBuilder sql = new StringBuilder(1024);
+		
+		// Optimize query by starting from the table with the most selective filter
+		if (hasRecipient && !hasSender) {
+			// When only filtering by recipient, start from PaymentTransactions to use recipient index first
+			sql.append("SELECT Transactions.signature FROM PaymentTransactions ");
+			sql.append("JOIN Transactions ON Transactions.signature = PaymentTransactions.signature ");
+		} else {
+			// When filtering by sender or both, start from Transactions to use creator index
+			sql.append("SELECT Transactions.signature FROM Transactions ");
+			sql.append("JOIN PaymentTransactions ON PaymentTransactions.signature = Transactions.signature ");
+		}
+
+		List<String> whereClauses = new ArrayList<>();
+		List<Object> bindParams = new ArrayList<>();
+
+		// Filter by transaction type (PAYMENT) - part of TransactionCreatorIndex (creator, type)
+		whereClauses.add("Transactions.type = ?");
+		bindParams.add(Integer.valueOf(TransactionType.PAYMENT.value));
+
+		// Filter by recipient address if provided (uses existing PaymentTransactionsRecipientIndex)
+		if (hasRecipient) {
+			whereClauses.add("PaymentTransactions.recipient = ?");
+			bindParams.add(recipientAddress);
+		}
+
+		// Filter by creator/sender's public key if provided (uses existing TransactionCreatorIndex)
+		if (hasSender && senderPublicKey != null) {
+			whereClauses.add("Transactions.creator = ?");
+			bindParams.add(senderPublicKey);
+		}
+
+		// Filter by amount if provided (optional)
+		if (amount != null) {
+			whereClauses.add("PaymentTransactions.amount = ?");
+			bindParams.add(amount);
+		}
+
+		// Filter by confirmation status
+		switch (confirmationStatus) {
+			case BOTH:
+				break;
+
+			case CONFIRMED:
+				whereClauses.add("Transactions.block_height IS NOT NULL");
+				break;
+
+			case UNCONFIRMED:
+				whereClauses.add("Transactions.block_height IS NULL");
+				break;
+		}
+
+		// Height range (only for CONFIRMED transactions)
+		if (hasHeightRange) {
+			if (confirmationStatus == ConfirmationStatus.UNCONFIRMED)
+				throw new DataException("Cannot specify block height range for unconfirmed transactions");
+
+			whereClauses.add("Transactions.block_height >= " + startBlock);
+
+			if (blockLimit != null)
+				whereClauses.add("Transactions.block_height < " + (startBlock + blockLimit));
+		}
+
+		// Build WHERE clause
+		if (!whereClauses.isEmpty()) {
+			sql.append(" WHERE ");
+
+			final int whereClausesSize = whereClauses.size();
+			for (int wci = 0; wci < whereClausesSize; ++wci) {
+				if (wci != 0)
+					sql.append(" AND ");
+
+				sql.append(whereClauses.get(wci));
+			}
+		}
+
+		// Order by timestamp
+		sql.append(" ORDER BY Transactions.created_when");
+		sql.append((reverse == null || !reverse) ? " ASC" : " DESC");
+
+		HSQLDBRepository.limitOffsetSql(sql, limit, offset);
+
+		LOGGER.trace(() -> String.format("Payment between addresses SQL: %s", sql));
+
+		List<TransactionData> transactions = new ArrayList<>();
+
+		try (ResultSet resultSet = this.repository.checkedExecute(sql.toString(), bindParams.toArray())) {
+			if (resultSet == null)
+				return transactions;
+
+			do {
+				byte[] signature = resultSet.getBytes(1);
+
+				TransactionData transactionData = this.fromSignature(signature);
+
+				if (transactionData == null)
+					throw new DataException(String.format("Unable to fetch payment transaction %s from repository?", Base58.encode(signature)));
+
+				transactions.add(transactionData);
+			} while (resultSet.next());
+
+			return transactions;
+		} catch (SQLException e) {
+			throw new DataException("Unable to fetch payment transactions between addresses from repository", e);
 		}
 	}
 

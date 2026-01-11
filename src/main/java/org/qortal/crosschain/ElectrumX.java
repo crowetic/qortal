@@ -1,6 +1,6 @@
 package org.qortal.crosschain;
 
-import pirate.wallet.sdk.rpc.CompactFormats.CompactBlock;
+import cash.z.wallet.sdk.rpc.CompactFormats.CompactBlock;
 import com.google.common.hash.HashCode;
 import com.google.common.primitives.Bytes;
 import org.apache.logging.log4j.LogManager;
@@ -897,7 +897,7 @@ public class ElectrumX extends BitcoinyBlockchainProvider {
 				return new ElectrumServerResponse(electrumServer, response);
 			}
 
-			LOGGER.info(NULL_RESPONSE_FROM_ELECTRUM_X_SERVER);
+			LOGGER.debug(NULL_RESPONSE_FROM_ELECTRUM_X_SERVER);
 
 			// Didn't work, try another server...
 			this.connections.remove(electrumServer);
@@ -966,9 +966,9 @@ public class ElectrumX extends BitcoinyBlockchainProvider {
 				return;
 			}
 			if (this.connections.size() < this.minimumConnections) {
-				LOGGER.info("{} recovering connections", this.blockchain.currencyCode);
+				LOGGER.debug("{} recovering connections", this.blockchain.currencyCode);
 				startMakingConnections();
-				LOGGER.info("{} recovered {} connections", this.blockchain.currencyCode, this.connections.size());
+				LOGGER.debug("{} recovered {} connections", this.blockchain.currencyCode, this.connections.size());
 			}
 		} catch (Exception e) {
 			LOGGER.error(e.getMessage(), e);
@@ -1026,7 +1026,7 @@ public class ElectrumX extends BitcoinyBlockchainProvider {
 	}
 
 	private Optional<ChainableServerConnection> makeConnection(ChainableServer server, String requestedBy) {
-		LOGGER.info(() -> String.format("Connecting to %s %s", server, this.blockchain.currencyCode));
+		LOGGER.debug(() -> String.format("Connecting to %s %s", server, this.blockchain.currencyCode));
 
 		try {
 			SocketAddress endpoint = new InetSocketAddress(server.getHostName(), server.getPort());
@@ -1062,7 +1062,7 @@ public class ElectrumX extends BitcoinyBlockchainProvider {
 					&& !((String) featuresJson.get("genesis_hash")).equals(this.expectedGenesisHash))
 				return Optional.of(recorder.recordConnection(server, requestedBy, true, false, EXPECTED_GENESIS_ERROR));
 
-			LOGGER.info(() -> String.format("Connected to %s %s", server, this.blockchain.currencyCode));
+			LOGGER.debug(() -> String.format("Connected to %s %s", server, this.blockchain.currencyCode));
 			this.connections.add(electrumServer);
 			this.availableConnections.add(electrumServer);
 			return Optional.of(this.recorder.recordConnection(server, requestedBy, true, true, EMPTY));

@@ -1232,7 +1232,20 @@ public class Network {
      *  @return Message, or null if DataException was thrown.
      */
     public Message buildHeightOrChainTipInfo(Peer peer) {
-        if (peer.getPeersVersion() >= BlockSummariesV2Message.MINIMUM_PEER_VERSION) {
+        Long peersVersion = peer.getPeersVersion();
+        return buildHeightOrChainTipInfoForVersion(peersVersion);
+    }
+
+    /**
+     * Build Height or Chain Tip Info For Version
+     *
+     * @param peersVersion the peer version
+     *
+     * @return the height for old versions and the chain tip for new versions
+     */
+    public Message buildHeightOrChainTipInfoForVersion(Long peersVersion) {
+
+        if (peersVersion >= BlockSummariesV2Message.MINIMUM_PEER_VERSION) {
             int latestHeight = Controller.getInstance().getChainHeight();
 
             try (final Repository repository = RepositoryManager.getRepository()) {

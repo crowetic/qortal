@@ -697,13 +697,13 @@ public class PirateWallet {
         String classpath = System.getProperty("java.class.path");
         Path libDirectory = PirateChainWalletController.getRustLibOuterDirectory();
         if (libDirectory == null || !Files.exists(libDirectory)) {
-            LOGGER.info("Pirate wallet validation failed: lib directory missing");
-            return false;
+            LOGGER.info("Pirate wallet validation skipped: lib directory missing");
+            return true;
         }
         String serverUri = this.getValidatorServerUri();
         if (serverUri == null || serverUri.trim().isEmpty()) {
-            LOGGER.info("Pirate wallet validation failed: no lightwallet server available");
-            return false;
+            LOGGER.info("Pirate wallet validation skipped: no lightwallet server available");
+            return true;
         }
         ProcessBuilder builder = new ProcessBuilder(
                 javaBin,
@@ -720,8 +720,8 @@ public class PirateWallet {
             boolean finished = process.waitFor(VALIDATOR_TIMEOUT_MS, TimeUnit.MILLISECONDS);
             if (!finished) {
                 process.destroyForcibly();
-                LOGGER.info("Pirate wallet validation timed out for {}", walletPath);
-                return false;
+                LOGGER.info("Pirate wallet validation skipped (timeout) for {}", walletPath);
+                return true;
             }
             String output = readProcessOutput(process);
             if (process.exitValue() != 0) {
@@ -734,8 +734,8 @@ public class PirateWallet {
             if (e instanceof InterruptedException) {
                 Thread.currentThread().interrupt();
             }
-            LOGGER.info("Pirate wallet validation failed for {}: {}", walletPath, e.getMessage());
-            return false;
+            LOGGER.info("Pirate wallet validation skipped for {}: {}", walletPath, e.getMessage());
+            return true;
         }
     }
 

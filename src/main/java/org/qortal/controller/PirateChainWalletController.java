@@ -326,7 +326,17 @@ public class PirateChainWalletController extends Thread {
                             if (Objects.equals(result, "success")) {
                                 this.currentWallet.setReady(true);
                             } else {
-                                this.rotateLightwalletServer("sync failure");
+                                String reason = json.optString("reason", null);
+                                if (reason != null && !reason.isEmpty()) {
+                                    String lowerReason = reason.toLowerCase();
+                                    if (lowerReason.contains("interrupted") || lowerReason.contains("interupted")) {
+                                        LOGGER.info("Pirate wallet sync interrupted: {}", reason);
+                                    } else {
+                                        this.requestRestart("sync failure: " + reason);
+                                    }
+                                } else {
+                                    this.requestRestart("sync failure");
+                                }
                             }
                         }
                     } catch (JSONException e) {
@@ -1224,7 +1234,7 @@ public class PirateChainWalletController extends Thread {
         this.lastSyncStatusRotateMs = 0L;
         this.walletInitRetryCount = 0;
         this.lastWalletInitFailureMs = 0L;
-        this.rotateLightwalletServer("restart requested");
+        this.rotateLightwalletServer(reason);
         this.shouldLoadWallet = true;
         this.updateLoadStatus("Restarting Pirate wallet...");
     }

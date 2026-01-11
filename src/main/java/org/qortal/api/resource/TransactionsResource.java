@@ -37,6 +37,7 @@ import java.io.IOException;
 import java.io.StringWriter;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.InvocationTargetException;
+import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
@@ -456,6 +457,87 @@ public class TransactionsResource {
 		}
 
 		return transactions;
+	}
+
+	@GET
+	@Path("/payments/between")
+	@Operation(
+			summary = "Get payment transactions between recipient and sender addresses",
+			description = "Returns PAYMENT type transactions filtered by recipient address and/or sender address. " +
+					"At least one of recipientAddress or senderAddress must be provided. " +
+					"Block height ranges allowed when searching CONFIRMED transactions ONLY.",
+			responses = {
+					@ApiResponse(
+							description = "payment transactions",
+							content = @Content(
+									array = @ArraySchema(
+											schema = @Schema(
+													implementation = TransactionData.class
+											)
+									)
+							)
+					)
+			}
+	)
+	@ApiErrors({ApiError.INVALID_CRITERIA, ApiError.INVALID_ADDRESS, ApiError.REPOSITORY_ISSUE})
+	public List<TransactionData> getPaymentsBetweenAddresses(
+			@Parameter(description = "Recipient's address") @QueryParam("recipientAddress") String recipientAddress,
+			@Parameter(description = "Sender's address") @QueryParam("senderAddress") String senderAddress,
+			@Parameter(description = "Payment amount (e.g., 1 or 1.5 for QORT)") @QueryParam("amount") String amountString,
+			@Parameter(description = "Start block height") @QueryParam("startBlock") Integer startBlock,
+			@Parameter(description = "Block limit (number of blocks to search from startBlock)") @QueryParam("blockLimit") Integer blockLimit,
+			@Parameter(
+					description = "whether to include confirmed, unconfirmed or both",
+					required = true
+			) @QueryParam("confirmationStatus") ConfirmationStatus confirmationStatus,
+			@Parameter(ref = "limit") @QueryParam("limit") Integer limit,
+			@Parameter(ref = "offset") @QueryParam("offset") Integer offset,
+			@Parameter(ref = "reverse") @QueryParam("reverse") Boolean reverse) {
+
+		// Validate that at least one address is provided
+		boolean hasRecipient = recipientAddress != null && !recipientAddress.isEmpty();
+		boolean hasSender = senderAddress != null && !senderAddress.isEmpty();
+		
+		if (!hasRecipient && !hasSender) {
+			throw ApiExceptionFactory.INSTANCE.createException(request, ApiError.INVALID_CRITERIA);
+		}
+
+		// Validate recipient address if provided
+		if (hasRecipient && !Crypto.isValidAddress(recipientAddress)) {
+			throw ApiExceptionFactory.INSTANCE.createException(request, ApiError.INVALID_ADDRESS);
+		}
+
+		// Validate sender address if provided
+		if (hasSender && !Crypto.isValidAddress(senderAddress)) {
+			throw ApiExceptionFactory.INSTANCE.createException(request, ApiError.INVALID_ADDRESS);
+		}
+
+		// Convert amount from decimal string to database format (e.g., "1" -> 100000000)
+		Long amount = null;
+		if (amountString != null && !amountString.isEmpty()) {
+			try {
+				amount = new BigDecimal(amountString).setScale(8).unscaledValue().longValue();
+			} catch (NumberFormatException | ArithmeticException e) {
+				throw ApiExceptionFactory.INSTANCE.createException(request, ApiError.INVALID_CRITERIA);
+			}
+		}
+
+		// You can't ask for unconfirmed and impose a block height range
+		if (confirmationStatus != ConfirmationStatus.CONFIRMED && (startBlock != null || blockLimit != null)) {
+			throw ApiExceptionFactory.INSTANCE.createException(request, ApiError.INVALID_CRITERIA);
+		}
+
+		try (final Repository repository = RepositoryManager.getRepository()) {
+			List<TransactionData> transactions = repository.getTransactionRepository()
+					.getPaymentsBetweenAddresses(recipientAddress, senderAddress, amount, startBlock, blockLimit, 
+							confirmationStatus, limit, offset, reverse);
+
+			return transactions;
+		} catch (ApiException e) {
+			throw e;
+		} catch (DataException e) {
+			throw ApiExceptionFactory.INSTANCE.createException(request, ApiError.REPOSITORY_ISSUE, e);
+		}
 	}
 
 	@GET

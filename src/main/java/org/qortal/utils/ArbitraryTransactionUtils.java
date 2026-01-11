@@ -26,6 +26,7 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 import static java.nio.file.StandardCopyOption.REPLACE_EXISTING;
 
@@ -193,6 +194,94 @@ public class ArbitraryTransactionUtils {
         ArbitraryDataFile arbitraryDataFile = ArbitraryDataFile.fromTransactionData(transactionData);
 
         return arbitraryDataFile.fileCount();
+    }
+
+    /**
+     * Delete Files By Prefix
+     *
+     * @param directory the directory containing the files
+     * @param prefix the prefix of the files to delete
+     * @param now the timestamp for now
+     * @param minAge the time passed creation to wait for deletion
+     *
+     * @throws IOException
+     */
+    public static void deleteFilesByPrefix(Path directory, String prefix, long now, long minAge) throws IOException {
+        try (Stream<Path> paths = Files.list(directory)) {
+            paths.filter(path -> path.getFileName().toString().startsWith(prefix) && !ArbitraryTransactionUtils.isFileRecent(path, now, minAge))
+                .forEach(path -> {
+                    try {
+                        Files.delete(path);
+                        LOGGER.debug("deleted {}", path);
+                    } catch (IOException e) {
+                        LOGGER.warn("failed to delete {}", path);
+                    }
+                });
+        }
+    }
+
+    /**
+     * Delete Folders By Prefix
+     *
+     * @param directory the directory containing the directories to delete
+     * @param prefix the prefix of the directories to delete
+     * @param now the timestamp for now
+     * @param minAge the time passed creation to wait for deletion
+     *
+     * @throws IOException
+     */
+    public static void deleteFoldersByPrefix(Path directory, String prefix, long now, long minAge) throws IOException {
+        try (Stream<Path> paths = Files.list(directory)) {
+            paths.filter(path -> path.toFile().isDirectory() && path.getFileName().toString().startsWith(prefix) && !ArbitraryTransactionUtils.isFileRecent(path, now, minAge))
+                .forEach(path -> {
+                    try {
+                        deleteDirectory(path.toFile());
+                        LOGGER.debug("deleted {}", path);
+                    } catch (IOException e) {
+                        LOGGER.warn("failed to delete {}", path);
+                    }
+                });
+        }
+    }
+
+    /**
+     * Delete Directory
+     *
+     * Delete directory and all of its contents, recursively.
+     *
+     * @param directory the directory to delete
+     *
+     * @return true if successful, otherwise false
+     *
+     * @throws IOException
+     */
+    public static boolean deleteDirectory(File directory) throws IOException {
+        // Ensure the directory exists and is actually a directory
+        if (!directory.exists()) {
+            return false;
+        }
+        if (!directory.isDirectory()) {
+            return false;
+        }
+
+        File[] files = directory.listFiles();
+        if (files != null) {
+            // Iterate over all files and subdirectories
+            for (File file : files) {
+                if (file.isDirectory()) {
+                    // Recursively delete subdirectory
+                    deleteDirectory(file);
+                } else {
+                    // Delete the file
+                    if (!file.delete()) {
+                        LOGGER.warn("Failed to delete file: " + file.getAbsolutePath());
+                    }
+                }
+            }
+        }
+
+        // Now that the directory is empty, delete it
+        return directory.delete();
     }
 
     public static boolean isFileRecent(Path filePath, long now, long cleanupAfter) {
