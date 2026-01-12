@@ -102,6 +102,7 @@ public class ReticulumPeer implements Peer {
     Link peerLink;
     byte[] peerLinkHash;
     BufferedRWPair peerBuffer;
+    Channel channel;
     int receiveStreamId = 1001;
     int sendStreamId = 1001;
     ReticulumPeerAddress peerAddress;
@@ -188,8 +189,8 @@ public class ReticulumPeer implements Peer {
     public ReticulumPeer(byte[] dhash) {
         this.destinationHash = dhash;
         this.serverIdentity = recall(dhash);
-        //this.sendStreamId = getRandomStreamId();
-        //this.receiveStreamId = sendStreamId;
+        this.sendStreamId = getRandomStreamId();
+        this.receiveStreamId = sendStreamId;
         initPeerLink();
         //setCreationTimestamp(System.currentTimeMillis());
         this.creationTimestamp = Instant.now();
@@ -211,8 +212,8 @@ public class ReticulumPeer implements Peer {
         this.peerDestination = link.getDestination();
         this.destinationHash = link.getDestination().getHash();
         this.serverIdentity = link.getRemoteIdentity();
-        //this.sendStreamId = getRandomStreamId();
-        //this.receiveStreamId = sendStreamId;
+        this.sendStreamId = getRandomStreamId();
+        this.receiveStreamId = sendStreamId;
 
         this.creationTimestamp = Instant.now();
         this.lastAccessTimestamp = Instant.now();
@@ -267,7 +268,7 @@ public class ReticulumPeer implements Peer {
     public String toString() {
         // for messages we want an address-like string representation
         if (nonNull(this.peerLink)) {
-            return this.getPeerLink().toString();
+            return encodeHexString(this.getPeerLink().getLinkId());
         } else {
             return encodeHexString(this.getDestinationHash());
         }
@@ -278,21 +279,35 @@ public class ReticulumPeer implements Peer {
         return ThreadLocalRandom.current().nextInt(1, 16383);
     }
 
+    public void shutdownChannel() {
+        if (nonNull(channel)) {
+            channel.shutdown();
+            this.channel = null;
+        }
+    }
+
     public BufferedRWPair getOrInitPeerBuffer() {
-        var channel = this.peerLink.getChannel();
+        channel = this.peerLink.getChannel();
         //var network = Network.getInstance();
+        var rns = RNS.getInstance();
         var ntpNow = NTP.getTime();
         if (nonNull(this.peerBuffer)) {
             //log.info("peerBuffer exists: {}, link status: {}", this.peerBuffer, this.peerLink.getStatus());
             try {
                 log.trace("peerBuffer exists: {}, link status: {}", this.peerBuffer, this.peerLink.getStatus());
+                if (rns.isUnreachable(this)) {
+                    makePeerUnavailable();
+                    shutdownChannel();
+                    //peerLink.teardown();
+                    return null;
+                }
             } catch (IllegalStateException e) {
                 // Exception thrown by Reticulum if the buffer is unusable (Channel, Link, etc)
                 // This is a chance to correct links status when doing a ReticulumPingTask
                 log.warn("can't establish Channel/Buffer (remote peer down?), closing link: {}");
+                ////shutdownChannel();
                 this.peerBuffer.close();
-                this.peerLink.teardown();
-                //this.peerLink = null;
+                //this.peerLink.teardown();
                 //log.error("(handled) IllegalStateException - can't establish Channel/Buffer: {}", e);
                 //network.removeOutboundHandshakedPeer(this);
                 //network.removeConnectedPeer(this);
@@ -325,7 +340,7 @@ public class ReticulumPeer implements Peer {
     }
 
     public void disconnect(String reason) {
-        log.debug("Disconnecting peer {} after {} - reason: {}", this.toString(), getConnectionAge(), reason);
+        log.debug("@@@-> Disconnecting peer {} after {} - reason: {}", this.toString(), getConnectionAge(), reason);
         makePeerUnavailable();
         this.isPeerAvailable = false;
         //this.shutdown();
@@ -341,11 +356,12 @@ public class ReticulumPeer implements Peer {
             log.info("shutdown - peerLink: {}, status: {}, channel: {}", peerLink.toString(), peerLink.getStatus(), peerBuffer);
             if (peerLink.getStatus() == ACTIVE) {
                 makePeerUnavailable();
-                if (nonNull(this.peerBuffer)) {
-                    this.peerBuffer.close();
-                //    this.peerBuffer = null;
-                }
-                this.peerLink.teardown();
+                //if (nonNull(this.peerBuffer)) {
+                //    shutdownChannel();
+                //    this.peerBuffer.close();
+                ////    this.peerBuffer = null;
+                //}
+                //this.peerLink.teardown();
             } else {
                 log.info("shutdown - status (non-ACTIVE): {}", peerLink.getStatus());
             }
@@ -467,10 +483,10 @@ public class ReticulumPeer implements Peer {
             if (Arrays.equals(destinationHash, targetPeerHash)) {
                 log.info("closing link: {}", peerLink.getDestination().getHexHash());
                 if (nonNull(this.peerBuffer)) {
+                    shutdownChannel();
                     this.peerBuffer.close();
-                    //this.peerBuffer = null;
                 }
-                this.peerLink.teardown();
+                //this.peerLink.teardown();
             }
             // obsolete (?): Link status CLOSED means network ignores it until pruned
             if (isInitiator) {
@@ -588,16 +604,15 @@ public class ReticulumPeer implements Peer {
                 }
             } catch (MessageException e) {
                 //log.error("{} from peer {}", e.getMessage(), this);
-                log.error("{} from peer {}, closing link", e, this);
-                //log.info("{} from peer {}", e, this);
+                log.error("peerBufferReady - {} from peer {}", e, this);
                 // don't take any chances:
                 // can happen if link is closed by peer in which case we close this side of the link
                 this.peerData.setLastMisbehaved(NTP.getTime());
-                //shutdown();
                 //if (nonNull(this.peerBuffer)) {
+                //    shutdownChannel();
                 //    this.peerBuffer.close();
                 //}
-                peerLink.teardown();
+                //peerLink.teardown();
             }
         //}
     }
@@ -690,7 +705,8 @@ public class ReticulumPeer implements Peer {
         if (receipt.getStatus() == PacketReceiptStatus.FAILED) {
             log.info("packet timed out, receipt status: {}, isInitiator: {}", PacketReceiptStatus.FAILED, isInitiator);
             this.peerTimedOut = true;
-            this.peerLink.teardown();
+            //shutdownChannel();
+            //this.peerLink.teardown();
             //if (isInitiator) {
             //    this.peerLink.teardown();
             //}
@@ -878,7 +894,8 @@ public class ReticulumPeer implements Peer {
         //    return false;
         } catch (IllegalStateException e) {
             //log.warn("Can't write to buffer (remote buffer down?)");
-            this.peerLink.teardown();
+            //shutdownChannel();
+            //this.peerLink.teardown();
             //this.peerBuffer = null;
             log.error("IllegalStateException - can't write to buffer: {}", e);
             return false;
@@ -953,20 +970,23 @@ public class ReticulumPeer implements Peer {
                 if (this.peerLink.getStatus() != ACTIVE) {
                     log.debug("sendMessage - skipping: link not ready (status: {})", this.peerLink.getStatus());
                     return false;
+                } else {
+                    log.trace("Sending {} message with ID {} to peer {}",
+                            message.getType().name(), message.getId(), encodeHexString(getDestinationHash()));
+                    var peerBuffer = getOrInitPeerBuffer();
+                    peerBuffer.write(message.toBytes());
+                    peerBuffer.flush();
+                    //return true;  // done at end of method
                 }
             } else {
                 log.debug("sendMessage - skipping: peerLink is null)");
                 return false;
             }
-            log.trace("Sending {} message with ID {} to peer {}", message.getType().name(), message.getId(), this.toString());
-            var peerBuffer = getOrInitPeerBuffer();
-            peerBuffer.write(message.toBytes());
-            peerBuffer.flush();
-            //return true;
         } catch (IllegalStateException e) {
-            this.peerLink.teardown();
-            //this.peerBuffer = null;
             log.error("IllegalStateException - can't write to buffer: {}", e);
+            //shutdownChannel();
+            //this.peerLink.teardown();
+            //this.peerBuffer = null;
             //return false;
         } catch (MessageException e) {
             log.error(e.getMessage(), e);

@@ -32,6 +32,7 @@ import org.qortal.globalization.Translator;
 import org.qortal.gui.Gui;
 import org.qortal.gui.SysTray;
 import org.qortal.network.Network;
+import org.qortal.network.RNS;
 import org.qortal.network.Peer;
 import org.qortal.network.PeerAddress;
 import org.qortal.network.PeerAddressFactory;
@@ -124,7 +125,7 @@ public class Controller extends Thread {
 	private long repositoryCheckpointTimestamp = startTime; // ms
 	private long prunePeersTimestamp = startTime; // ms
 	private long ntpCheckTimestamp = startTime; // ms
-	//private long pruneRNSPeersTimestamp = startTime; // ms
+	private long pruneRNSTimestamp = startTime; // ms
 	private long deleteExpiredTimestamp = startTime + DELETE_EXPIRED_INTERVAL; // ms
 
 	/** Whether we can mint new blocks, as reported by BlockMinter. */
@@ -840,9 +841,9 @@ public class Controller extends Thread {
 		final long repositoryBackupInterval = Settings.getInstance().getRepositoryBackupInterval();
 		final long repositoryCheckpointInterval = Settings.getInstance().getRepositoryCheckpointInterval();
 		long repositoryMaintenanceInterval = getRandomRepositoryMaintenanceInterval();
-		final long prunePeersInterval = 2 * 60 * 1000L; // Every 2 minutes
-		//final long pruneRNSPeersInterval = 5 * 60 * 1000L; // Every 5 minutes
-		//final long pruneRNSPeersInterval = 1 * 60 * 1000L; // Every 1 minute (during development)
+		final long prunePeersInterval = 5 * 60 * 1000L; // Every 5 minutes
+		final long pruneRNSInterval = 2 * 60 * 1000L; // Every 2 minutes
+		//final long pruneRNSInterval = 1 * 60 * 1000L; // Every 1 minute (during development)
 
 		// Start executor service for trimming or pruning
 		PruneManager.getInstance().start();
@@ -951,17 +952,17 @@ public class Controller extends Thread {
 					}
 				}
 
-				//// Q: Do we need global pruning?
-				//if (now >= pruneRNSPeersTimestamp + pruneRNSPeersInterval) {
-				//	pruneRNSPeersTimestamp = now + pruneRNSPeersInterval;
-        //
-				//	try {
-				//		LOGGER.debug("Pruning Reticulum peers...");
-				//		RNSNetwork.getInstance().prunePeers();
-				//	} catch (DataException e) {
-				//		LOGGER.warn(String.format("Repository issue when trying to prune Reticulum peers: %s", e.getMessage()));
-				//	}
-				//}
+                // Prune mesh peers
+				if (now >= pruneRNSTimestamp + pruneRNSInterval) {
+					pruneRNSTimestamp = now + pruneRNSInterval;
+
+					try {
+						LOGGER.debug("Pruning Reticulum peers...");
+						RNS.getInstance().prunePeers();
+					} catch (DataException e) {
+						LOGGER.warn(String.format("Repository issue when trying to prune Reticulum peers: %s", e.getMessage()));
+					}
+				}
 
 				// Delete expired transactions
 				if (now >= deleteExpiredTimestamp) {
@@ -1299,11 +1300,12 @@ public class Controller extends Thread {
 				LOGGER.info("Backing up local data");
 				this.exportRepositoryData();
 
+                // shutdown Reticulum mesh before Network for a chance to tear down ACTIVE links gracefully
+                LOGGER.info("Shutting down Reticulum");
+                RNS.getInstance().shutdown();
+
 				LOGGER.info("Shutting down networking");
 				Network.getInstance().shutdown();
-
-				//LOGGER.info("Shutting down Reticulum");
-				//RNSNetwork.getInstance().shutdown();
 
 				LOGGER.info("Shutting down controller");
 				this.interrupt();

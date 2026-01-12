@@ -176,15 +176,16 @@ public class RNS {
         log.info("reticulum instance created");
         log.debug("reticulum instance created: {}", reticulum);
         //        Settings.getInstance().getMaxRNSNetworkThreadPoolSize(),   // statically set to 5 below
-        var networkDataPriority = Settings.getInstance().getNetworkThreadPriority();
-        //if (networkDataPriority > 1) {
-        //    networkDataPriority--; // keep network priority below the on of Network-EPC
+        var rnsThreadPriority = Settings.getInstance().getNetworkThreadPriority(); // default: 7
+        //// if possible one higher than NetworkThreadPriority
+        //if (rnsThreadPriority < 10) {
+        //    rnsThreadPriority++;
         //}
         ExecutorService RNSExecutor = new ThreadPoolExecutor(1,
-                8,  // we don't need many max threads
+                Settings.getInstance().getReticulumMaxNetworkThreadPoolSize(),  // we don't need many max threads
                 NETWORK_EPC_KEEPALIVE, TimeUnit.SECONDS,
                 new SynchronousQueue<Runnable>(),
-                new NamedThreadFactory("RNS-EPC", networkDataPriority));
+                new NamedThreadFactory("RNS-EPC", rnsThreadPriority));
         rnsEPC = new RNSProcessor(RNSExecutor);
     }
 
@@ -251,7 +252,7 @@ public class RNS {
         //dataDestination.announce();
         //log.debug("Sent initial announce from {} ({})", encodeHexString(dataDestination.getHash()), dataDestination.getName());
 
-        // Start up first networking thread (the "server loop", the "Tasks engine")
+        // Start up first networking thread (the RNS main thread, somilar to the "server loop" in a standalone Reticulum app)
         rnsEPC.start();
     }
 
@@ -391,11 +392,11 @@ public class RNS {
             log.info("shutting down peer: {}", encodeHexString(p.getDestinationHash()));
             //p.makePeerUnavailable();
             p.shutdown();
-            try {
-                TimeUnit.MILLISECONDS.sleep(200); // allow for peers to disconnect gracefully
-            } catch (InterruptedException e) {
-                log.error("exception: ", e);
-            }
+            //try {
+            //    TimeUnit.MILLISECONDS.sleep(200); // allow for peers to disconnect gracefully
+            //} catch (InterruptedException e) {
+            //    log.error("exception: ", e);
+            //}
         }
         log.debug("Shutdown of linkedPeers completed");
         // Note: we still need to get the packet timeout callback to work...
@@ -568,6 +569,7 @@ public class RNS {
                 newPeer.setIsDataPeer(false);
             }
             newPeer.setMessageMagic(getMessageMagic());
+            log.debug(">>> ReticulumPeer created - PeerData: {} - {}", newPeer.getPeerData().toString(), newPeer.getPeerAddress().getDestinationHash());
             return newPeer;
         }
     }
@@ -724,17 +726,18 @@ public class RNS {
 
     public void removeLinkedPeer(ReticulumPeer peer) {
         if (nonNull(peer.getPeerBuffer())) {
+            peer.shutdownChannel();
             peer.getPeerBuffer().close();
         }
-        if (nonNull(peer.getPeerLink())) {
-            peer.getPeerLink().teardown();
-        }
+        //if (nonNull(peer.getPeerLink())) {
+        //    peer.getPeerLink().teardown();
+        //}
         var p = this.linkedPeers.remove(this.linkedPeers.indexOf(peer)); // thread safe
         this.immutableLinkedPeers = List.copyOf(this.linkedPeers);
-        var network = Network.getInstance();
-        network.removeHandshakedPeer(peer);
-        network.removeOutboundHandshakedPeer(peer);
-        network.removeConnectedPeer(peer);
+        //var network = Network.getInstance();
+        //network.removeHandshakedPeer(peer);
+        //network.removeOutboundHandshakedPeer(peer);
+        //network.removeConnectedPeer(peer);
     }
 
     // note: we already have a lobok getter for this
@@ -752,11 +755,12 @@ public class RNS {
 
     public void removeIncomingPeer(ReticulumPeer peer) {
         if (nonNull(peer.getPeerBuffer())) {
+            peer.shutdownChannel();
             peer.getPeerBuffer().close();
         }
-        if (nonNull(peer.getPeerLink())) {
-            peer.getPeerLink().teardown();
-        }
+        //if (nonNull(peer.getPeerLink())) {
+        //    peer.getPeerLink().teardown();
+        //}
         var p = this.incomingPeers.remove(this.incomingPeers.indexOf(peer));
         this.immutableIncomingPeers = List.copyOf(this.incomingPeers);
     }
@@ -769,11 +773,12 @@ public class RNS {
     //    return this.immutableIncomingPeers;
     //}
 
-    private Boolean isUnreachable(ReticulumPeer peer) {
+    public Boolean isUnreachable(ReticulumPeer peer) {
         var result = peer.getDeleteMe();
         var now = Instant.now();
         var peerLastAccessTimestamp = peer.getLastAccessTimestamp();
         if (peerLastAccessTimestamp.isBefore(now.minusMillis(LINK_UNREACHABLE_TIMEOUT))) {
+            log.debug("RNS - link is unreachable");
             result = true;
         }
         return result;
@@ -841,7 +846,7 @@ public class RNS {
             if (nonNull(pLink)) {
                 if (p.getPeerTimedOut()) {
                     // options: keep in case peer reconnects or remove => we'll remove it
-                    //p.makePeerUnavailable();
+                    p.makePeerUnavailable();
                     //p.setPeerTimedOut(false);
                     removeLinkedPeer(p);
                     continue;
@@ -856,8 +861,9 @@ public class RNS {
                     continue;
                 }
                 if (pLink.getStatus() == PENDING) {
-                    pLink.teardown();
                     p.makePeerUnavailable();
+                    //p.shutdownChannel();
+                    pLink.teardown();
                     p.setIsPeerAvailable(false);
                     removeLinkedPeer(p);
                     continue;
@@ -879,7 +885,9 @@ public class RNS {
             pLink = p.getPeerLink();
             if (nonNull(pLink)) {
                 // could be eg. PENDING
-                pLink.teardown();
+                if (pLink.getStatus() != ACTIVE) {
+                    pLink.teardown();
+                }
             }
             removeIncomingPeer(p);
         }
@@ -909,10 +917,10 @@ public class RNS {
             log.info("Active core peers ({}) <= desired core peers ({}). Announcing", corePeerCount, MIN_DESIRED_CORE_PEERS);
             d.announce();
         }
-        if ((dataPeerCount <= MIN_DESIRED_DATA_PEERS) && (pa == RNSCommon.PeerAspect.DATA)) {
-            log.info("Active qdn peers ({}) <= desired data peers ({}). Announcing", dataPeerCount, MIN_DESIRED_CORE_PEERS);
-            d.announce();
-        }
+        //if ((dataPeerCount <= MIN_DESIRED_DATA_PEERS) && (pa == RNSCommon.PeerAspect.DATA)) {
+        //    log.info("Active qdn peers ({}) <= desired data peers ({}). Announcing", dataPeerCount, MIN_DESIRED_CORE_PEERS);
+        //    d.announce();
+        //}
     }
 
     /**
