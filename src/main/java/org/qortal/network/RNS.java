@@ -608,13 +608,20 @@ public class RNS {
             //    return task;
             //}
 
-            final Long now = NTP.getTime();
-
-            // ping task (Link+Channel+Buffer)
-            task = maybeProducePeerPingTask(now);
-            if (task != null) {
-                return task;
+            //final Long now = NTP.getTime();
+            //
+            //// ping task (Link+Channel+Buffer)
+            //task = maybeProducePeerPingTask(now);
+            //if (task != null) {
+            //    return task;
+            //}
+            // we'll just wait instead of producing tasks
+            try {
+                TimeUnit.MILLISECONDS.sleep(100);
+            } catch (InterruptedException e) {
+                log.error("exception: {}", e);
             }
+
 
             //task = maybeProduceBroadcastTask(now);
             //if (task != null) {
@@ -630,22 +637,22 @@ public class RNS {
             return null;
         }
 
-        private Task maybeProducePeerPingTask(Long now) {
-            //var ilp = getImmutableLinkedPeers().stream()
-            //        .map(peer -> peer.getPingTask(now))
-            //        .filter(Objects::nonNull)
-            //        .findFirst()
-            //        .orElse(null);
-            //if (nonNull(ilp)) {
-            //    log.info("ilp - {}", ilp);
-            //}
-            //return ilp;
-            return getActiveImmutableLinkedPeers().stream()
-                    .map(peer -> peer.getPingTask(now))
-                    .filter(Objects::nonNull)
-                    .findFirst()
-                    .orElse(null);
-        }
+        //private Task maybeProducePeerPingTask(Long now) {
+        //    //var ilp = getImmutableLinkedPeers().stream()
+        //    //        .map(peer -> peer.getPingTask(now))
+        //    //        .filter(Objects::nonNull)
+        //    //        .findFirst()
+        //    //        .orElse(null);
+        //    //if (nonNull(ilp)) {
+        //    //    log.info("ilp - {}", ilp);
+        //    //}
+        //    //return ilp;
+        //    return getActiveImmutableLinkedPeers().stream()
+        //            .map(peer -> peer.getPingTask(now))
+        //            .filter(Objects::nonNull)
+        //            .findFirst()
+        //            .orElse(null);
+        //}
 
         //private Task maybeProduceBroadcastTask(Long now) {
         //    if (now == null || now < nextBroadcastTimestamp.get()) {

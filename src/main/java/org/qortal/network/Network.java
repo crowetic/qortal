@@ -635,9 +635,8 @@ public class Network {
         }
 
         private Task maybeProducePeerPingTask(Long now) {
-            // non-IP peer task handled in respective module (eg. RNS)
-            //return getImmutableHandshakedPeers().stream()
-            return getImmutableHandshakedIPPeers().stream()
+            //return getImmutableHandshakedIPPeers().stream()
+            return getImmutableHandshakedPeers().stream()
                     .map(peer -> peer.getPingTask(now))
                     .filter(Objects::nonNull)
                     .findFirst()
@@ -649,7 +648,7 @@ public class Network {
                 return null;
             }
 
-            // only IPPeer
+            // only IPPeer know about Handshake.COMPLETED
             //var iOHP = getImmutableHandshakedPeers().stream()
             var iOHP = getImmutableHandshakedIPPeers().stream()
                     .filter(peer -> peer.getHandshakeStatus() == Handshake.COMPLETED)

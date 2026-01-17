@@ -124,8 +124,8 @@ public class Controller extends Thread {
 	private long repositoryMaintenanceTimestamp = startTime; // ms
 	private long repositoryCheckpointTimestamp = startTime; // ms
 	private long prunePeersTimestamp = startTime; // ms
+    private long pruneRNSPeersTimestamp = startTime; // ms
 	private long ntpCheckTimestamp = startTime; // ms
-	private long pruneRNSTimestamp = startTime; // ms
 	private long deleteExpiredTimestamp = startTime + DELETE_EXPIRED_INTERVAL; // ms
 
 	/** Whether we can mint new blocks, as reported by BlockMinter. */
@@ -842,8 +842,8 @@ public class Controller extends Thread {
 		final long repositoryCheckpointInterval = Settings.getInstance().getRepositoryCheckpointInterval();
 		long repositoryMaintenanceInterval = getRandomRepositoryMaintenanceInterval();
 		final long prunePeersInterval = 5 * 60 * 1000L; // Every 5 minutes
-		final long pruneRNSInterval = 2 * 60 * 1000L; // Every 2 minutes
-		//final long pruneRNSInterval = 1 * 60 * 1000L; // Every 1 minute (during development)
+		//final long pruneRNSPeersInterval = 2 * 60 * 1000L; // Every 2 minutes
+		final long pruneRNSPeersInterval = 1 * 60 * 1000L; // Every 1 minute (during development)
 
 		// Start executor service for trimming or pruning
 		PruneManager.getInstance().start();
@@ -953,8 +953,8 @@ public class Controller extends Thread {
 				}
 
                 // Prune mesh peers
-				if (now >= pruneRNSTimestamp + pruneRNSInterval) {
-					pruneRNSTimestamp = now + pruneRNSInterval;
+				if (now >= pruneRNSPeersTimestamp + pruneRNSPeersInterval) {
+					pruneRNSPeersTimestamp = now + pruneRNSPeersInterval;
 
 					try {
 						LOGGER.debug("Pruning Reticulum peers...");
