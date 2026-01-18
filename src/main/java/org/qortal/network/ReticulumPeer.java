@@ -3,6 +3,7 @@ package org.qortal.network;
 //import org.slf4j.Logger;
 //import org.slf4j.LoggerFactory;
 
+import static io.reticulum.link.LinkStatus.CLOSED;
 import static java.util.Objects.isNull;
 import static java.util.Objects.nonNull;
 //import java.io.IOException;
@@ -194,8 +195,8 @@ public class ReticulumPeer implements Peer {
     public ReticulumPeer(byte[] dhash) {
         this.destinationHash = dhash;
         this.serverIdentity = recall(dhash);
-        this.sendStreamId = getRandomStreamId();
-        this.receiveStreamId = sendStreamId;
+        //this.sendStreamId = getRandomStreamId();
+        //this.receiveStreamId = sendStreamId;
         initPeerLink();
         //setCreationTimestamp(System.currentTimeMillis());
         this.creationTimestamp = Instant.now();
@@ -217,8 +218,8 @@ public class ReticulumPeer implements Peer {
         this.peerDestination = link.getDestination();
         this.destinationHash = link.getDestination().getHash();
         this.serverIdentity = link.getRemoteIdentity();
-        this.sendStreamId = getRandomStreamId();
-        this.receiveStreamId = sendStreamId;
+        //this.sendStreamId = getRandomStreamId();
+        //this.receiveStreamId = sendStreamId;
 
         this.pendingMessages = new LinkedBlockingQueue<>();
         this.creationTimestamp = Instant.now();
@@ -364,7 +365,8 @@ public class ReticulumPeer implements Peer {
         if (nonNull(this.peerLink)) {
             log.info("shutdown - peerLink: {}, status: {}, channel: {}", peerLink.toString(), peerLink.getStatus(), peerBuffer);
             if (peerLink.getStatus() == ACTIVE) {
-                makePeerUnavailable();
+                disconnect("shutting down");
+                //makePeerUnavailable();
                 //if (nonNull(this.peerBuffer)) {
                 //    shutdownChannel();
                 //    this.peerBuffer.close();
@@ -451,7 +453,8 @@ public class ReticulumPeer implements Peer {
     
     public void linkClosed(Link link) {
         if (isInitiator) {
-            makePeerUnavailable();
+            disconnect("link closed");
+            //makePeerUnavailable();
         }
         if (link.getTeardownReason() == TIMEOUT) {
             log.info("linkClosed callback: The link timed out");
@@ -487,7 +490,8 @@ public class ReticulumPeer implements Peer {
                 encodeHexString(destinationHash),
                 encodeHexString(targetPeerHash));
             if (isInitiator) {
-                makePeerUnavailable();
+                disconnect("close link packet received");
+                //makePeerUnavailable();
             }
             if (Arrays.equals(destinationHash, targetPeerHash)) {
                 log.info("closing link: {}", peerLink.getDestination().getHexHash());
@@ -971,6 +975,11 @@ public class ReticulumPeer implements Peer {
             if (nonNull(this.peerLink)) {
                 if (this.peerLink.getStatus() != ACTIVE) {
                     log.debug("sendMessage - skipping: link not ready (status: {})", this.peerLink.getStatus());
+                    if (this.peerLink.getStatus() == CLOSED) {
+                        // prevent peer from being chosen for sending again.
+                        disconnect("sendMessage - link closed");
+                        //makePeerUnavailable();
+                    }
                     return false;
                 } else {
                     log.trace("Sending {} message with ID {} to peer {}",
