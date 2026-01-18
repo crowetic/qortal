@@ -14,6 +14,7 @@ import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.logging.Logger;
 
 public class HSQLDBBlockRepository implements BlockRepository {
 
@@ -68,6 +69,35 @@ public class HSQLDBBlockRepository implements BlockRepository {
 			return getBlockFromResultSet(resultSet);
 		} catch (SQLException e) {
 			throw new DataException("Error fetching block by signature from repository", e);
+		}
+	}
+
+	@Override
+	public List<BlockData> fromSignatures(List<byte[]> signatures) throws DataException {
+		StringBuffer sql = new StringBuffer();
+		sql.append("SELECT " + BLOCK_DB_COLUMNS + " ");
+		sql.append("FROM Blocks WHERE signature IN (");
+		sql.append(String.join(", ", Collections.nCopies(signatures.size(), "?")));
+		sql.append(")");
+
+		List<BlockData> list;
+		try (ResultSet resultSet = this.repository.checkedExecute(sql.toString(), signatures.toArray(new byte[0][]))) {
+			if (resultSet == null) {
+				return new ArrayList<>(0);
+			}
+
+			list = new ArrayList<>(signatures.size());
+			do {
+				BlockData blockFromResultSet = getBlockFromResultSet(resultSet);
+
+				if( blockFromResultSet != null ) list.add(blockFromResultSet);
+			} while( resultSet.next());
+
+			return list;
+		} catch (SQLException e) {
+			throw new DataException("Error fetching block by signature from repository", e);
+		} catch ( Exception e ) {
+			throw new DataException(e.getMessage());
 		}
 	}
 

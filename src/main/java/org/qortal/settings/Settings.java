@@ -1,5 +1,27 @@
 package org.qortal.settings;
 
+import java.io.File;
+import java.io.FileNotFoundException;
+import java.io.FileReader;
+import java.io.IOException;
+import java.io.Reader;
+import java.nio.file.Paths;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+
+import javax.xml.bind.JAXBContext;
+import javax.xml.bind.JAXBException;
+import javax.xml.bind.UnmarshalException;
+import javax.xml.bind.Unmarshaller;
+import javax.xml.bind.annotation.XmlAccessType;
+import javax.xml.bind.annotation.XmlAccessorType;
+import javax.xml.transform.stream.StreamSource;
+
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.eclipse.persistence.exceptions.XMLMarshalException;
@@ -15,17 +37,6 @@ import org.qortal.crosschain.PirateChain.PirateChainNet;
 import org.qortal.crosschain.Ravencoin.RavencoinNet;
 import org.qortal.network.message.MessageType;
 import org.qortal.utils.EnumUtils;
-
-import javax.xml.bind.JAXBContext;
-import javax.xml.bind.JAXBException;
-import javax.xml.bind.UnmarshalException;
-import javax.xml.bind.Unmarshaller;
-import javax.xml.bind.annotation.XmlAccessType;
-import javax.xml.bind.annotation.XmlAccessorType;
-import javax.xml.transform.stream.StreamSource;
-import java.io.*;
-import java.nio.file.Paths;
-import java.util.*;
 
 // All properties to be converted to JSON via JAXB
 @XmlAccessorType(XmlAccessType.FIELD)
@@ -364,7 +375,7 @@ public class Settings {
 	private boolean directDataRetrievalEnabled = true;
 
 	/** Expiry time (ms) for (unencrypted) built/cached data */
-	private Long builtDataExpiryInterval = 30 * 24 * 60 * 60 * 1000L; // 30 days
+	private Long builtDataExpiryInterval = 7 * 24 * 60 * 60 * 1000L; // 7 days
 
 	/** Whether to validate every layer when building arbitrary data, or just the final layer */
 	private boolean validateAllDataLayers = false;
@@ -522,9 +533,9 @@ public class Settings {
 	/**
 	 * Arbitrary Indexing Priority
 	 *
-	 * The thread priority when indexing arbirary resources.
+	 * The thread priority when indexing arbitrary resources.
 	 */
-    private int arbitraryIndexingPriority = 5;
+    private int arbitraryIndexingPriority = 1;
 
 	/**
 	 * Arbitrary Indexing Frequency (In Minutes)

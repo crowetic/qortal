@@ -113,10 +113,10 @@ window.addEventListener("message", async (event) => {
         case "DELETE_LIST_ITEM":
             const isExtInstalledRes = await isExtensionInstalledFunc()
             if(isExtInstalledRes?.version) return;
-            const errorString = "Interactive features were requested, but these are not yet supported when viewing via a gateway. To use interactive features, please access using the Qortal UI desktop app. More info at: https://qortal.org";
+            const errorString = "Interactive features were requested, but these are not yet supported when viewing via a gateway. To use interactive features, please access using the Qortal Hub on a desktop. More info at: https://qortal.dev/onboarding";
             response = "{\"error\": \"" + errorString + "\"}"
 
-            const modalText = "This app is powered by the Qortal blockchain. You are viewing in read-only mode. To use interactive features, please access using the Qortal UI desktop app.";
+            const modalText = "This app is powered by the Qortal blockchain. You are viewing in read-only mode. To use interactive features, please access using the Qortal Hub on a desktop. More info at: https://qortal.dev/onboarding";
             qdnGatewayShowModal(modalText);
             break;
 

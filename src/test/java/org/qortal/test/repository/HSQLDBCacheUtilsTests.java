@@ -430,12 +430,27 @@ public class HSQLDBCacheUtilsTests {
     }
 
     @Test
-    public void testFollowedNamesPositive() {
+    public void testFollowedNamesNegative() {
 
         ArbitraryResourceData data = new ArbitraryResourceData();
         data.name = "Joe";
 
         Supplier<List<String>> supplier = () -> List.of("admin");
+
+        filterListByMap(
+                List.of(data),
+                NAME_LEVEL, new HashMap<>(Map.of(FOLLOWED_ONLY, supplier)),
+                0
+        );
+    }
+
+    @Test
+    public void testFollowedNamesPositive() {
+
+        ArbitraryResourceData data = new ArbitraryResourceData();
+        data.name = "Joe";
+
+        Supplier<List<String>> supplier = () -> List.of("Joe");
 
         filterListByMap(
                 List.of(data),

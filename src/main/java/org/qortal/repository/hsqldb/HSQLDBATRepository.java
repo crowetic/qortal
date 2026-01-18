@@ -167,7 +167,7 @@ public class HSQLDBATRepository implements ATRepository {
 				+ "is_frozen, frozen_balance, sleep_until_message_timestamp "
 				+ "FROM ATs "
 				+ "WHERE is_finished = false "
-				+ "ORDER BY created_when ASC";
+				+ "ORDER BY created_when ASC, AT_address DESC";
 
 		List<ATData> executableATs = new ArrayList<>();
 
@@ -707,7 +707,7 @@ public class HSQLDBATRepository implements ATRepository {
 				+ "JOIN ATStates "
 				+ "ON ATStates.AT_address = ATs.AT_address "
 				+ "WHERE height = ? "
-				+ "ORDER BY created_when ASC";
+				+ "ORDER BY created_when ASC, AT_address DESC";
 
 		List<ATStateData> atStates = new ArrayList<>();
 

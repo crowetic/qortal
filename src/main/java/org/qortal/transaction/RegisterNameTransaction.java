@@ -129,16 +129,6 @@ public class RegisterNameTransaction extends Transaction {
 		// Register Name
 		Name name = new Name(this.repository, this.registerNameTransactionData);
 		name.register();
-
-		if( this.repository.getBlockRepository().getBlockchainHeight() > BlockChain.getInstance().getMultipleNamesPerAccountHeight()) {
-
-			Account account = new Account(this.repository, this.getCreator().getAddress());
-
-			// if there is no primary name established, then the new registered name is the primary name
-			if (account.getPrimaryName().isEmpty()) {
-				account.setPrimaryName(this.registerNameTransactionData.getName());
-			}
-		}
 	}
 
 	@Override

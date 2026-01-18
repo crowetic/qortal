@@ -81,8 +81,8 @@ public class HSQLDBCacheUtils {
      * @param defaultResource true to query filter identifier on the default identifier and use the query terms to match candidates names only
      * @param mode LATEST or ALL
      * @param minLevel the minimum account level for resource creators
-     * @param includeOnly names to retain, exclude all others
-     * @param exclude names to exclude, retain all others
+     * @param followedOnly names to retain, exclude all others
+     * @param excludeBlocked names to exclude, retain all others
      * @param includeMetadata true to include resource metadata in the results, false to exclude metadata
      * @param includeStatus true to include resource status in the results, false to exclude status
      * @param before the latest creation timestamp for any candidate
@@ -193,6 +193,10 @@ public class HSQLDBCacheUtils {
 
         if(exclude.isPresent())
             stream = stream.filter( candidate -> !exclude.get().get().contains( candidate.name ));
+
+        if( includeOnly.isPresent()) {
+            stream = stream.filter( candidate -> includeOnly.get().get().contains( candidate.name ));
+        }
 
         // filter by service
         if( service.isPresent() )

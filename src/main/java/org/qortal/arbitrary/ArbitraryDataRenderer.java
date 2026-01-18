@@ -179,7 +179,17 @@ public class ArbitraryDataRenderer {
                 }
                 HTMLParser htmlParser = new HTMLParser(encodedResourceId, inPath, prefix, includeResourceIdInPrefix, data, qdnContext, service, identifier, theme, usingCustomRouting, lang);
                 htmlParser.addAdditionalHeaderTags();
-               response.addHeader("Content-Security-Policy", "default-src 'self' 'unsafe-inline' 'unsafe-eval'; font-src 'self' data:; media-src 'self' data: blob:; img-src 'self' data: blob:; connect-src 'self' wss: blob:;");
+                response.addHeader(
+                    "Content-Security-Policy",
+                    "default-src 'self' 'unsafe-inline' 'unsafe-eval'; " +
+                    "font-src 'self' data:; " +
+
+                    // allow localhost for media
+                    "media-src 'self' data: blob: http://127.0.0.1:* http://localhost:*; " +
+
+                    "img-src 'self' data: blob:; " +
+                    "connect-src 'self' wss: blob:;"
+                );
                 response.setContentType(context.getMimeType(filename));
                 response.setContentLength(htmlParser.getData().length);
                 response.getOutputStream().write(htmlParser.getData());

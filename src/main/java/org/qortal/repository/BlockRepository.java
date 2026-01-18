@@ -20,6 +20,19 @@ public interface BlockRepository {
 	public BlockData fromSignature(byte[] signature) throws DataException;
 
 	/**
+	 * From Signatures
+	 *
+	 * Get the block data for each block signature given.
+	 *
+	 * @param signatures the signatures
+	 *
+	 * @return the block data
+	 *
+	 * @throws DataException
+	 */
+	public List<BlockData> fromSignatures(List<byte[]> signatures) throws DataException;
+
+	/**
 	 * Returns BlockData from repository using block reference.
 	 * 
 	 * @param reference
