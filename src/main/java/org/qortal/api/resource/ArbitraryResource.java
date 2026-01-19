@@ -30,19 +30,22 @@ import org.qortal.arbitrary.misc.Category;
 import org.qortal.arbitrary.misc.Service;
 import org.qortal.controller.Controller;
 import org.qortal.controller.arbitrary.ArbitraryDataCacheManager;
+import org.qortal.controller.arbitrary.ArbitraryDataHostMonitor;
 import org.qortal.controller.arbitrary.ArbitraryDataRenderManager;
 import org.qortal.controller.arbitrary.ArbitraryDataStorageManager;
 import org.qortal.controller.arbitrary.ArbitraryMetadataManager;
 import org.qortal.data.account.AccountData;
+import org.qortal.data.arbitrary.AdvancedStringMatcher;
 import org.qortal.data.arbitrary.ArbitraryCategoryInfo;
 import org.qortal.data.arbitrary.ArbitraryDataIndexDetail;
-import org.qortal.data.arbitrary.ArbitraryDataIndexScoreKey;
 import org.qortal.data.arbitrary.ArbitraryDataIndexScorecard;
 import org.qortal.data.arbitrary.ArbitraryResourceData;
 import org.qortal.data.arbitrary.ArbitraryResourceMetadata;
 import org.qortal.data.arbitrary.ArbitraryResourceStatus;
 import org.qortal.data.arbitrary.IndexCache;
 import org.qortal.data.naming.NameData;
+import org.qortal.data.transaction.ArbitraryHostedDataInfo;
+import org.qortal.data.transaction.ArbitraryHostedDataItemInfo;
 import org.qortal.data.transaction.ArbitraryTransactionData;
 import org.qortal.data.transaction.TransactionData;
 import org.qortal.list.ResourceListManager;
@@ -83,8 +86,8 @@ import java.util.Arrays;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
-import java.util.Objects;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 import java.util.zip.GZIPOutputStream;
 
 import org.apache.tika.Tika;
@@ -94,7 +97,6 @@ import org.apache.tika.mime.MimeTypes;
 import javax.ws.rs.core.Response;
 
 import org.glassfish.jersey.media.multipart.FormDataParam;
-import static org.qortal.api.ApiError.REPOSITORY_ISSUE;
 
 @Path("/arbitrary")
 @Tag(name = "Arbitrary")
@@ -514,25 +516,33 @@ public class ArbitraryResource {
 			summary = "List arbitrary transactions hosted by this node",
 			responses = {
 					@ApiResponse(
-							content = @Content(mediaType = MediaType.APPLICATION_JSON, schema = @Schema(implementation = ArbitraryTransactionData.class))
+							content = @Content(mediaType = MediaType.APPLICATION_JSON, schema = @Schema(implementation = ArbitraryHostedDataInfo.class))
 					)
 			}
 	)
 	@ApiErrors({ApiError.REPOSITORY_ISSUE})
-	public List<ArbitraryTransactionData> getHostedTransactions(@HeaderParam(Security.API_KEY_HEADER) String apiKey,
-																@Parameter(ref = "limit") @QueryParam("limit") Integer limit,
-																@Parameter(ref = "offset") @QueryParam("offset") Integer offset) {
-		Security.checkApiCallAllowed(request);
+	public ArbitraryHostedDataInfo getHostedTransactions(@Parameter(ref = "limit") @QueryParam("limit") Integer limit,
+																@Parameter(ref = "offset") @QueryParam("offset") Integer offset,
+																   @QueryParam("name") String name) {
 
-		try (final Repository repository = RepositoryManager.getRepository()) {
+		Stream<ArbitraryHostedDataItemInfo> stream = ArbitraryDataHostMonitor.getInstance().getHostedDataItemInfos().stream();
 
-			List<ArbitraryTransactionData> hostedTransactions = ArbitraryDataStorageManager.getInstance().listAllHostedTransactions(repository, limit, offset);
-
-			return hostedTransactions;
-
-		} catch (DataException e) {
-			throw ApiExceptionFactory.INSTANCE.createException(request, ApiError.REPOSITORY_ISSUE, e);
+		// if name is set, then filter by name
+		if( name != null && !"".equals(name)) {
+			stream = stream.filter( info -> info.getName().startsWith(name));
 		}
+
+		// always sort from the greatest total space to the least total space
+		List<ArbitraryHostedDataItemInfo> hostedTransactions
+			= stream.sorted(Comparator.comparing(ArbitraryHostedDataItemInfo::getTotalSpace).reversed())
+				.collect(Collectors.toList());
+
+		int count = hostedTransactions.size();
+		long totalSpace = hostedTransactions.stream().collect(Collectors.summingLong(ArbitraryHostedDataItemInfo::getTotalSpace));
+
+		List<ArbitraryHostedDataItemInfo> items = ArbitraryTransactionUtils.limitOffsetTransactions(hostedTransactions, limit, offset);
+
+		return new ArbitraryHostedDataInfo(count, totalSpace, items);
 	}
 
 	@GET
@@ -1111,23 +1121,21 @@ public String finalizeUploadNoIdentifier(
     } finally {
         if (tempDir != null) {
             try {
-                Files.walk(tempDir)
-                    .sorted(Comparator.reverseOrder())
-                    .map(java.nio.file.Path::toFile)
-                    .forEach(File::delete);
+                ArbitraryTransactionUtils.deleteDirectory(tempDir.toFile());
             } catch (IOException e) {
                 LOGGER.warn("Failed to delete temp directory: {}", tempDir, e);
-            }
+            } catch (Exception e) {
+				LOGGER.error(e.getMessage(), e);
+			}
         }
 
         try {
-            Files.walk(chunkDir)
-                .sorted(Comparator.reverseOrder())
-                .map(java.nio.file.Path::toFile)
-                .forEach(File::delete);
+            ArbitraryTransactionUtils.deleteDirectory(chunkDir.toFile());
         } catch (IOException e) {
             LOGGER.warn("Failed to delete chunk directory: {}", chunkDir, e);
-        }
+        } catch (Exception e) {
+			LOGGER.error(e.getMessage(), e);
+		}
     }
 }
 
@@ -1330,23 +1338,21 @@ public String finalizeUpload(
     } finally {
         if (tempDir != null) {
             try {
-                Files.walk(tempDir)
-                    .sorted(Comparator.reverseOrder())
-                    .map(java.nio.file.Path::toFile)
-                    .forEach(File::delete);
+               ArbitraryTransactionUtils.deleteDirectory(tempDir.toFile());
             } catch (IOException e) {
                 LOGGER.warn("Failed to delete temp directory: {}", tempDir, e);
-            }
+            } catch (Exception e) {
+				LOGGER.error(e.getMessage(), e);
+			}
         }
 
         try {
-            Files.walk(chunkDir)
-                .sorted(Comparator.reverseOrder())
-                .map(java.nio.file.Path::toFile)
-                .forEach(File::delete);
+            ArbitraryTransactionUtils.deleteDirectory(chunkDir.toFile());
         } catch (IOException e) {
             LOGGER.warn("Failed to delete chunk directory: {}", chunkDir, e);
-        }
+        } catch (Exception e) {
+			LOGGER.error(e.getMessage(), e);
+		}
     }
 }
 
@@ -1671,7 +1677,7 @@ public String finalizeUpload(
 	@GET
 	@Path("/indices")
 	@Operation(
-			summary = "Find matching arbitrary resource indices",
+			summary = "Find exact and similar arbitrary resource indices",
 			description = "",
 			responses = {
 					@ApiResponse(
@@ -1688,40 +1694,28 @@ public String finalizeUpload(
 	)
 	public List<ArbitraryDataIndexScorecard> searchIndices(@QueryParam("terms") String[] terms) {
 
+		List<String> indexedTerms
+			= IndexCache.getInstance()
+				.getIndicesByTerm().entrySet().stream()
+				.map( Map.Entry::getKey )
+				.collect(Collectors.toList());
+
+		List<AdvancedStringMatcher.MatchResult> matchResults = ArbitraryIndexUtils.getMatchedTerms(terms, indexedTerms);
+
 		List<ArbitraryDataIndexDetail> indices = new ArrayList<>();
 
-		// get index details for each term
-		for( String term : terms ) {
-			List<ArbitraryDataIndexDetail> details = IndexCache.getInstance().getIndicesByTerm().get(term);
+		// get index details for each matched term
+		for( AdvancedStringMatcher.MatchResult matchResult : matchResults ) {
+
+			List<ArbitraryDataIndexDetail> details = IndexCache.getInstance().getIndicesByTerm().get(matchResult.getMatchedString());
 
 			if( details != null ) {
-				indices.addAll(details);
+
+				ArbitraryIndexUtils.reduceRanks(indices, matchResult.getSimilarity(), details);
 			}
 		}
 
-		// sum up the scores for each index with identical attributes
-		Map<ArbitraryDataIndexScoreKey, Double> scoreForKey
-			= indices.stream()
-				.collect(
-					Collectors.groupingBy(
-						index -> new ArbitraryDataIndexScoreKey(index.name, index.category, index.link),
-						Collectors.summingDouble(detail -> 1.0 / detail.rank)
-					)
-				);
-
-		// create scorecards for each index group and put them in descending order by score
-		List<ArbitraryDataIndexScorecard> scorecards
-			= scoreForKey.entrySet().stream().map(
-				entry
-				->
-				new ArbitraryDataIndexScorecard(
-					entry.getValue(),
-					entry.getKey().name,
-					entry.getKey().category,
-					entry.getKey().link)
-				)
-				.sorted(Comparator.comparingDouble(ArbitraryDataIndexScorecard::getScore).reversed())
-				.collect(Collectors.toList());
+		List<ArbitraryDataIndexScorecard> scorecards = ArbitraryIndexUtils.getArbitraryDataIndexScorecards(indices);
 
 		return scorecards;
 	}

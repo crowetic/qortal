@@ -790,6 +790,32 @@ public class GroupsResource {
 	}
 
 	@GET
+	@Path("/joinrequests/address/{address}")
+	@Operation(
+		summary = "Pending group join requests (by joiner address)",
+		responses = {
+			@ApiResponse(
+				description = "group join requests",
+				content = @Content(
+					mediaType = MediaType.APPLICATION_JSON,
+					array = @ArraySchema(schema = @Schema(implementation = GroupJoinRequestData.class))
+				)
+			)
+		}
+	)
+	@ApiErrors({ApiError.INVALID_ADDRESS, ApiError.REPOSITORY_ISSUE})
+	public List<GroupJoinRequestData> getJoinRequestsByAddress(@PathParam("address") String address) {
+		if (!Crypto.isValidAddress(address))
+			throw ApiExceptionFactory.INSTANCE.createException(request, ApiError.INVALID_ADDRESS);
+
+		try (final Repository repository = RepositoryManager.getRepository()) {
+			return repository.getGroupRepository().getJoinRequestsByJoiner(address);
+		} catch (DataException e) {
+			throw ApiExceptionFactory.INSTANCE.createException(request, ApiError.REPOSITORY_ISSUE, e);
+		}
+	}
+
+	@GET
 	@Path("/bans/{groupid}")
 	@Operation(
 		summary = "Current group join bans",

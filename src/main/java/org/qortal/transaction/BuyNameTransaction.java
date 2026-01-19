@@ -127,25 +127,6 @@ public class BuyNameTransaction extends Transaction {
 
 		// Save transaction with updated "name reference" pointing to previous transaction that changed name
 		this.repository.getTransactionRepository().save(this.buyNameTransactionData);
-
-		// if multiple names feature is activated, then check the buyer and seller's primary name status
-		if( this.repository.getBlockRepository().getBlockchainHeight() > BlockChain.getInstance().getMultipleNamesPerAccountHeight()) {
-
-			Account seller = new Account(this.repository, this.buyNameTransactionData.getSeller());
-			Optional<String> sellerPrimaryName = seller.getPrimaryName();
-
-			// if the seller sold their primary name, then remove their primary name
-			if (sellerPrimaryName.isPresent() && sellerPrimaryName.get().equals(buyNameTransactionData.getName())) {
-				seller.removePrimaryName();
-			}
-
-			Account buyer = new Account(this.repository, this.getBuyer().getAddress());
-
-			// if the buyer had no primary name, then set the primary name to the name bought
-			if( buyer.getPrimaryName().isEmpty() ) {
-				buyer.setPrimaryName(this.buyNameTransactionData.getName());
-			}
-		}
 	}
 
 	@Override
@@ -156,24 +137,5 @@ public class BuyNameTransaction extends Transaction {
 
 		// Save this transaction, with previous "name reference"
 		this.repository.getTransactionRepository().save(this.buyNameTransactionData);
-
-		// if multiple names feature is activated, then check the buyer and seller's primary name status
-		if( this.repository.getBlockRepository().getBlockchainHeight() > BlockChain.getInstance().getMultipleNamesPerAccountHeight()) {
-
-			Account seller = new Account(this.repository, this.buyNameTransactionData.getSeller());
-
-			// if the seller lost their primary name, then set their primary name back
-			if (seller.getPrimaryName().isEmpty()) {
-				seller.setPrimaryName(this.buyNameTransactionData.getName());
-			}
-
-			Account buyer = new Account(this.repository, this.getBuyer().getAddress());
-			Optional<String> buyerPrimaryName = buyer.getPrimaryName();
-
-			// if the buyer bought their primary, then remove it
-			if( buyerPrimaryName.isPresent() && this.buyNameTransactionData.getName().equals(buyerPrimaryName.get()) ) {
-				buyer.removePrimaryName();
-			}
-		}
 	}
 }

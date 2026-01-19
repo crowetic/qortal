@@ -217,6 +217,28 @@ public interface TransactionRepository {
 	public List<String> getConfirmedTransferAssetCreators() throws DataException;
 
 	/**
+	 * Returns payment transactions between a specific recipient and sender.
+	 * <p>
+	 * This is optimized for querying PAYMENT transactions where we need to filter
+	 * by recipient address and/or sender's address. At least one address is required.
+	 * 
+	 * @param recipientAddress the recipient's address (optional, but at least one address required)
+	 * @param senderAddress the sender's address (optional, but at least one address required)
+	 * @param amount the payment amount to filter by (optional)
+	 * @param startBlock height of first block to check (optional)
+	 * @param blockLimit number of blocks from startBlock to check (optional)
+	 * @param confirmationStatus whether to include confirmed, unconfirmed or both
+	 * @param limit maximum number of results
+	 * @param offset result offset for pagination
+	 * @param reverse whether to reverse the sort order
+	 * @return list of payment transaction data
+	 * @throws DataException
+	 */
+	public List<TransactionData> getPaymentsBetweenAddresses(String recipientAddress, String senderAddress,
+			Long amount, Integer startBlock, Integer blockLimit, ConfirmationStatus confirmationStatus, 
+			Integer limit, Integer offset, Boolean reverse) throws DataException;
+
+	/**
 	 * Returns list of transactions pending approval, with optional txGgroupId filtering.
 	 * <p>
 	 * This is typically called by the API.

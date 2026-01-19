@@ -159,16 +159,6 @@ public class UpdateNameTransaction extends Transaction {
 
 		// Save this transaction, now with updated "name reference" to previous transaction that changed name
 		this.repository.getTransactionRepository().save(this.updateNameTransactionData);
-
-		if( this.repository.getBlockRepository().getBlockchainHeight() > BlockChain.getInstance().getMultipleNamesPerAccountHeight()) {
-
-			Account account = new Account(this.repository, this.getCreator().getAddress());
-
-			// if updating the primary name, then set primary name to new name
-			if( account.getPrimaryName().isEmpty() || account.getPrimaryName().get().equals(this.updateNameTransactionData.getName())) {
-				account.setPrimaryName(this.updateNameTransactionData.getNewName());
-			}
-		}
 	}
 
 	@Override
@@ -184,16 +174,6 @@ public class UpdateNameTransaction extends Transaction {
 
 		// Save this transaction, with previous "name reference"
 		this.repository.getTransactionRepository().save(this.updateNameTransactionData);
-
-		if( this.repository.getBlockRepository().getBlockchainHeight() > BlockChain.getInstance().getMultipleNamesPerAccountHeight()) {
-
-			Account account = new Account(this.repository, this.getCreator().getAddress());
-
-			// if the primary name is the new updated name, then it needs to be set back to the previous name
-			if (account.getPrimaryName().isPresent() && account.getPrimaryName().get().equals(this.updateNameTransactionData.getNewName())) {
-				account.setPrimaryName(this.updateNameTransactionData.getName());
-			}
-		}
 	}
 
 }

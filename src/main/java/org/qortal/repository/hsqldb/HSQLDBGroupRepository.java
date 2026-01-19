@@ -741,6 +741,36 @@ public class HSQLDBGroupRepository implements GroupRepository {
 	}
 
 	@Override
+	public List<GroupJoinRequestData> getJoinRequestsByJoiner(String joiner, Integer limit, Integer offset, Boolean reverse) throws DataException {
+		StringBuilder sql = new StringBuilder(256);
+
+		sql.append("SELECT group_id, reference FROM GroupJoinRequests WHERE joiner = ? ORDER BY group_id");
+
+		if (reverse != null && reverse)
+			sql.append(" DESC");
+
+		HSQLDBRepository.limitOffsetSql(sql, limit, offset);
+
+		List<GroupJoinRequestData> joinRequests = new ArrayList<>();
+
+		try (ResultSet resultSet = this.repository.checkedExecute(sql.toString(), joiner)) {
+			if (resultSet == null)
+				return joinRequests;
+
+			do {
+				int groupId = resultSet.getInt(1);
+				byte[] reference = resultSet.getBytes(2);
+
+				joinRequests.add(new GroupJoinRequestData(groupId, joiner, reference));
+			} while (resultSet.next());
+
+			return joinRequests;
+		} catch (SQLException e) {
+			throw new DataException("Unable to fetch group join requests from repository", e);
+		}
+	}
+
+	@Override
 	public void save(GroupJoinRequestData groupJoinRequestData) throws DataException {
 		HSQLDBSaver saveHelper = new HSQLDBSaver("GroupJoinRequests");
 

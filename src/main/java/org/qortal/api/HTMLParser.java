@@ -1,13 +1,16 @@
 package org.qortal.api;
 
 
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
+import java.util.Objects;
+
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.jsoup.Jsoup;
 import org.jsoup.nodes.Document;
 import org.jsoup.select.Elements;
 import org.qortal.arbitrary.misc.Service;
-import java.util.Objects;
 public class HTMLParser {
 
     private static final Logger LOGGER = LogManager.getLogger(HTMLParser.class);
@@ -82,6 +85,39 @@ public class HTMLParser {
             head.get(0).prepend(metaCharsetElement);
 
         }
+        
+        // For render context with non-default identifier, modify all relative script and link tags
+        // to include the identifier query parameter (base tag doesn't reliably preserve query params)
+        if (Objects.equals(this.qdnContext, "render") && this.identifier != null && !this.identifier.isBlank() && !this.identifier.equals("default")) {
+            String encodedIdentifier = URLEncoder.encode(this.identifier, StandardCharsets.UTF_8);
+            
+            // Modify script tags
+            Elements scripts = document.select("script[src]");
+            scripts.forEach(script -> {
+                String src = script.attr("src");
+                // Only modify relative URLs (not absolute URLs starting with / or http)
+                if (!src.startsWith("/") && !src.startsWith("http")) {
+                    String newSrc = src.contains("?") ? 
+                        src + "&identifier=" + encodedIdentifier : 
+                        src + "?identifier=" + encodedIdentifier;
+                    script.attr("src", newSrc);
+                }
+            });
+            
+            // Modify link tags (CSS, etc.)
+            Elements links = document.select("link[href]");
+            links.forEach(link -> {
+                String href = link.attr("href");
+                // Only modify relative URLs
+                if (!href.startsWith("/") && !href.startsWith("http")) {
+                    String newHref = href.contains("?") ? 
+                        href + "&identifier=" + encodedIdentifier : 
+                        href + "?identifier=" + encodedIdentifier;
+                    link.attr("href", newHref);
+                }
+            });
+        }
+        
         String html = document.html();
         this.data = html.getBytes();
     }
