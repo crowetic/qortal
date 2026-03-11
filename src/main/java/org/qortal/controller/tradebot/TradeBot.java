@@ -68,6 +68,8 @@ public class TradeBot implements Listener {
 	private static final long EXPIRY_ROUNDING = 15 * 60 * 1000L;
 	/** How often we want to broadcast our list of all known trade presences to peers. 5 mins in ms. */
 	private static final long PRESENCE_BROADCAST_INTERVAL = 5 * 60 * 1000L;
+	/** Cache period for stale unconfirmed MESSAGE recipients used in failed-trade filtering. */
+	private static final long STALE_UNCONFIRMED_MESSAGE_CACHE_PERIOD = 5 * 1000L;
 
 	public interface StateNameAndValueSupplier {
 		public String getState();
@@ -122,6 +124,9 @@ public class TradeBot implements Listener {
 
 	private Map<String, Long> failedTrades = new HashMap<>();
 	private Map<String, Long> validTrades = new HashMap<>();
+	private final Object staleUnconfirmedMessagesCacheLock = new Object();
+	private Set<String> cachedRecipientsWithStaleUnconfirmedMessages = Collections.emptySet();
+	private long cachedStaleRecipientsTimestamp = 0L;
 
 	private TradeBot() {
 
@@ -841,7 +846,11 @@ public class TradeBot implements Listener {
 		}
 
 		List<CrossChainTradeData> updatedCrossChainTrades = new ArrayList<>(crossChainTrades);
-		int getMaxTradeOfferAttempts = Settings.getInstance().getMaxTradeOfferAttempts();
+		final long staleOfferThreshold = 60L * 60L * 1000L;
+
+		Set<String> recipientsWithStaleUnconfirmedMessages = this.getRecipientsWithStaleUnconfirmedMessages(repository, now, staleOfferThreshold);
+		if (recipientsWithStaleUnconfirmedMessages == null)
+			return updatedCrossChainTrades;
 
 		for (CrossChainTradeData crossChainTradeData : crossChainTrades) {
 			// We only care about trades in the OFFERING state
@@ -864,22 +873,13 @@ public class TradeBot implements Listener {
 				continue;
 			}
 
-			try {
-				List<TransactionData> transactions = repository.getTransactionRepository().getUnconfirmedTransactions(Arrays.asList(Transaction.TransactionType.MESSAGE), null, null, null, null);
-
-				for (TransactionData transactionData : transactions) {
-					// Treat as failed if buy attempt was more than 60 mins ago (as it's still in the OFFERING state)
-					if (transactionData.getRecipient().equals(crossChainTradeData.qortalCreatorTradeAddress) && now - transactionData.getTimestamp() > 60*60*1000L) {
-						failedTrades.put(crossChainTradeData.qortalAtAddress, now);
-						updatedCrossChainTrades.remove(crossChainTradeData);
-					} else {
-						validTrades.put(crossChainTradeData.qortalAtAddress, now);
-					}
-				}
-
-			} catch (DataException e) {
-				LOGGER.info("Unable to determine failed state of AT {}", crossChainTradeData.qortalAtAddress);
-            }
+			// Treat as failed if we have a stale unconfirmed MESSAGE to the creator trade address.
+			if (recipientsWithStaleUnconfirmedMessages.contains(crossChainTradeData.qortalCreatorTradeAddress)) {
+				failedTrades.put(crossChainTradeData.qortalAtAddress, now);
+				updatedCrossChainTrades.remove(crossChainTradeData);
+			} else {
+				validTrades.put(crossChainTradeData.qortalAtAddress, now);
+			}
 		}
 
 		return updatedCrossChainTrades;
@@ -888,6 +888,38 @@ public class TradeBot implements Listener {
 	public boolean isFailedTrade(Repository repository, CrossChainTradeData crossChainTradeData) {
 		List<CrossChainTradeData> results = removeFailedTrades(repository, Arrays.asList(crossChainTradeData));
 		return results.isEmpty();
+	}
+
+	private Set<String> getRecipientsWithStaleUnconfirmedMessages(Repository repository, long now, long staleOfferThreshold) {
+		synchronized (this.staleUnconfirmedMessagesCacheLock) {
+			if (now - this.cachedStaleRecipientsTimestamp < STALE_UNCONFIRMED_MESSAGE_CACHE_PERIOD)
+				return this.cachedRecipientsWithStaleUnconfirmedMessages;
+		}
+
+		final List<TransactionData> messageTransactions;
+		try {
+			messageTransactions = repository.getTransactionRepository().getUnconfirmedTransactions(
+					Arrays.asList(Transaction.TransactionType.MESSAGE), null, null, null, null);
+		} catch (DataException e) {
+			LOGGER.info("Unable to fetch unconfirmed MESSAGE transactions while checking failed trades");
+			return null;
+		}
+
+		Set<String> refreshedRecipientsWithStaleUnconfirmedMessages = new HashSet<>();
+		for (TransactionData transactionData : messageTransactions) {
+			String recipient = transactionData.getRecipient();
+			if (recipient == null)
+				continue;
+
+			if (now - transactionData.getTimestamp() > staleOfferThreshold)
+				refreshedRecipientsWithStaleUnconfirmedMessages.add(recipient);
+		}
+
+		synchronized (this.staleUnconfirmedMessagesCacheLock) {
+			this.cachedRecipientsWithStaleUnconfirmedMessages = Collections.unmodifiableSet(refreshedRecipientsWithStaleUnconfirmedMessages);
+			this.cachedStaleRecipientsTimestamp = now;
+			return this.cachedRecipientsWithStaleUnconfirmedMessages;
+		}
 	}
 
 	private long generateExpiry(long timestamp) {

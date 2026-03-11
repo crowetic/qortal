@@ -624,7 +624,8 @@ public abstract class Transaction {
 	private int countUnconfirmedByCreator(PublicKeyAccount creator) throws DataException {
 		List<TransactionData> unconfirmedTransactions = TransactionImporter.getInstance().unconfirmedTransactionsCache;
 		if (unconfirmedTransactions == null) {
-			unconfirmedTransactions = repository.getTransactionRepository().getUnconfirmedTransactions();
+			// Fallback query should be scoped to creator to avoid scanning/hydrating the full unconfirmed pool.
+			unconfirmedTransactions = repository.getTransactionRepository().getUnconfirmedTransactions(null, creator.getPublicKey(), null, null, null);
 		}
 
 		// We exclude CHAT transactions as they never get included into blocks and
@@ -636,7 +637,9 @@ public abstract class Transaction {
 			return Arrays.equals(creator.getPublicKey(), transactionData.getCreatorPublicKey());
 		};
 
-		return (int) unconfirmedTransactions.stream().filter(hasSameCreatorButNotChat).count();
+		synchronized (unconfirmedTransactions) {
+			return (int) unconfirmedTransactions.stream().filter(hasSameCreatorButNotChat).count();
+		}
 	}
 
 	/**
@@ -827,7 +830,13 @@ public abstract class Transaction {
 	public ValidationResult importAsUnconfirmed() throws DataException {
 		// Attempt to acquire blockchain lock
 		ReentrantLock blockchainLock = Controller.getInstance().getBlockchainLock();
+		final long lockWaitStart = System.currentTimeMillis();
 		blockchainLock.lock();
+		final long lockWaitMillis = System.currentTimeMillis() - lockWaitStart;
+		if (lockWaitMillis >= 2000L) {
+			LOGGER.info("Waited {} ms for blockchain lock in importAsUnconfirmed (type={}, thread={})",
+					lockWaitMillis, this.transactionData.getType(), Thread.currentThread().getName());
+		}
 
 		try {
 			// Check transaction doesn't already exist

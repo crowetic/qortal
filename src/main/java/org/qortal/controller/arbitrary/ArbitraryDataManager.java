@@ -213,23 +213,17 @@ public class ArbitraryDataManager extends Thread {
 		final int limit = 100;
 		int offset = 0;
 
-		List<ArbitraryTransactionData> allArbitraryTransactionsInDescendingOrder;
+		List<ArbitraryTransactionData> allArbitraryTransactionsInDescendingOrder = null;
 
-		try (final Repository repository = RepositoryManager.getRepository()) {
-
-			if( name == null ) {
-				allArbitraryTransactionsInDescendingOrder
-						= repository.getArbitraryRepository()
-						.getLatestArbitraryTransactions();
-			}
-			else {
+		if (name != null) {
+			try (final Repository repository = RepositoryManager.getRepository()) {
 				allArbitraryTransactionsInDescendingOrder
 						= repository.getArbitraryRepository()
 						.getLatestArbitraryTransactionsByName(name);
+			} catch( Exception e) {
+				LOGGER.error(e.getMessage(), e);
+				allArbitraryTransactionsInDescendingOrder = new ArrayList<>(0);
 			}
-		} catch( Exception e) {
-			LOGGER.error(e.getMessage(), e);
-			allArbitraryTransactionsInDescendingOrder = new ArrayList<>(0);
 		}
 
 		// collect processed transactions in a set to ensure outdated data transactions do not get fetched
@@ -240,7 +234,19 @@ public class ArbitraryDataManager extends Thread {
 
 			// Any arbitrary transactions we want to fetch data for?
 			try (final Repository repository = RepositoryManager.getRepository()) {
-				List<byte[]> signatures = processTransactionsForSignatures(limit, offset, allArbitraryTransactionsInDescendingOrder, processedTransactions);
+				List<byte[]> signatures;
+
+				if (name == null) {
+					// Avoid fetching the full transaction history up-front.
+					List<ArbitraryTransactionData> transactionsPage = repository.getArbitraryRepository().getArbitraryTransactions(true, limit, offset, true);
+					if (transactionsPage == null || transactionsPage.isEmpty()) {
+						offset = 0;
+						break;
+					}
+					signatures = processTransactionsForSignatures(transactionsPage, processedTransactions);
+				} else {
+					signatures = processTransactionsForSignatures(limit, offset, allArbitraryTransactionsInDescendingOrder, processedTransactions);
+				}
 
 				if (signatures == null || signatures.isEmpty()) {
 					offset = 0;
@@ -375,17 +381,6 @@ public class ArbitraryDataManager extends Thread {
 		final int limit = 100;
 		int offset = 0;
 
-		List<ArbitraryTransactionData> allArbitraryTransactionsInDescendingOrder;
-
-		try (final Repository repository = RepositoryManager.getRepository()) {
-			allArbitraryTransactionsInDescendingOrder
-					= repository.getArbitraryRepository()
-						.getLatestArbitraryTransactions();
-		} catch( Exception e) {
-			LOGGER.error(e.getMessage(), e);
-			allArbitraryTransactionsInDescendingOrder = new ArrayList<>(0);
-		}
-
 		// collect processed transactions in a set to ensure outdated data transactions do not get fetched
 		Set<ArbitraryTransactionDataHashWrapper> processedTransactions = new HashSet<>();
 
@@ -397,7 +392,13 @@ public class ArbitraryDataManager extends Thread {
 
 			// Any arbitrary transactions we want to fetch data for?
 			try (final Repository repository = RepositoryManager.getRepository()) {
-				List<byte[]> signatures = processTransactionsForSignatures(limit, offset, allArbitraryTransactionsInDescendingOrder, processedTransactions);
+				List<ArbitraryTransactionData> transactionsPage = repository.getArbitraryRepository().getArbitraryTransactions(true, limit, offset, true);
+				if (transactionsPage == null || transactionsPage.isEmpty()) {
+					offset = 0;
+					break;
+				}
+
+				List<byte[]> signatures = processTransactionsForSignatures(transactionsPage, processedTransactions);
 
 				if (signatures == null || signatures.isEmpty()) {
 					offset = 0;
@@ -485,6 +486,13 @@ public class ArbitraryDataManager extends Thread {
 					.skip(offset)
 					.limit(limit)
 					.collect(Collectors.toList());
+
+		return processTransactionsForSignatures(transactions, processedTransactions);
+	}
+
+	private static List<byte[]> processTransactionsForSignatures(
+			List<ArbitraryTransactionData> transactions,
+			Set<ArbitraryTransactionDataHashWrapper> processedTransactions) {
 
 		// wrap the transactions, so they can be used for hashing and comparing
 		// Class ArbitraryTransactionDataHashWrapper supports hashCode() and equals(...) for this purpose

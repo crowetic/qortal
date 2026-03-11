@@ -274,14 +274,15 @@ public class BlockMinter extends Thread {
 							continue;
 
 						// Make sure we're the only thread modifying the blockchain
-						ReentrantLock blockchainLock = Controller.getInstance().getBlockchainLock();
-						if (!blockchainLock.tryLock(30, TimeUnit.SECONDS)) {
-							LOGGER.debug("Couldn't acquire blockchain lock even after waiting 30 seconds");
-							continue;
-						}
+							ReentrantLock blockchainLock = Controller.getInstance().getBlockchainLock();
+							if (!blockchainLock.tryLock(30, TimeUnit.SECONDS)) {
+								LOGGER.debug("Couldn't acquire blockchain lock even after waiting 30 seconds");
+								continue;
+							}
+							final long lockHeldStartMillis = System.currentTimeMillis();
 
-						boolean newBlockMinted = false;
-						Block newBlock = null;
+							boolean newBlockMinted = false;
+							Block newBlock = null;
 
 						try {
 							// Clear repository session state so we have latest view of data
@@ -445,9 +446,13 @@ public class BlockMinter extends Thread {
 								LOGGER.error("Unable to process newly minted block?", e);
 								newBlocks.clear();
 							}
-						} finally {
-							blockchainLock.unlock();
-						}
+							} finally {
+								final long lockHeldMillis = System.currentTimeMillis() - lockHeldStartMillis;
+								if (lockHeldMillis >= 2000L) {
+									LOGGER.info("BlockMinter held blockchain lock for {} ms", lockHeldMillis);
+								}
+								blockchainLock.unlock();
+							}
 
 						if (newBlockMinted) {
 							// Broadcast our new chain to network

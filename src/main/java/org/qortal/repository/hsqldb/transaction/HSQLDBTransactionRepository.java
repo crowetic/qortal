@@ -32,6 +32,7 @@ import static org.qortal.transaction.Transaction.TransactionType.*;
 public class HSQLDBTransactionRepository implements TransactionRepository {
 
 	private static final Logger LOGGER = LogManager.getLogger(HSQLDBTransactionRepository.class);
+	private static final int MAX_SIGNATURES_PER_QUERY = 128;
 
 	public static class RepositorySubclassInfo {
 		public Class<?> clazz;
@@ -158,56 +159,91 @@ public class HSQLDBTransactionRepository implements TransactionRepository {
 
 	@Override
 	public List<TransactionData> fromSignatures(List<byte[]> signatures) throws DataException {
-		StringBuffer sql = new StringBuffer();
+		if (signatures == null || signatures.isEmpty())
+			return new ArrayList<>(0);
 
-		sql.append("SELECT type, reference, creator, created_when, fee, tx_group_id, block_height, approval_status, approval_height, signature ");
-		sql.append("FROM Transactions WHERE signature IN (");
-		sql.append(String.join(", ", Collections.nCopies(signatures.size(), "?")));
-		sql.append(")");
+		List<TransactionData> list = new ArrayList<>(signatures.size());
 
-		List<TransactionData> list;
-		try (ResultSet resultSet = this.repository.checkedExecute(sql.toString(), signatures.toArray(new byte[0][]))) {
-			if (resultSet == null) {
-				return new ArrayList<>(0);
+		for (int start = 0; start < signatures.size(); start += MAX_SIGNATURES_PER_QUERY) {
+			int end = Math.min(start + MAX_SIGNATURES_PER_QUERY, signatures.size());
+			List<byte[]> signatureChunk = signatures.subList(start, end);
+
+			StringBuffer sql = new StringBuffer();
+			sql.append("SELECT type, reference, creator, created_when, fee, tx_group_id, block_height, approval_status, approval_height, signature ");
+			sql.append("FROM Transactions WHERE signature IN (");
+			sql.append(String.join(", ", Collections.nCopies(signatureChunk.size(), "?")));
+			sql.append(")");
+
+			try (ResultSet resultSet = this.repository.checkedExecute(sql.toString(), signatureChunk.toArray(new byte[0][]))) {
+				if (resultSet == null)
+					continue;
+
+				do {
+					TransactionType type = TransactionType.valueOf(resultSet.getInt(1));
+
+					byte[] reference = resultSet.getBytes(2);
+					byte[] creatorPublicKey = resultSet.getBytes(3);
+					long timestamp = resultSet.getLong(4);
+
+					Long fee = resultSet.getLong(5);
+					if (fee == 0 && resultSet.wasNull())
+						fee = null;
+
+					int txGroupId = resultSet.getInt(6);
+
+					Integer blockHeight = resultSet.getInt(7);
+					if (blockHeight == 0 && resultSet.wasNull())
+						blockHeight = null;
+
+					ApprovalStatus approvalStatus = ApprovalStatus.valueOf(resultSet.getInt(8));
+					Integer approvalHeight = resultSet.getInt(9);
+					if (approvalHeight == 0 && resultSet.wasNull())
+						approvalHeight = null;
+
+					byte[] signature = resultSet.getBytes(10);
+
+					BaseTransactionData baseTransactionData = new BaseTransactionData(timestamp, txGroupId, reference, creatorPublicKey, fee, approvalStatus, blockHeight, approvalHeight, signature);
+					TransactionData data = fromBase(type, baseTransactionData);
+					if (data != null)
+						list.add(data);
+				} while (resultSet.next());
+			} catch (SQLException e) {
+				throw new DataException("Unable to fetch transactions from repository", e);
 			}
-
-			list = new ArrayList<>(signatures.size());
-
-			do {
-				TransactionType type = TransactionType.valueOf(resultSet.getInt(1));
-
-				byte[] reference = resultSet.getBytes(2);
-				byte[] creatorPublicKey = resultSet.getBytes(3);
-				long timestamp = resultSet.getLong(4);
-
-				Long fee = resultSet.getLong(5);
-				if (fee == 0 && resultSet.wasNull())
-					fee = null;
-
-				int txGroupId = resultSet.getInt(6);
-
-				Integer blockHeight = resultSet.getInt(7);
-				if (blockHeight == 0 && resultSet.wasNull())
-					blockHeight = null;
-
-				ApprovalStatus approvalStatus = ApprovalStatus.valueOf(resultSet.getInt(8));
-				Integer approvalHeight = resultSet.getInt(9);
-				if (approvalHeight == 0 && resultSet.wasNull())
-					approvalHeight = null;
-
-				byte[] signature = resultSet.getBytes(10);
-
-				BaseTransactionData baseTransactionData = new BaseTransactionData(timestamp, txGroupId, reference, creatorPublicKey, fee, approvalStatus, blockHeight, approvalHeight, signature);
-
-				TransactionData data = fromBase(type, baseTransactionData);
-				if (data != null)
-					list.add(data);
-			} while( resultSet.next());
-
-			return list;
-		} catch (SQLException e) {
-			throw new DataException("Unable to fetch transactions from repository", e);
 		}
+
+		return list;
+	}
+
+	@Override
+	public List<byte[]> getExistingSignatures(List<byte[]> signatures) throws DataException {
+		if (signatures == null || signatures.isEmpty())
+			return new ArrayList<>(0);
+
+		List<byte[]> existingSignatures = new ArrayList<>();
+
+		for (int start = 0; start < signatures.size(); start += MAX_SIGNATURES_PER_QUERY) {
+			int end = Math.min(start + MAX_SIGNATURES_PER_QUERY, signatures.size());
+			List<byte[]> signatureChunk = signatures.subList(start, end);
+
+			StringBuilder sql = new StringBuilder(128);
+			sql.append("SELECT signature FROM Transactions WHERE signature IN (");
+			sql.append(String.join(", ", Collections.nCopies(signatureChunk.size(), "?")));
+			sql.append(")");
+
+			try (ResultSet resultSet = this.repository.checkedExecute(sql.toString(), signatureChunk.toArray(new byte[0][]))) {
+				if (resultSet == null)
+					continue;
+
+				do {
+					existingSignatures.add(resultSet.getBytes(1));
+				} while (resultSet.next());
+			} catch (SQLException e) {
+				throw new DataException("Unable to fetch existing transaction signatures from repository", e);
+			}
+		}
+
+		return existingSignatures;
 	}
 
 	@Override
@@ -1388,11 +1424,11 @@ public class HSQLDBTransactionRepository implements TransactionRepository {
 			bindParams.add(creatorPublicKey);
 		}
 
-		StringBuilder sql = new StringBuilder(256);
-		sql.append("SELECT signature FROM UnconfirmedTransactions");
-		if (hasCreatorPublicKey || hasTxTypes) {
-			sql.append(" JOIN Transactions USING (signature) ");
-		}
+		StringBuilder sql = new StringBuilder(512);
+		sql.append("SELECT Transactions.type, Transactions.reference, Transactions.creator, Transactions.created_when, ");
+		sql.append("Transactions.fee, Transactions.tx_group_id, Transactions.block_height, ");
+		sql.append("Transactions.approval_status, Transactions.approval_height, Transactions.signature ");
+		sql.append("FROM UnconfirmedTransactions JOIN Transactions USING (signature) ");
 
 		if (hasTxTypes) {
 			StringBuilder txTypesIn = new StringBuilder(256);
@@ -1442,22 +1478,39 @@ public class HSQLDBTransactionRepository implements TransactionRepository {
 				return transactions;
 
 			do {
-				byte[] signature = resultSet.getBytes(1);
+				TransactionType type = TransactionType.valueOf(resultSet.getInt(1));
 
-				TransactionData transactionData = this.fromSignature(signature);
+				byte[] reference = resultSet.getBytes(2);
+				byte[] creator = resultSet.getBytes(3);
+				long createdWhen = resultSet.getLong(4);
 
-				if (transactionData == null) {
-					// Transaction was deleted concurrently (e.g., expired transaction cleanup)
-					// This is not an error - just skip this transaction
-					LOGGER.trace(() -> String.format("Skipping unconfirmed transaction %s - no longer in repository (likely deleted concurrently)", Base58.encode(signature)));
-					continue;
-				}
+				Long fee = resultSet.getLong(5);
+				if (fee == 0 && resultSet.wasNull())
+					fee = null;
 
-				transactions.add(transactionData);
+				int txGroupId = resultSet.getInt(6);
+
+				Integer blockHeight = resultSet.getInt(7);
+				if (blockHeight == 0 && resultSet.wasNull())
+					blockHeight = null;
+
+				ApprovalStatus approvalStatus = ApprovalStatus.valueOf(resultSet.getInt(8));
+
+				Integer approvalHeight = resultSet.getInt(9);
+				if (approvalHeight == 0 && resultSet.wasNull())
+					approvalHeight = null;
+
+				byte[] signature = resultSet.getBytes(10);
+
+				BaseTransactionData baseTransactionData = new BaseTransactionData(createdWhen, txGroupId, reference, creator, fee, approvalStatus, blockHeight, approvalHeight, signature);
+				TransactionData transactionData = this.fromBase(type, baseTransactionData);
+
+				if (transactionData != null)
+					transactions.add(transactionData);
 			} while (resultSet.next());
 
 			return transactions;
-		} catch (SQLException | DataException e) {
+		} catch (SQLException e) {
 			throw new DataException("Unable to fetch unconfirmed transactions from repository", e);
 		}
 	}
@@ -1468,7 +1521,10 @@ public class HSQLDBTransactionRepository implements TransactionRepository {
 			throw new IllegalArgumentException("At least one of txType or creatorPublicKey must be non-null");
 
 		StringBuilder sql = new StringBuilder(1024);
-		sql.append("SELECT signature FROM UnconfirmedTransactions ");
+		sql.append("SELECT Transactions.type, Transactions.reference, Transactions.creator, Transactions.created_when, ");
+		sql.append("Transactions.fee, Transactions.tx_group_id, Transactions.block_height, ");
+		sql.append("Transactions.approval_status, Transactions.approval_height, Transactions.signature ");
+		sql.append("FROM UnconfirmedTransactions ");
 		sql.append("JOIN Transactions USING (signature) ");
 		sql.append("WHERE ");
 
@@ -1502,22 +1558,39 @@ public class HSQLDBTransactionRepository implements TransactionRepository {
 				return transactions;
 
 			do {
-				byte[] signature = resultSet.getBytes(1);
+				TransactionType type = TransactionType.valueOf(resultSet.getInt(1));
 
-				TransactionData transactionData = this.fromSignature(signature);
+				byte[] reference = resultSet.getBytes(2);
+				byte[] creator = resultSet.getBytes(3);
+				long createdWhen = resultSet.getLong(4);
 
-				if (transactionData == null) {
-					// Transaction was deleted concurrently (e.g., expired transaction cleanup)
-					// This is not an error - just skip this transaction
-					LOGGER.trace(() -> String.format("Skipping unconfirmed transaction %s - no longer in repository (likely deleted concurrently)", Base58.encode(signature)));
-					continue;
-				}
+				Long fee = resultSet.getLong(5);
+				if (fee == 0 && resultSet.wasNull())
+					fee = null;
 
-				transactions.add(transactionData);
+				int txGroupId = resultSet.getInt(6);
+
+				Integer blockHeight = resultSet.getInt(7);
+				if (blockHeight == 0 && resultSet.wasNull())
+					blockHeight = null;
+
+				ApprovalStatus approvalStatus = ApprovalStatus.valueOf(resultSet.getInt(8));
+
+				Integer approvalHeight = resultSet.getInt(9);
+				if (approvalHeight == 0 && resultSet.wasNull())
+					approvalHeight = null;
+
+				byte[] signature = resultSet.getBytes(10);
+
+				BaseTransactionData baseTransactionData = new BaseTransactionData(createdWhen, txGroupId, reference, creator, fee, approvalStatus, blockHeight, approvalHeight, signature);
+				TransactionData transactionData = this.fromBase(type, baseTransactionData);
+
+				if (transactionData != null)
+					transactions.add(transactionData);
 			} while (resultSet.next());
 
 			return transactions;
-		} catch (SQLException | DataException e) {
+		} catch (SQLException e) {
 			throw new DataException("Unable to fetch unconfirmed transactions from repository", e);
 		}
 	}
@@ -1527,7 +1600,10 @@ public class HSQLDBTransactionRepository implements TransactionRepository {
 		StringBuilder sql = new StringBuilder(1024);
 		List<Object> bindParams = new ArrayList<>();
 
-		sql.append("SELECT signature FROM UnconfirmedTransactions ");
+		sql.append("SELECT Transactions.type, Transactions.reference, Transactions.creator, Transactions.created_when, ");
+		sql.append("Transactions.fee, Transactions.tx_group_id, Transactions.block_height, ");
+		sql.append("Transactions.approval_status, Transactions.approval_height, Transactions.signature ");
+		sql.append("FROM UnconfirmedTransactions ");
 		sql.append("JOIN Transactions USING (signature) ");
 		sql.append("WHERE type NOT IN (");
 
@@ -1557,23 +1633,94 @@ public class HSQLDBTransactionRepository implements TransactionRepository {
 				return transactions;
 
 			do {
-				byte[] signature = resultSet.getBytes(1);
+				TransactionType type = TransactionType.valueOf(resultSet.getInt(1));
 
-				TransactionData transactionData = this.fromSignature(signature);
+				byte[] reference = resultSet.getBytes(2);
+				byte[] creator = resultSet.getBytes(3);
+				long createdWhen = resultSet.getLong(4);
 
-				if (transactionData == null) {
-					// Transaction was deleted concurrently (e.g., expired transaction cleanup)
-					// This is not an error - just skip this transaction
-					LOGGER.trace(() -> String.format("Skipping unconfirmed transaction %s - no longer in repository (likely deleted concurrently)", Base58.encode(signature)));
-					continue;
-				}
+				Long fee = resultSet.getLong(5);
+				if (fee == 0 && resultSet.wasNull())
+					fee = null;
 
-				transactions.add(transactionData);
+				int txGroupId = resultSet.getInt(6);
+
+				Integer blockHeight = resultSet.getInt(7);
+				if (blockHeight == 0 && resultSet.wasNull())
+					blockHeight = null;
+
+				ApprovalStatus approvalStatus = ApprovalStatus.valueOf(resultSet.getInt(8));
+
+				Integer approvalHeight = resultSet.getInt(9);
+				if (approvalHeight == 0 && resultSet.wasNull())
+					approvalHeight = null;
+
+				byte[] signature = resultSet.getBytes(10);
+
+				BaseTransactionData baseTransactionData = new BaseTransactionData(createdWhen, txGroupId, reference, creator, fee, approvalStatus, blockHeight, approvalHeight, signature);
+				TransactionData transactionData = this.fromBase(type, baseTransactionData);
+
+				if (transactionData != null)
+					transactions.add(transactionData);
 			} while (resultSet.next());
 
 			return transactions;
-		} catch (SQLException | DataException e) {
+		} catch (SQLException e) {
 			throw new DataException("Unable to fetch unconfirmed transactions from repository", e);
+		}
+	}
+
+	@Override
+	public List<TransactionData> getUnconfirmedTransactionsCreatedBefore(long createdBeforeInclusive) throws DataException {
+		StringBuilder sql = new StringBuilder(512);
+		sql.append("SELECT Transactions.type, Transactions.reference, Transactions.creator, Transactions.created_when, ");
+		sql.append("Transactions.fee, Transactions.tx_group_id, Transactions.block_height, ");
+		sql.append("Transactions.approval_status, Transactions.approval_height, Transactions.signature ");
+		sql.append("FROM UnconfirmedTransactions JOIN Transactions USING (signature) ");
+		sql.append("WHERE UnconfirmedTransactions.created_when <= ? ");
+		sql.append("ORDER BY UnconfirmedTransactions.created_when, UnconfirmedTransactions.signature");
+
+		List<TransactionData> transactions = new ArrayList<>();
+
+		try (ResultSet resultSet = this.repository.checkedExecute(sql.toString(), createdBeforeInclusive)) {
+			if (resultSet == null)
+				return transactions;
+
+			do {
+				TransactionType type = TransactionType.valueOf(resultSet.getInt(1));
+
+				byte[] reference = resultSet.getBytes(2);
+				byte[] creator = resultSet.getBytes(3);
+				long createdWhen = resultSet.getLong(4);
+
+				Long fee = resultSet.getLong(5);
+				if (fee == 0 && resultSet.wasNull())
+					fee = null;
+
+				int txGroupId = resultSet.getInt(6);
+
+				Integer blockHeight = resultSet.getInt(7);
+				if (blockHeight == 0 && resultSet.wasNull())
+					blockHeight = null;
+
+				ApprovalStatus approvalStatus = ApprovalStatus.valueOf(resultSet.getInt(8));
+
+				Integer approvalHeight = resultSet.getInt(9);
+				if (approvalHeight == 0 && resultSet.wasNull())
+					approvalHeight = null;
+
+				byte[] signature = resultSet.getBytes(10);
+
+				BaseTransactionData baseTransactionData = new BaseTransactionData(createdWhen, txGroupId, reference, creator, fee, approvalStatus, blockHeight, approvalHeight, signature);
+				TransactionData transactionData = this.fromBase(type, baseTransactionData);
+
+				if (transactionData != null)
+					transactions.add(transactionData);
+			} while (resultSet.next());
+
+			return transactions;
+		} catch (SQLException e) {
+			throw new DataException("Unable to fetch old unconfirmed transactions from repository", e);
 		}
 	}
 

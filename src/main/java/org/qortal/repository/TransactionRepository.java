@@ -20,6 +20,15 @@ public interface TransactionRepository {
 
 	public List<TransactionData> fromSignatures(List<byte[]> signatures) throws DataException;
 
+	/**
+	 * Returns subset of supplied signatures that already exist in Transactions table.
+	 *
+	 * @param signatures signatures to check
+	 * @return existing signatures (may be empty)
+	 * @throws DataException
+	 */
+	public List<byte[]> getExistingSignatures(List<byte[]> signatures) throws DataException;
+
 	public TransactionData fromReference(byte[] reference) throws DataException;
 
 	public TransactionData fromHeightAndSequence(int height, int sequence) throws DataException;
@@ -348,6 +357,17 @@ public interface TransactionRepository {
 	 * @throws DataException
 	 */
 	public List<TransactionData> getUnconfirmedTransactions(EnumSet<TransactionType> excludedTxTypes, Integer limit) throws DataException;
+
+	/**
+	 * Returns unconfirmed transactions whose created_when is older than, or equal to, supplied timestamp.
+	 * <p>
+	 * This can be used as a fast prefilter before exact expiry checks.
+	 *
+	 * @param createdBeforeInclusive epoch millis threshold (inclusive)
+	 * @return list of candidate transactions, or empty if none.
+	 * @throws DataException
+	 */
+	public List<TransactionData> getUnconfirmedTransactionsCreatedBefore(long createdBeforeInclusive) throws DataException;
 
 	/**
 	 * Remove transaction from unconfirmed transactions pile.

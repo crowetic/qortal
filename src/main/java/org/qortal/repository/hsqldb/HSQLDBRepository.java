@@ -423,10 +423,21 @@ public class HSQLDBRepository implements Repository {
 	}
 
 	private void maybeCheckpoint() throws DataException {
-		// Exclusive gate: block new queries/sessions while checkpoint runs
-		CHECKPOINT_GATE.writeLock().lock();
+		// Fast-path: no checkpoint requested
+		Boolean quickCheckpointRequest = RepositoryManager.getRequestedCheckpoint();
+		if (quickCheckpointRequest == null)
+			return;
+
+		// Avoid queueing as a writer (fair lock would then block new readers behind us).
+		// If the gate is busy, we'll try again on a later close().
+		if (!CHECKPOINT_GATE.writeLock().tryLock()) {
+			LOGGER.trace("Skipping requested checkpoint attempt - checkpoint gate busy");
+			return;
+		}
+
 		try {
-			Boolean quickCheckpointRequest = RepositoryManager.getRequestedCheckpoint();
+			// Re-read under lock in case it changed since fast-path check
+			quickCheckpointRequest = RepositoryManager.getRequestedCheckpoint();
 			if (quickCheckpointRequest == null)
 				return;
 

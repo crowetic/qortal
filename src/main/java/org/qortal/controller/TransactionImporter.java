@@ -21,10 +21,10 @@ import org.qortal.utils.Base58;
 import org.qortal.utils.NTP;
 
 import java.util.*;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
@@ -36,6 +36,12 @@ public class TransactionImporter extends Thread {
     private volatile boolean isStopping = false;
 
     private static final int MAX_INCOMING_TRANSACTIONS = 5000;
+    private static final int MAX_IMPORT_TRANSACTIONS_PER_CYCLE = 200;
+    private static final int MAX_GET_TRANSACTION_MESSAGES_PER_CYCLE = 256;
+    private static final int GET_TRANSACTION_REPLY_THREADS = 4;
+    private static final int MAX_SIGNATURE_MESSAGES_PER_CYCLE = 64;
+    private static final int MAX_SIGNATURES_TO_CHECK_PER_CYCLE = 2048;
+    private static final int MAX_SIGNATURE_DB_BATCH = 256;
 
     /** Minimum time before considering an invalid unconfirmed transaction as "stale" */
     public static final long INVALID_TRANSACTION_STALE_TIMEOUT = 30 * 60 * 1000L; // ms
@@ -44,6 +50,8 @@ public class TransactionImporter extends Thread {
     /** Minimum frequency to re-request expired unconfirmed transactions from peers, to recheck validity
      * This mainly exists to stop expired transactions from bloating the list */
     public static final long EXPIRED_TRANSACTION_RECHECK_INTERVAL = 10 * 60 * 1000L; // ms
+    /** Cache lifetime for known-existing transaction signatures to avoid repeated DB existence checks under signature spam. */
+    public static final long KNOWN_SIGNATURE_RECHECK_INTERVAL = 2 * 60 * 1000L; // ms
 
 
     /** Map of incoming transaction that are in the import queue. Key is transaction data, value is whether signature has been validated. */
@@ -51,6 +59,8 @@ public class TransactionImporter extends Thread {
 
     /** Map of recent invalid unconfirmed transactions. Key is base58 transaction signature, value is do-not-request expiry timestamp. */
     private final Map<String, Long> invalidUnconfirmedTransactions = Collections.synchronizedMap(new HashMap<>());
+    /** Map of recently seen signatures already known to exist in DB. Key is base58 tx signature, value is expiry timestamp. */
+    private final Map<String, Long> knownExistingSignatures = Collections.synchronizedMap(new HashMap<>());
 
     /** Cached list of unconfirmed transactions, used when counting per creator. This is replaced regularly */
     public static List<TransactionData> unconfirmedTransactionsCache = null;
@@ -99,6 +109,7 @@ public class TransactionImporter extends Thread {
             getTransactionMessageScheduler.shutdownNow();
             getUnconfirmedTransactionsMessageScheduler.shutdownNow();
             signatureMessageScheduler.shutdownNow();
+            getTransactionReplyExecutor.shutdownNow();
 
             if (!getTransactionMessageScheduler.awaitTermination(5, TimeUnit.SECONDS)) {
                 LOGGER.warn("getTransactionMessageScheduler did not terminate in time");
@@ -108,6 +119,9 @@ public class TransactionImporter extends Thread {
             }
             if (!signatureMessageScheduler.awaitTermination(5, TimeUnit.SECONDS)) {
                 LOGGER.warn("signatureMessageScheduler did not terminate in time");
+            }
+            if (!getTransactionReplyExecutor.awaitTermination(5, TimeUnit.SECONDS)) {
+                LOGGER.warn("getTransactionReplyExecutor did not terminate in time");
             }
         } catch (InterruptedException e) {
             LOGGER.warn("Interrupted while waiting for TransactionImporter schedulers to terminate", e);
@@ -125,7 +139,9 @@ public class TransactionImporter extends Thread {
     }
 
     private void removeIncomingTransaction(byte[] signature) {
-        incomingTransactions.keySet().removeIf(t -> Arrays.equals(t.getSignature(), signature));
+        synchronized (incomingTransactions) {
+            incomingTransactions.keySet().removeIf(t -> Arrays.equals(t.getSignature(), signature));
+        }
     }
 
     /**
@@ -155,7 +171,10 @@ public class TransactionImporter extends Thread {
 
         try (final Repository repository = RepositoryManager.getRepository()) {
             // Take a snapshot of incomingTransactions, so we don't need to lock it while processing
-            Map<TransactionData, Boolean> incomingTransactionsCopy = Map.copyOf(this.incomingTransactions);
+            Map<TransactionData, Boolean> incomingTransactionsCopy;
+            synchronized (this.incomingTransactions) {
+                incomingTransactionsCopy = new HashMap<>(this.incomingTransactions);
+            }
 
             int unvalidatedCount = Collections.frequency(incomingTransactionsCopy.values(), Boolean.FALSE);
             int validatedCount = 0;
@@ -256,8 +275,6 @@ public class TransactionImporter extends Thread {
 
     /**
      * Import any transactions in the queue that have valid signatures.
-     *
-     * A database lock is required.
      */
     private void importTransactionsInQueue() {
         List<TransactionData> sigValidTransactions = this.getCachedSigValidTransactions();
@@ -278,10 +295,10 @@ public class TransactionImporter extends Thread {
             return;
         }
 
-        ReentrantLock blockchainLock = Controller.getInstance().getBlockchainLock();
-        if (!blockchainLock.tryLock()) {
-            LOGGER.debug("Too busy to import incoming transactions queue");
-            return;
+        final int totalPendingImports = sigValidTransactions.size();
+        if (totalPendingImports > MAX_IMPORT_TRANSACTIONS_PER_CYCLE) {
+            sigValidTransactions = new ArrayList<>(sigValidTransactions.subList(0, MAX_IMPORT_TRANSACTIONS_PER_CYCLE));
+            LOGGER.info("Throttling unconfirmed import cycle: processing {} of {} pending", sigValidTransactions.size(), totalPendingImports);
         }
 
         LOGGER.debug("Importing incoming transactions queue (size {})...", sigValidTransactions.size());
@@ -293,8 +310,7 @@ public class TransactionImporter extends Thread {
                 // Use a single copy of the unconfirmed transactions list for each cycle, to speed up constant lookups
                 // when counting unconfirmed transactions by creator.
                 List<TransactionData> unconfirmedTransactions = repository.getTransactionRepository().getUnconfirmedTransactions();
-                unconfirmedTransactions.removeIf(t -> t.getType() == Transaction.TransactionType.CHAT);
-                unconfirmedTransactionsCache = unconfirmedTransactions;
+                unconfirmedTransactionsCache = Collections.synchronizedList(unconfirmedTransactions);
 
                 // A list of signatures were imported in this round
                 List<byte[]> newlyImportedSignatures = new ArrayList<>();
@@ -323,7 +339,7 @@ public class TransactionImporter extends Thread {
                         }
 
                         case NO_BLOCKCHAIN_LOCK: {
-                            // Is this even possible considering we acquired blockchain lock above?
+                            // Defensive fallback in case import behavior changes in future
                             LOGGER.trace(() -> String.format("Couldn't lock blockchain to import unconfirmed transaction %s", Base58.encode(transactionData.getSignature())));
                             break;
                         }
@@ -332,7 +348,7 @@ public class TransactionImporter extends Thread {
                             LOGGER.debug(() -> String.format("Imported %s transaction %s", transactionData.getType().name(), Base58.encode(transactionData.getSignature())));
 
                             // Add to the unconfirmed transactions cache
-                            if (transactionData.getType() != Transaction.TransactionType.CHAT && unconfirmedTransactionsCache != null) {
+                            if (unconfirmedTransactionsCache != null) {
                                 unconfirmedTransactionsCache.add(transactionData);
                             }
 
@@ -380,9 +396,6 @@ public class TransactionImporter extends Thread {
                 LOGGER.error("Repository issue while importing incoming transactions", e);
             }
         } finally {
-            // Always release the blockchain lock, even if an exception occurred
-            blockchainLock.unlock();
-
             // Clear the unconfirmed transaction cache so new data can be populated in the next cycle
             unconfirmedTransactionsCache = null;
         }
@@ -394,6 +407,8 @@ public class TransactionImporter extends Thread {
         }
         // Periodically remove invalid unconfirmed transactions from the list, so that they can be fetched again
         invalidUnconfirmedTransactions.entrySet().removeIf(entry -> entry.getValue() == null || entry.getValue() < now);
+        // Periodically remove known-existing signatures so we eventually recheck after potential reorgs.
+        knownExistingSignatures.entrySet().removeIf(entry -> entry.getValue() == null || entry.getValue() < now);
     }
 
 
@@ -419,6 +434,8 @@ public class TransactionImporter extends Thread {
 
     // Scheduled executor service to process messages every second
     private final ScheduledExecutorService getTransactionMessageScheduler = Executors.newScheduledThreadPool(1);
+    // Small fixed pool to avoid creating a thread per outgoing transaction reply
+    private final ExecutorService getTransactionReplyExecutor = Executors.newFixedThreadPool(GET_TRANSACTION_REPLY_THREADS);
 
     public void onNetworkGetTransactionMessage(Peer peer, Message message) {
 
@@ -435,8 +452,9 @@ public class TransactionImporter extends Thread {
         try {
             List<PeerMessage> messagesToProcess;
             synchronized (getTransactionMessageLock) {
-                messagesToProcess = new ArrayList<>(getTransactionMessageList);
-                getTransactionMessageList.clear();
+                int messagesToProcessCount = Math.min(MAX_GET_TRANSACTION_MESSAGES_PER_CYCLE, getTransactionMessageList.size());
+                messagesToProcess = new ArrayList<>(getTransactionMessageList.subList(0, messagesToProcessCount));
+                getTransactionMessageList.subList(0, messagesToProcessCount).clear();
             }
 
             if( messagesToProcess.isEmpty() ) return;
@@ -491,9 +509,7 @@ public class TransactionImporter extends Thread {
                 final Message message = peerMessage.getMessage();
                 final Peer peer = peerMessage.getPeer();
 
-                Runnable sendTransactionMessageRunner = () -> sendTransactionMessage(entry.getKey(), entry.getValue(), message, peer);
-                Thread sendTransactionMessageThread = new Thread(sendTransactionMessageRunner);
-                sendTransactionMessageThread.start();
+                getTransactionReplyExecutor.execute(() -> sendTransactionMessage(entry.getKey(), entry.getValue(), message, peer));
             }
         } catch (Exception e) {
             LOGGER.error(e.getMessage(),e);
@@ -583,16 +599,28 @@ public class TransactionImporter extends Thread {
         }
 
         try {
+            final Long now = NTP.getTime();
             List<PeerMessage> messagesToProcess;
+            int queuedMessagesBeforeDrain;
+            int queuedMessagesAfterDrain;
             synchronized (signatureMessageLock) {
-                messagesToProcess = new ArrayList<>(signatureMessageList);
-                signatureMessageList.clear();
+                queuedMessagesBeforeDrain = signatureMessageList.size();
+                int messagesToDrain = Math.min(MAX_SIGNATURE_MESSAGES_PER_CYCLE, signatureMessageList.size());
+                messagesToProcess = new ArrayList<>(messagesToDrain);
+                Iterator<PeerMessage> iterator = signatureMessageList.iterator();
+                while (messagesToProcess.size() < messagesToDrain && iterator.hasNext()) {
+                    messagesToProcess.add(iterator.next());
+                    iterator.remove();
+                }
+                queuedMessagesAfterDrain = signatureMessageList.size();
             }
 
             Map<String, byte[]> signatureBySignature58 = new HashMap<>(messagesToProcess.size() * 10);
             Map<String, Peer> peerBySignature58 = new HashMap<>( messagesToProcess.size() * 10 );
+            boolean hitSignatureCycleLimit = false;
 
-            for( PeerMessage peerMessage : messagesToProcess ) {
+            outer:
+            for (PeerMessage peerMessage : messagesToProcess) {
 
                 TransactionSignaturesMessage transactionSignaturesMessage = (TransactionSignaturesMessage) peerMessage.getMessage();
                 List<byte[]> signatures = transactionSignaturesMessage.getSignatures();
@@ -605,6 +633,14 @@ public class TransactionImporter extends Thread {
                         continue;
                     }
 
+                    if (now != null) {
+                        Long knownExistingExpiry = knownExistingSignatures.get(signature58);
+                        if (knownExistingExpiry != null && knownExistingExpiry > now) {
+                            // Recently confirmed/existing tx signature - skip repeated existence checks.
+                            continue;
+                        }
+                    }
+
                     // Ignore if this transaction is in the queue
                     if (incomingTransactionQueueContains(signature)) {
                         LOGGER.trace(() -> String.format("Ignoring existing queued transaction %s from peer %s", Base58.encode(signature), peerMessage.getPeer()));
@@ -613,21 +649,51 @@ public class TransactionImporter extends Thread {
 
                     signatureBySignature58.put(signature58, signature);
                     peerBySignature58.put(signature58, peerMessage.getPeer());
+
+                    if (signatureBySignature58.size() >= MAX_SIGNATURES_TO_CHECK_PER_CYCLE) {
+                        hitSignatureCycleLimit = true;
+                        break outer;
+                    }
                 }
             }
 
+            final int candidateCountBeforeDbCheck = signatureBySignature58.size();
+            int existingSignatureCount = 0;
             if( !signatureBySignature58.isEmpty() ) {
                 try (final Repository repository = RepositoryManager.getRepository()) {
+                    // Remove signatures already present in DB in bounded batches.
+                    List<byte[]> candidateSignatures = new ArrayList<>(signatureBySignature58.values());
+                    for (int start = 0; start < candidateSignatures.size(); start += MAX_SIGNATURE_DB_BATCH) {
+                        int end = Math.min(start + MAX_SIGNATURE_DB_BATCH, candidateSignatures.size());
+                        List<byte[]> signatureBatch = candidateSignatures.subList(start, end);
 
-                    // remove signatures in db already
-                    repository.getTransactionRepository()
-                            .fromSignatures(new ArrayList<>(signatureBySignature58.values())).stream()
-                            .map(TransactionData::getSignature)
-                            .map(signature -> Base58.encode(signature))
-                            .forEach(signature58 -> signatureBySignature58.remove(signature58));
+                        for (byte[] existingSignature : repository.getTransactionRepository().getExistingSignatures(signatureBatch)) {
+                            String signature58 = Base58.encode(existingSignature);
+                            if (signatureBySignature58.remove(signature58) != null) {
+                                existingSignatureCount++;
+                            }
+
+                            if (now != null) {
+                                knownExistingSignatures.put(signature58, now + KNOWN_SIGNATURE_RECHECK_INTERVAL);
+                            }
+                        }
+                    }
                 } catch (DataException e) {
                     LOGGER.error(String.format("Repository issue while processing unconfirmed transactions from peer"), e);
                 }
+            }
+
+            if (queuedMessagesAfterDrain > 0 || hitSignatureCycleLimit) {
+                LOGGER.info(
+                        "Tx signature importer cycle: queuedBefore={}, drained={}, queuedAfter={}, candidatesBeforeDb={}, existingInDb={}, remainingCandidates={}, hitSignatureLimit={}",
+                        queuedMessagesBeforeDrain,
+                        messagesToProcess.size(),
+                        queuedMessagesAfterDrain,
+                        candidateCountBeforeDbCheck,
+                        existingSignatureCount,
+                        signatureBySignature58.size(),
+                        hitSignatureCycleLimit
+                );
             }
 
             // Check isInterrupted() here and exit fast

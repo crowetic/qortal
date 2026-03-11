@@ -3,6 +3,7 @@ package org.qortal.transaction;
 import org.qortal.account.Account;
 import org.qortal.account.PublicKeyAccount;
 import org.qortal.asset.Asset;
+import org.qortal.controller.TransactionImporter;
 import org.qortal.crypto.Crypto;
 import org.qortal.crypto.MemoryPoW;
 import org.qortal.data.naming.NameData;
@@ -237,7 +238,12 @@ public class ChatTransaction extends Transaction {
 	}
 
 	private int countRecentChatTransactionsByCreator(PublicKeyAccount creator) throws DataException {
-		List<TransactionData> unconfirmedTransactions = repository.getTransactionRepository().getUnconfirmedTransactions();
+		List<TransactionData> unconfirmedTransactions = TransactionImporter.getInstance().unconfirmedTransactionsCache;
+		if (unconfirmedTransactions == null) {
+			// Fallback query should be scoped to creator+CHAT to avoid scanning/hydrating the full unconfirmed pool.
+			unconfirmedTransactions = repository.getTransactionRepository().getUnconfirmedTransactions(TransactionType.CHAT, creator.getPublicKey());
+		}
+
 		final Long now = NTP.getTime();
 		long recentThreshold = Settings.getInstance().getRecentChatMessagesMaxAge();
 
@@ -252,7 +258,9 @@ public class ChatTransaction extends Transaction {
 			return Arrays.equals(creator.getPublicKey(), transactionData.getCreatorPublicKey());
 		};
 
-		return (int) unconfirmedTransactions.stream().filter(hasSameCreatorAndIsRecentChat).count();
+		synchronized (unconfirmedTransactions) {
+			return (int) unconfirmedTransactions.stream().filter(hasSameCreatorAndIsRecentChat).count();
+		}
 	}
 
 
