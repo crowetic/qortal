@@ -101,7 +101,7 @@ function qdnGatewayShowModal(message) {
     qortalButton.innerText = "Learn more";
     qortalButton.addEventListener ("click", function() {
         document.body.removeChild(document.getElementById(modalElementId));
-        window.open("https://qortal.org");
+        window.open("https://qortal.dev");
     });
     modalElement.appendChild(qortalButton);
 
