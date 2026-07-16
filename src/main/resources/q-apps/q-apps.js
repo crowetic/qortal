@@ -376,8 +376,17 @@ window.addEventListener(
       return;
     }
     if (event.data.action == null) {
-      // This could be a response from the UI
-      handleResponse(event, event.data);
+      // Only Q-App-shaped messages can be responses from the UI. Other
+      // extensions may use window.postMessage() too (for example, Pontem's
+      // pontem-external protocol), and those messages do not contain a
+      // MessagePort or a Q-App result/error pair.
+      if (
+        Object.prototype.hasOwnProperty.call(event.data, "result") ||
+        Object.prototype.hasOwnProperty.call(event.data, "error")
+      ) {
+        handleResponse(event, event.data);
+      }
+      return;
     }
     if (
       event.data.requestedHandler != null &&

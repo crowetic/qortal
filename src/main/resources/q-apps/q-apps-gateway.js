@@ -22,6 +22,8 @@ const gatewayInteractiveActions = new Set([
   "DELETE_LIST_ITEM",
 ]);
 
+const gatewayLocalActions = new Set(["QDN_RESOURCE_DISPLAYED"]);
+
 function sendRequestToExtension(
   requestType,
   payload,
@@ -111,6 +113,18 @@ window.addEventListener("message", async (event) => {
         return;
     }
     if (event.data.action == null) {
+        return;
+    }
+
+    if (gatewayLocalActions.has(event.data.action)) {
+        // Gateway pages do not have a Qortal UI to receive navigation
+        // tracking messages. Acknowledge these locally so the app's
+        // qortalRequest() promise does not time out during page load.
+        event.stopImmediatePropagation();
+        const port = event.ports?.[0];
+        if (port != null) {
+            port.postMessage({ result: null, error: null });
+        }
         return;
     }
 
