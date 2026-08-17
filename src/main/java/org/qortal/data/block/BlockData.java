@@ -1,12 +1,16 @@
 package org.qortal.data.block;
 
 import com.google.common.primitives.Bytes;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.qortal.account.Account;
 import org.qortal.block.BlockChain;
+import org.qortal.controller.Controller;
 import org.qortal.repository.DataException;
 import org.qortal.repository.Repository;
 import org.qortal.repository.RepositoryManager;
 import org.qortal.settings.Settings;
+import org.qortal.transform.Transformer;
 import org.qortal.utils.NTP;
 
 import javax.xml.bind.annotation.XmlAccessType;
@@ -46,6 +50,7 @@ public class BlockData implements Serializable {
 	private Long onlineAccountsTimestamp;
 	private byte[] onlineAccountsSignatures;
 
+    private static final Logger LOGGER = LogManager.getLogger(BlockData.class);
 	// Constructors
 
 	// necessary for JAX-RS serialization
@@ -222,8 +227,21 @@ public class BlockData implements Serializable {
 
 	public int getOnlineAccountsSignaturesCount() {
 		if (this.onlineAccountsSignatures != null && this.onlineAccountsSignatures.length > 0) {
-			// Blocks use a single online accounts signature, so there is no need for this to be dynamic
-			return 1;
+			// The stored bytes are: (signaturesCount * SIGNATURE_LENGTH) + (onlineAccountsCount * INT_LENGTH) nonces.
+			// Derive the signature count from the actual bytes so it works for both the legacy aggregate
+			// (single signature) and the per-account scheme (one signature per online account).
+			final int noncesLength;
+			try {
+				noncesLength = Math.multiplyExact(this.onlineAccountsCount, Transformer.INT_LENGTH);
+			} catch (ArithmeticException e) {
+				throw new IllegalStateException("Online accounts nonce byte length overflow", e);
+			}
+
+			int signaturesLength = this.onlineAccountsSignatures.length - noncesLength;
+			if (signaturesLength <= 0 || signaturesLength % Transformer.SIGNATURE_LENGTH != 0)
+				throw new IllegalStateException("Online account signatures byte data malformed");
+
+			return signaturesLength / Transformer.SIGNATURE_LENGTH;
 		}
 		return 0;
 	}
@@ -232,7 +250,8 @@ public class BlockData implements Serializable {
 		long onlineAccountSignaturesTrimmedTimestamp = NTP.getTime() - BlockChain.getInstance().getOnlineAccountSignaturesMaxLifetime();
 		long currentTrimmableTimestamp = NTP.getTime() - Settings.getInstance().getAtStatesMaxLifetime();
 		long blockTimestamp = this.getTimestamp();
-		return blockTimestamp < onlineAccountSignaturesTrimmedTimestamp && blockTimestamp < currentTrimmableTimestamp;
+
+        return blockTimestamp < onlineAccountSignaturesTrimmedTimestamp && blockTimestamp < currentTrimmableTimestamp;
 	}
 
 	public String getMinterAddressFromPublicKey() {

@@ -3,6 +3,8 @@ package org.qortal.controller.arbitrary;
 import org.apache.commons.io.FileUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.qortal.arbitrary.ArbitraryDataFolderSizeEstimator;
+import org.qortal.arbitrary.LongFileHandler;
 import org.qortal.data.transaction.ArbitraryTransactionData;
 import org.qortal.data.transaction.TransactionData;
 import org.qortal.repository.DataException;
@@ -11,18 +13,31 @@ import org.qortal.settings.Settings;
 import org.qortal.transaction.Transaction;
 import org.qortal.utils.*;
 
+import java.io.File;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.time.Duration;
+import java.time.ZonedDateTime;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Objects;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 
 public class ArbitraryDataStorageManager extends Thread {
+
+    private static final File DATA_FILE = new File("qortal-backup/ArbitraryDataFolderSizeEstimate.dat");
+    private final ScheduledExecutorService scheduler;
+    private final ScheduledFuture<?> scheduledTask;
 
     public enum StoragePolicy {
         FOLLOWED_OR_VIEWED,
@@ -45,6 +60,8 @@ public class ArbitraryDataStorageManager extends Thread {
 
     private String searchQuery;
 
+    private AtomicBoolean recalculate = new AtomicBoolean(false);
+
     private static final long DIRECTORY_SIZE_CHECK_INTERVAL = 10 * 60 * 1000L; // 10 minutes
 
     /** Treat storage as full at 80% usage, to reduce risk of going over the limit.
@@ -60,6 +77,19 @@ public class ArbitraryDataStorageManager extends Thread {
     private static final long PER_NAME_STORAGE_MULTIPLIER = 4L;
 
     public ArbitraryDataStorageManager() {
+        // Calculate initial delay until next target time
+        long initialDelay = calculateInitialDelay();
+
+        this.scheduler = Executors.newSingleThreadScheduledExecutor();
+
+        // Schedule the task to run initially and then every nth day (the frequency)
+        this.scheduledTask
+            = this.scheduler.scheduleAtFixedRate(
+                () -> this.recalculate.set(true),
+                initialDelay,
+                Settings.getInstance().getDataStorageSizeCalculationFrequency() * 24L,
+                TimeUnit.HOURS
+        );
     }
 
     public static ArbitraryDataStorageManager getInstance() {
@@ -78,20 +108,24 @@ public class ArbitraryDataStorageManager extends Thread {
             while (!isStopping) {
                 Thread.sleep(1000);
 
-                // Don't run if QDN is disabled
-                if (!Settings.getInstance().isQdnEnabled()) {
-                    Thread.sleep(60 * 60 * 1000L);
-                    continue;
-                }
+                try {
+                    // Don't run if QDN is disabled
+                    if (!Settings.getInstance().isQdnEnabled()) {
+                        Thread.sleep(60 * 60 * 1000L);
+                        continue;
+                    }
 
-                Long now = NTP.getTime();
-                if (now == null) {
-                    continue;
-                }
+                    Long now = NTP.getTime();
+                    if (now == null) {
+                        continue;
+                    }
 
-                // Check the total directory size if we haven't in a while
-                if (this.shouldCalculateDirectorySize(now)) {
-                    this.calculateDirectorySize(now);
+                    // Check the total directory size if we haven't in a while
+                    if (this.shouldCalculateDirectorySize(now)) {
+                        this.getDataDirectorySize(now);
+                    }
+                } catch (Exception e) {
+                    LOGGER.error(e.getMessage(), e);
                 }
 
                 Thread.sleep(59000);
@@ -105,6 +139,19 @@ public class ArbitraryDataStorageManager extends Thread {
         isStopping = true;
         this.interrupt();
         instance = null;
+
+        if (scheduledTask != null) {
+            scheduledTask.cancel(false);
+        }
+        scheduler.shutdown();
+        try {
+            if (!scheduler.awaitTermination(1, TimeUnit.SECONDS)) {
+                scheduler.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            scheduler.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
     }
 
     /**
@@ -403,24 +450,78 @@ public class ArbitraryDataStorageManager extends Thread {
         return false;
     }
 
-    public void calculateDirectorySize(Long now) {
+    public void getDataDirectorySize(Long now) {
         if (now == null) {
             return;
         }
 
-        long totalSize = 0;
-        long remainingCapacity = 0;
-
-        // Calculate remaining capacity
         try {
-            remainingCapacity = this.getRemainingUsableStorageCapacity();
-        } catch (IOException e) {
-            LOGGER.info("Unable to calculate remaining storage capacity: {}", e.getMessage());
-            return;
+            long remainingCapacity = 0;
+
+            // Calculate remaining capacity
+            try {
+                remainingCapacity = this.getRemainingUsableStorageCapacity();
+            } catch (IOException e) {
+                LOGGER.info("Unable to calculate remaining storage capacity: {}", e.getMessage());
+                return;
+            }
+
+            // if it is time to recalculate
+            if( this.recalculate.getAndSet(false) ) {
+                calculateDirectorySize();
+            }
+            // if this is the first size check, then look at data file first
+            else if( lastDirectorySizeCheck == 0 ) {
+                long totalSize = LongFileHandler.readLongWithDefault(DATA_FILE, -1L);
+
+                // if there is no data file, then calculate
+                if( totalSize < 0) {
+                    calculateDirectorySize();
+                }
+                // if there is data, then set it to the estimator
+                else {
+                    ArbitraryDataFolderSizeEstimator.getInstance().set(totalSize);
+                }
+            }
+            // otherwise just get it from the estimator
+
+            long totalSize = ArbitraryDataFolderSizeEstimator.getInstance().get();
+
+            // store size in data file to be available after a restart
+            LongFileHandler.createFileIfNotExists(DATA_FILE);
+            LongFileHandler.writeLong(DATA_FILE, totalSize);
+
+            this.totalDirectorySize = totalSize;
+            this.lastDirectorySizeCheck = now;
+
+            // It's essential that used space (this.totalDirectorySize) is included in the storage capacity
+            LOGGER.trace("Calculating total storage capacity...");
+            long storageCapacity = remainingCapacity + this.totalDirectorySize;
+
+            // Make sure to limit the storage capacity if the user is overriding it in the settings
+            if (Settings.getInstance().getMaxStorageCapacity() != null) {
+                storageCapacity = Math.min(storageCapacity, Settings.getInstance().getMaxStorageCapacity());
+            }
+            this.storageCapacity = storageCapacity;
+        } catch (UncheckedIOException e) {
+            LOGGER.warn(e.getMessage(), e);
+        } catch (Exception e) {
+           LOGGER.error(e.getMessage(), e);
         }
 
+        LOGGER.info("Total used: {}, Total capacity: {}", StringUtils.formatBytes(this.totalDirectorySize), StringUtils.formatBytes(this.storageCapacity));
+    }
+
+    /**
+     * Calculate Directory Size
+     *
+     * Calculate directory size and set it to the estimator.
+     */
+    public static void calculateDirectorySize() {
+        long totalSize = 0;
+
         // Calculate total size of data directory
-        LOGGER.trace("Calculating data directory size...");
+        LOGGER.info("Calculating data directory size...");
         Path dataDirectoryPath = Paths.get(Settings.getInstance().getDataPath());
         if (dataDirectoryPath.toFile().exists()) {
             totalSize += FileUtils.sizeOfDirectory(dataDirectoryPath.toFile());
@@ -430,25 +531,12 @@ public class ArbitraryDataStorageManager extends Thread {
         Path tempDirectoryPath = Paths.get(Settings.getInstance().getTempDataPath());
         if (tempDirectoryPath.toFile().exists()) {
             if (!FilesystemUtils.isChild(tempDirectoryPath, dataDirectoryPath)) {
-                LOGGER.trace("Calculating temp directory size...");
-                totalSize += FileUtils.sizeOfDirectory(dataDirectoryPath.toFile());
+                LOGGER.info("Calculating temp directory size...");
+                totalSize += FileUtils.sizeOfDirectory(tempDirectoryPath.toFile());
             }
         }
 
-        this.totalDirectorySize = totalSize;
-        this.lastDirectorySizeCheck = now;
-
-        // It's essential that used space (this.totalDirectorySize) is included in the storage capacity
-        LOGGER.trace("Calculating total storage capacity...");
-        long storageCapacity = remainingCapacity + this.totalDirectorySize;
-
-        // Make sure to limit the storage capacity if the user is overriding it in the settings
-        if (Settings.getInstance().getMaxStorageCapacity() != null) {
-            storageCapacity = Math.min(storageCapacity, Settings.getInstance().getMaxStorageCapacity());
-        }
-        this.storageCapacity = storageCapacity;
-
-        LOGGER.info("Total used: {} bytes, Total capacity: {} bytes", this.totalDirectorySize, this.storageCapacity);
+        ArbitraryDataFolderSizeEstimator.getInstance().set(totalSize);
     }
 
     private long getRemainingUsableStorageCapacity() throws IOException {
@@ -505,5 +593,32 @@ public class ArbitraryDataStorageManager extends Thread {
             return null;
         }
         return (long)(this.storageCapacity * threshold);
+    }
+
+    /**
+     * Calculate Initial Delay
+     *
+     * Calculate the time to delay the scheduling of the data storage size calculation.
+     *
+     * @return the time in milliseconds
+     */
+    private long calculateInitialDelay() {
+        // Get current time in the system's default timezone
+        ZonedDateTime now = ZonedDateTime.now();
+
+        // Create a target time for today with the specified hour
+        ZonedDateTime targetToday
+            = now.withHour(Settings.getInstance().getDataStorageSizeCalculationHour())
+                .withMinute(0)
+                .withSecond(0)
+                .withNano(0);
+
+        // If the target time has already passed today, schedule for tomorrow
+        if (now.isAfter(targetToday)) {
+            targetToday = targetToday.plusDays(1);
+        }
+
+        // Calculate the difference in hours
+        return Duration.between(now, targetToday).get(ChronoUnit.SECONDS) / 3600;
     }
 }

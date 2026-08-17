@@ -26,19 +26,27 @@ import org.qortal.data.naming.NameData;
 import org.qortal.data.network.PeerData;
 import org.qortal.data.transaction.ArbitraryTransactionData;
 import org.qortal.data.transaction.ChatTransactionData;
+import org.qortal.data.transaction.PaymentTransactionData;
 import org.qortal.data.transaction.TransactionData;
+import org.qortal.crypto.Crypto;
 import org.qortal.event.Event;
 import org.qortal.event.EventBus;
+import org.qortal.notification.NotificationEvent;
+import org.qortal.notification.NotificationManager;
 import org.qortal.globalization.Translator;
 import org.qortal.gui.Gui;
 import org.qortal.gui.SysTray;
 import org.qortal.network.Network;
+import org.qortal.network.NetworkData;
 import org.qortal.network.Peer;
+import org.qortal.network.PeerSendManagement;
 import org.qortal.network.PeerAddress;
 import org.qortal.network.message.*;
 import org.qortal.repository.*;
+import org.qortal.repository.hsqldb.HSQLDBCacheUtils;
 import org.qortal.repository.hsqldb.HSQLDBRepositoryFactory;
 import org.qortal.settings.Settings;
+import org.qortal.transaction.ChatTransaction;
 import org.qortal.transaction.Transaction;
 import org.qortal.transaction.Transaction.TransactionType;
 import org.qortal.transform.TransformationException;
@@ -75,6 +83,8 @@ import java.util.function.Predicate;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
+import static org.qortal.network.Peer.FETCH_BLOCKS_TIMEOUT;
+
 public class Controller extends Thread {
 
 	static {
@@ -91,7 +101,14 @@ public class Controller extends Thread {
 	public static final long MISBEHAVIOUR_COOLOFF = 10 * 60 * 1000L; // ms
 	private static final int MAX_BLOCKCHAIN_TIP_AGE = 5; // blocks
 	private static final Object shutdownLock = new Object();
-	private static final String repositoryUrlTemplate = "jdbc:hsqldb:file:%s" + File.separator + "blockchain;create=true;hsqldb.full_log_replay=true";
+	private static String buildRepositoryUrl(String path) {
+		int cacheRows = Settings.getInstance().getHsqldbCacheRows();
+		int cacheSize = Settings.getInstance().getHsqldbCacheSize();
+		return "jdbc:hsqldb:file:" + path + File.separator
+				+ "blockchain;create=true;hsqldb.full_log_replay=true"
+				+ ";hsqldb.cache_rows=" + cacheRows
+				+ ";hsqldb.cache_size=" + cacheSize;
+	}
 	private static final long NTP_PRE_SYNC_CHECK_PERIOD = 5 * 1000L; // ms
 	private static final long NTP_POST_SYNC_CHECK_PERIOD = 5 * 60 * 1000L; // ms
 	private static final long DELETE_EXPIRED_INTERVAL = 5 * 60 * 1000L; // ms
@@ -123,7 +140,7 @@ public class Controller extends Thread {
 	private long repositoryBackupTimestamp = startTime; // ms
 	private long repositoryMaintenanceTimestamp = startTime; // ms
 	private long repositoryCheckpointTimestamp = startTime; // ms
-	private long prunePeersTimestamp = startTime; // ms
+	private long prunePeersTimestamp = startTime + 120000; // ms
 	private long ntpCheckTimestamp = startTime; // ms
 	private long deleteExpiredTimestamp = startTime + DELETE_EXPIRED_INTERVAL; // ms
 
@@ -145,7 +162,19 @@ public class Controller extends Thread {
 			public GetBlockMessageStats() {
 			}
 		}
-		public GetBlockMessageStats getBlockMessageStats = new GetBlockMessageStats();
+        public GetBlockMessageStats getBlockMessageStats = new GetBlockMessageStats();
+
+        public static class GetBlocksMessageStats {
+            public AtomicLong requests = new AtomicLong();
+            public AtomicLong cacheHits = new AtomicLong();
+            public AtomicLong unknownBlocks = new AtomicLong();
+            public AtomicLong cacheFills = new AtomicLong();
+            public AtomicLong fullyFromCache = new AtomicLong();
+
+            public GetBlocksMessageStats() {
+            }
+        }
+        public GetBlocksMessageStats getBlocksMessageStats = new GetBlocksMessageStats();
 
 		public static class GetBlockSummariesStats {
 			public AtomicLong requests = new AtomicLong();
@@ -301,7 +330,7 @@ public class Controller extends Thread {
 	// Getters / setters
 
 	public static String getRepositoryUrl() {
-		return String.format(repositoryUrlTemplate, Settings.getInstance().getRepositoryPath());
+		return buildRepositoryUrl(Settings.getInstance().getRepositoryPath());
 	}
 
 	public long getBuildTimestamp() {
@@ -412,8 +441,10 @@ public class Controller extends Thread {
 			NTP.start(Settings.getInstance().getNtpServers());
 
 		LOGGER.info("Starting repository");
+		LOGGER.debug("Repository URL: {}", getRepositoryUrl());
 		try {
 			HSQLDBRepositoryFactory repositoryFactory = new HSQLDBRepositoryFactory(getRepositoryUrl());
+
 			RepositoryManager.setRepositoryFactory(repositoryFactory);
 			RepositoryManager.setRequestedCheckpoint(Boolean.TRUE);
 
@@ -422,34 +453,28 @@ public class Controller extends Thread {
 				ArbitraryDataCacheManager.getInstance().buildArbitraryResourcesCache(repository, false);
 			}
 
-			if( Settings.getInstance().isDbCacheEnabled() ) {
-				LOGGER.info("Db Cache Starting ...");
-				HSQLDBDataCacheManager hsqldbDataCacheManager = new HSQLDBDataCacheManager();
-				hsqldbDataCacheManager.start();
-			}
-			else {
-				LOGGER.info("Db Cache Disabled");
-			}
 
-			LOGGER.info("Arbitrary Indexing Starting ...");
-			ArbitraryIndexUtils.startCaching(
-				Settings.getInstance().getArbitraryIndexingPriority(),
-				Settings.getInstance().getArbitraryIndexingFrequency()
-			);
+			if (Settings.getInstance().getArbitraryIndexingPriority() > 0 ) {
+				LOGGER.info("Arbitrary Indexing Starting ...");
+				ArbitraryIndexUtils.startCaching(
+						Settings.getInstance().getArbitraryIndexingPriority(),
+						Settings.getInstance().getArbitraryIndexingFrequency()
+				);
+			}
 
 			if( Settings.getInstance().isBalanceRecorderEnabled() ) {
 				Optional<HSQLDBBalanceRecorder> recorder = HSQLDBBalanceRecorder.getInstance();
 
 				if( recorder.isPresent() ) {
-					LOGGER.info("Balance Recorder Starting ...");
+					LOGGER.info("Starting Balance Recorder...");
 					recorder.get().start();
 				}
 				else {
-					LOGGER.info("Balance Recorder won't start.");
+					LOGGER.debug("Balance Recorder won't start.");
 				}
 			}
 			else {
-				LOGGER.info("Balance Recorder Disabled");
+				LOGGER.debug("Balance Recorder disabled");
 			}
 		} catch (DataException e) {
 			// If exception has no cause or message then repository is in use by some other process.
@@ -468,18 +493,20 @@ public class Controller extends Thread {
 		if (!Settings.getInstance().isLite()) {
 
 			// Rebuild Names table and check database integrity (if enabled)
+			// @toDo : We rebuild this table everytime?  This is not sustainable as we age, need a
+			//  	   table that tracks completed features such as this to determine if it needs to run
 			NamesDatabaseIntegrityCheck namesDatabaseIntegrityCheck = new NamesDatabaseIntegrityCheck();
+			LOGGER.info("Rebuilding all names...");
 			namesDatabaseIntegrityCheck.rebuildAllNames();
 			if (Settings.getInstance().isNamesIntegrityCheckEnabled()) {
+				LOGGER.info("Running database integrity check...");
 				namesDatabaseIntegrityCheck.runIntegrityCheck();
 			}
-
-			LOGGER.info("Validating blockchain");
+			LOGGER.info("Validating blockchain...");
 			try {
 				BlockChain.validate();
-
 				Controller.getInstance().refillLatestBlocksCache();
-				LOGGER.info(String.format("Our chain height at start-up: %d", Controller.getInstance().getChainHeight()));
+				LOGGER.info("Chain height at start-up: {}", Controller.getInstance().getChainHeight());
 			} catch (DataException e) {
 				LOGGER.error("Couldn't validate blockchain", e);
 				Gui.getInstance().fatalError("Blockchain validation issue", e);
@@ -487,7 +514,12 @@ public class Controller extends Thread {
 			}
 		}
 
+	
+
 		try (Repository repository = RepositoryManager.getRepository()) {
+
+			ArbitraryDataCacheManager.populateLatestSignaturesIfNecessary(repository.getConnection());
+		
 			if (RepositoryManager.needsTransactionSequenceRebuild(repository)) {
 				// Don't allow the node to start if transaction sequences haven't been built yet
 				// This is needed to handle a case when bootstrapping
@@ -545,6 +577,9 @@ public class Controller extends Thread {
 		LOGGER.info("Starting trade-bot");
 		TradeBot.getInstance();
 
+		LOGGER.info("Starting chat delegate");
+		ChatTransactionDelegate.getInstance();
+
 		// Arbitrary data controllers
 		LOGGER.info("Starting arbitrary-transaction controllers");
 		ArbitraryDataManager.getInstance().start();
@@ -565,7 +600,6 @@ public class Controller extends Thread {
 			);
 		}
 
-
 		LOGGER.info("Starting online accounts manager");
 		OnlineAccountsManager.getInstance().start();
 
@@ -585,7 +619,18 @@ public class Controller extends Thread {
 		}
 
 		LOGGER.info("Starting wallets");
-		PirateChainWalletController.getInstance().start();
+        if( Settings.getInstance().isWalletEnabled("ARRR")) {
+            PirateChainWalletController.getInstance().start();
+        }
+
+	    if( Settings.getInstance().isDbCacheEnabled() ) {
+				LOGGER.info("Starting Db Cache...");
+				HSQLDBDataCacheManager hsqldbDataCacheManager = new HSQLDBDataCacheManager();
+				hsqldbDataCacheManager.start();
+		}
+		else {
+				LOGGER.info("Db Cache Disabled");
+		}
 
 		LOGGER.info(String.format("Starting API on port %d", Settings.getInstance().getApiPort()));
 		try {
@@ -599,7 +644,7 @@ public class Controller extends Thread {
 		}
 
 		if (Settings.getInstance().isGatewayEnabled()) {
-			LOGGER.info(String.format("Starting gateway service on port %d", Settings.getInstance().getGatewayPort()));
+			LOGGER.info("Starting gateway service on port {}", Settings.getInstance().getGatewayPort());
 			try {
 				GatewayService gatewayService = GatewayService.getInstance();
 				gatewayService.start();
@@ -612,7 +657,7 @@ public class Controller extends Thread {
 		}
 
 		if (Settings.getInstance().isDomainMapEnabled()) {
-			LOGGER.info(String.format("Starting domain map service on port %d", Settings.getInstance().getDomainMapPort()));
+			LOGGER.info("Starting domain map service on port {}", Settings.getInstance().getDomainMapPort());
 			try {
 				DomainMapService domainMapService = DomainMapService.getInstance();
 				domainMapService.start();
@@ -742,6 +787,12 @@ public class Controller extends Thread {
 				}
 			}
 		}, 3*60*1000, 3*60*1000);
+
+		if( Settings.getInstance().getThreadDumpInterval() > 0 ) {
+
+			LOGGER.info("Starting Thread Dump Scheduler ...");
+			ThreadDumpScheduler.getInstance().start();
+		}
 	}
 
 	/** Called by AdvancedInstaller's launch EXE in single-instance mode, when an instance is already running. */
@@ -758,7 +809,7 @@ public class Controller extends Thread {
 		final long repositoryBackupInterval = Settings.getInstance().getRepositoryBackupInterval();
 		final long repositoryCheckpointInterval = Settings.getInstance().getRepositoryCheckpointInterval();
 		long repositoryMaintenanceInterval = getRandomRepositoryMaintenanceInterval();
-		final long prunePeersInterval = 5 * 60 * 1000L; // Every 5 minutes
+		final long prunePeersInterval = 90 * 1000L; // Every 90 seconds (1.5 minutes)
 
 		// Start executor service for trimming or pruning
 		PruneManager.getInstance().start();
@@ -778,16 +829,15 @@ public class Controller extends Thread {
 				// Check NTP status
 				if (now >= ntpCheckTimestamp) {
 					Long ntpTime = NTP.getTime();
-
 					if (ntpTime != null) {
 						if (ntpTime != now)
 							// Only log if non-zero offset
-							LOGGER.info(String.format("Adjusting system time by NTP offset: %dms", ntpTime - now));
+							LOGGER.info("Adjusting system time by NTP offset: {}ms", ntpTime - now);
 
 						ntpCheckTimestamp = now + NTP_POST_SYNC_CHECK_PERIOD;
 						requestSysTrayUpdate = true;
 					} else {
-						LOGGER.info(String.format("No NTP offset yet"));
+						LOGGER.info("No NTP offset yet");
 						ntpCheckTimestamp = now + NTP_PRE_SYNC_CHECK_PERIOD;
 						// We can't do much without a valid NTP time
 						continue;
@@ -862,8 +912,29 @@ public class Controller extends Thread {
 					try {
 						LOGGER.debug("Pruning peers...");
 						Network.getInstance().prunePeers();
+						NetworkData.getInstance().prunePeers();
 					} catch (DataException e) {
 						LOGGER.warn(String.format("Repository issue when trying to prune peers: %s", e.getMessage()));
+					}
+					
+					// Check worker pool health to detect critical thread issues
+					// Note: After refactor to dedicated I/O threads, 0 active threads means "idle worker pool"
+					// not "dead system". The I/O threads run independently and always service sockets.
+					// Only warn if pool stats are unavailable (indicates shutdown or initialization issue).
+					try {
+						ExecuteProduceConsume.StatsSnapshot networkStats = Network.getInstance().getStatsSnapshot();
+						ExecuteProduceConsume.StatsSnapshot networkDataStats = NetworkData.getInstance().getStatsSnapshot();
+						
+						// Log high activity for monitoring, but 0 active threads is now normal when idle
+						if (networkStats.activeThreadCount > 50) {
+							LOGGER.trace("Network worker pool has high activity: {} active threads", networkStats.activeThreadCount);
+						}
+						if (networkDataStats.activeThreadCount > 15) {
+							LOGGER.trace("NetworkData worker pool has high activity: {} active threads", networkDataStats.activeThreadCount);
+						}
+					} catch (Exception e) {
+						// This would indicate a more serious problem (e.g., Network not initialized)
+						LOGGER.error("CRITICAL: Failed to get worker pool stats (system may not be initialized): {}", e.getMessage());
 					}
 				}
 
@@ -1084,10 +1155,25 @@ public class Controller extends Thread {
 			if (repository == null)
 				return;
 
-			List<TransactionData> transactions = repository.getTransactionRepository().getUnconfirmedTransactions();
+			// Most unconfirmed tx types expire using the chain-wide transaction expiry period.
+			// PRESENCE has shorter custom lifetimes, so handle it separately to avoid scanning lots
+			// of non-presence tx too early.
+			long standardExpiry = BlockChain.getInstance().getTransactionExpiryPeriod();
+			if (standardExpiry <= 0)
+				standardExpiry = 1;
+
+			long standardCandidatesBefore = now - standardExpiry;
+			List<TransactionData> transactions = repository.getTransactionRepository().getUnconfirmedTransactionsCreatedBefore(standardCandidatesBefore);
+			List<TransactionData> presenceTransactions = repository.getTransactionRepository().getUnconfirmedTransactions(TransactionType.PRESENCE, null);
+
+			Map<String, TransactionData> candidatesBySignature58 = new LinkedHashMap<>();
+			for (TransactionData transactionData : transactions)
+				candidatesBySignature58.put(Base58.encode(transactionData.getSignature()), transactionData);
+			for (TransactionData transactionData : presenceTransactions)
+				candidatesBySignature58.put(Base58.encode(transactionData.getSignature()), transactionData);
 
 			int deletedCount = 0;
-			for (TransactionData transactionData : transactions) {
+			for (TransactionData transactionData : candidatesBySignature58.values()) {
 				Transaction transaction = Transaction.fromData(repository, transactionData);
 
 				if (now >= transaction.getDeadline()) {
@@ -1120,28 +1206,41 @@ public class Controller extends Thread {
 
 				LOGGER.info("Shutting down synchronizer");
 				Synchronizer.getInstance().shutdown();
+				try {
+					Synchronizer.getInstance().join();
+				} catch (InterruptedException e) {
+					// We were interrupted while waiting for thread to join
+				}
 
 				LOGGER.info("Shutting down API");
 				ApiService.getInstance().stop();
 
 				LOGGER.info("Shutting down wallets");
-				PirateChainWalletController.getInstance().shutdown();
+				PirateChainWalletController pirateWalletController = PirateChainWalletController.getInstance();
+				if (pirateWalletController != null) {
+					pirateWalletController.shutdown();
+				}
 
 				if (Settings.getInstance().isAutoUpdateEnabled()) {
 					LOGGER.info("Shutting down auto-update");
 					AutoUpdate.getInstance().shutdown();
 				}
 
-				// Arbitrary data controllers
-				LOGGER.info("Shutting down arbitrary-transaction controllers");
-				ArbitraryDataManager.getInstance().shutdown();
-				ArbitraryDataFileManager.getInstance().shutdown();
-				ArbitraryDataCacheManager.getInstance().shutdown();
-				ArbitraryDataBuildManager.getInstance().shutdown();
-				ArbitraryDataCleanupManager.getInstance().shutdown();
-				ArbitraryDataStorageManager.getInstance().shutdown();
-				ArbitraryDataRenderManager.getInstance().shutdown();
-				ArbitraryDataHostMonitor.getInstance().shutdown();
+				// Chat
+				LOGGER.info("Shutting down chat delegate");
+				ChatTransactionDelegate.getInstance().shutdown();
+
+			// Arbitrary data controllers
+			LOGGER.info("Shutting down arbitrary-transaction controllers");
+			ArbitraryDataManager.getInstance().shutdown();
+			ArbitraryDataFileManager.getInstance().shutdown();
+			ArbitraryDataFileListManager.getInstance().shutdown();
+			ArbitraryDataCacheManager.getInstance().shutdown();
+			ArbitraryDataBuildManager.getInstance().shutdown();
+			ArbitraryDataCleanupManager.getInstance().shutdown();
+			ArbitraryDataStorageManager.getInstance().shutdown();
+			ArbitraryDataRenderManager.getInstance().shutdown();
+			ArbitraryDataHostMonitor.getInstance().shutdown();
 
 				LOGGER.info("Shutting down online accounts manager");
 				OnlineAccountsManager.getInstance().shutdown();
@@ -1168,6 +1267,8 @@ public class Controller extends Thread {
 
 				LOGGER.info("Shutting down networking");
 				Network.getInstance().shutdown();
+				NetworkData.getInstance().shutdown();
+				PeerSendManagement.getInstance().shutdown();
 
 				LOGGER.info("Shutting down controller");
 				this.interrupt();
@@ -1176,6 +1277,17 @@ public class Controller extends Thread {
 				} catch (InterruptedException e) {
 					// We were interrupted while waiting for thread to join
 				}
+
+				LOGGER.info("Shutting down TradeBot");
+				TradeBot.getInstance().shutdown();
+
+				// Shutdown database cache timers before closing repository
+				LOGGER.info("Shutting down database cache timers");
+				HSQLDBCacheUtils.shutdown();
+
+				// Shutdown arbitrary metadata manager scheduler before closing repository
+				LOGGER.info("Shutting down arbitrary metadata manager");
+				ArbitraryMetadataManager.getInstance().shutdown();
 
 				// Make sure we're the only thread modifying the blockchain when shutting down the repository
 				ReentrantLock blockchainLock = Controller.getInstance().getBlockchainLock();
@@ -1199,6 +1311,9 @@ public class Controller extends Thread {
 				if (blockchainLock.isHeldByCurrentThread()) {
 					blockchainLock.unlock();
 				}
+
+				// if thread dumps are scheduled, then this will shutdown
+				ThreadDumpScheduler.getInstance().shutdown();
 
 				LOGGER.info("Shutting down NTP");
 				NTP.shutdownNow();
@@ -1412,6 +1527,33 @@ public class Controller extends Thread {
 	}
 
 	/**
+	 * Converts a transaction into a {@link NotificationEvent} and dispatches it
+	 * through the {@link NotificationManager} to any subscribed WebSocket clients.
+	 * <p>
+	 * Covered events:
+	 * <ul>
+	 *   <li>{@code PAYMENT_RECEIVED} – PAYMENT transactions</li>
+	 * </ul>
+	 */
+	private void dispatchTransactionNotification(TransactionData transactionData) {
+		if (transactionData == null) {
+			return;
+		}
+
+		try {
+			if (transactionData.getType() == TransactionType.PAYMENT) {
+				PaymentTransactionData tx = (PaymentTransactionData) transactionData;
+				String sender = Crypto.toAddress(tx.getCreatorPublicKey());
+				String amount = String.valueOf(tx.getAmount());
+				NotificationManager.getInstance().processEvent(new NotificationEvent("PAYMENT_RECEIVED",
+					Map.of("sender", sender, "recipient", tx.getRecipient(), "amount", amount)));
+			}
+		} catch (Exception e) {
+			LOGGER.debug("Error dispatching transaction notification: {}", e.getMessage());
+		}
+	}
+
+	/**
 	 * Callback for when we've deleted an expired, unconfirmed transaction.
 	 * <p>
 	 * @implSpec performs actions in a new thread
@@ -1422,6 +1564,11 @@ public class Controller extends Thread {
 			// If this is an ARBITRARY transaction, we may need to update the cache
 			if (transactionData.getType() == TransactionType.ARBITRARY) {
 				ArbitraryDataManager.getInstance().onExpiredArbitraryTransaction((ArbitraryTransactionData)transactionData);
+			}
+
+			// If this is a CHAT transaction, evict its timestamp from the rate-limit cache
+			if (transactionData.getType() == TransactionType.CHAT) {
+				ChatTransaction.removeExpiredChatTimestamp(transactionData.getCreatorPublicKey(), transactionData.getTimestamp());
 			}
 		});
 	}
@@ -1452,6 +1599,10 @@ public class Controller extends Thread {
 			case GET_BLOCK:
 				onNetworkGetBlockMessage(peer, message);
 				break;
+
+            case GET_BLOCKS:
+                onNetworkGetBlocksMessage(peer, message);
+                break;
 
 			case GET_BLOCK_SUMMARIES:
 				onNetworkGetBlockSummariesMessage(peer, message);
@@ -1501,33 +1652,6 @@ public class Controller extends Thread {
 				ForeignFeesManager.getInstance().onNetworkForeignFeesMessage(peer, message);
 				break;
 
-			case GET_ARBITRARY_DATA:
-				// Not currently supported
-				break;
-
-			case ARBITRARY_DATA_FILE_LIST:
-				ArbitraryDataFileListManager.getInstance().onNetworkArbitraryDataFileListMessage(peer, message);
-				break;
-
-			case GET_ARBITRARY_DATA_FILE:
-				ArbitraryDataFileManager.getInstance().onNetworkGetArbitraryDataFileMessage(peer, message);
-				break;
-
-			case GET_ARBITRARY_DATA_FILE_LIST:
-				ArbitraryDataFileListManager.getInstance().onNetworkGetArbitraryDataFileListMessage(peer, message);
-				break;
-
-			case ARBITRARY_SIGNATURES:
-				// Not currently supported
-				break;
-
-			case GET_ARBITRARY_METADATA:
-				ArbitraryMetadataManager.getInstance().onNetworkGetArbitraryMetadataMessage(peer, message);
-				break;
-
-			case ARBITRARY_METADATA:
-				ArbitraryMetadataManager.getInstance().onNetworkArbitraryMetadataMessage(peer, message);
-				break;
 
 			case GET_TRADE_PRESENCES:
 				TradeBot.getInstance().onGetTradePresencesMessage(peer, message);
@@ -1641,26 +1765,39 @@ public class Controller extends Thread {
 
 			for( BlockData blockData : blockDataList) {
 
-				if (PruneManager.getInstance().isBlockPruned(blockData.getHeight())) {
+				try {
+					if (PruneManager.getInstance().isBlockPruned(blockData.getHeight())) {
 
-					// If this is a pruned block, we likely only have partial data, so best not to sent it
-					continue;
-				}
+						// If this is a pruned block, we likely only have partial data, so best not to sent it
+						continue;
+					}
 
-				String signature58 = Base58.encode(blockData.getSignature());
+					String signature58 = Base58.encode(blockData.getSignature());
 
-				PeerMessage peerMessage = toProcessBySignature58.get(signature58);
+					PeerMessage peerMessage = toProcessBySignature58.get(signature58);
 
-				Message message = peerMessage.getMessage();
-				Peer peer = peerMessage.getPeer();
+					Message message = peerMessage.getMessage();
+					Peer peer = peerMessage.getPeer();
 
-				signature58Processed.add(signature58);
+					signature58Processed.add(signature58);
 
-				Block block = new Block(repository, blockData);
+					Block block = new Block(repository, blockData);
 
-				// V2 support
-				if (peer.getPeersVersion() >= BlockV2Message.MIN_PEER_VERSION) {
-					Message blockMessage = new BlockV2Message(block);
+					// V2 support
+					if (peer.getPeersVersion() >= BlockV2Message.MIN_PEER_VERSION) {
+						Message blockMessage = new BlockV2Message(block);
+						blockMessage.setId(message.getId());
+
+						if (!peer.sendMessage(blockMessage)) {
+							peer.disconnect("failed to send block");
+							// Don't fall-through to caching because failure to send might be from failure to build message
+							continue;
+						}
+
+						continue;
+					}
+
+					CachedBlockMessage blockMessage = new CachedBlockMessage(block);
 					blockMessage.setId(message.getId());
 
 					if (!peer.sendMessage(blockMessage)) {
@@ -1669,25 +1806,18 @@ public class Controller extends Thread {
 						continue;
 					}
 
-					continue;
-				}
+					int blockCacheSize = Settings.getInstance().getBlockCacheSize();
 
-				CachedBlockMessage blockMessage = new CachedBlockMessage(block);
-				blockMessage.setId(message.getId());
+					// If request is for a recent block, cache it
+					if (getChainHeight() - blockData.getHeight() <= blockCacheSize) {
+						this.stats.getBlockMessageStats.cacheFills.incrementAndGet();
 
-				if (!peer.sendMessage(blockMessage)) {
-					peer.disconnect("failed to send block");
-					// Don't fall-through to caching because failure to send might be from failure to build message
-					continue;
-				}
-
-				int blockCacheSize = Settings.getInstance().getBlockCacheSize();
-
-				// If request is for a recent block, cache it
-				if (getChainHeight() - blockData.getHeight() <= blockCacheSize) {
-					this.stats.getBlockMessageStats.cacheFills.incrementAndGet();
-
-					this.blockMessageCache.put(ByteArray.wrap(blockData.getSignature()), blockMessage);
+						this.blockMessageCache.put(ByteArray.wrap(blockData.getSignature()), blockMessage);
+					}
+				} catch (IllegalStateException e) {
+					LOGGER.warn(e.getMessage());
+				} catch (Exception e) {
+					LOGGER.error(e.getMessage(), e);
 				}
 			}
 
@@ -1757,6 +1887,59 @@ public class Controller extends Thread {
 			LOGGER.error(e.getMessage(), e);
 		}
 	}
+
+    private void onNetworkGetBlocksMessage(Peer peer, Message message) {
+        GetBlocksMessage getBlocksMessage = (GetBlocksMessage) message;
+        byte[] parentSignature = getBlocksMessage.getParentSignature();
+        this.stats.getBlocksMessageStats.requests.incrementAndGet();
+
+        try (final Repository repository = RepositoryManager.getRepository()) {
+
+            // If peer's parent signature matches our latest block signature
+            // then we can short-circuit with an empty response
+            BlockData chainTip = getChainTip();
+            if (chainTip != null && Arrays.equals(parentSignature, chainTip.getSignature())) {
+                Message blocksMessage = new BlocksMessage(Collections.emptyList());
+                blocksMessage.setId(message.getId());
+                if (!peer.sendMessage(blocksMessage))
+                    peer.disconnect("failed to send blocks");
+
+                return;
+            }
+
+            // Ensure that we don't serve more blocks than the amount specified in the settings
+            // Serializing multiple blocks is very slow, so by default we are using a low limit
+            int blockLimitPerRequest = Settings.getInstance().getMaxBlocksPerResponse();
+            int untrimmedBlockLimitPerRequest = Settings.getInstance().getMaxBlocksPerResponse();
+            int numberRequested = Math.min(blockLimitPerRequest, getBlocksMessage.getNumberRequested());
+
+            List<Block> blocks = new ArrayList<>();
+            BlockData blockData = repository.getBlockRepository().fromReference(parentSignature);
+
+            while (blockData != null && blocks.size() < numberRequested) {
+                // If we're dealing with untrimmed blocks, ensure we don't go above the untrimmedBlockLimitPerRequest
+                if (blockData.isTrimmed() == false && blocks.size() >= untrimmedBlockLimitPerRequest) {
+                    break;
+                }
+                Block block = new Block(repository, blockData);
+                blocks.add(block);
+                blockData = repository.getBlockRepository().fromReference(blockData.getSignature());
+            }
+
+            Message blocksMessage = new BlocksMessage(blocks);
+            blocksMessage.setId(message.getId());
+            try {
+                if (!peer.sendMessageWithTimeout(blocksMessage, FETCH_BLOCKS_TIMEOUT))
+                    peer.disconnect("failed to send blocks");
+            } catch (java.io.IOException e) {
+                // Socket closed - peer already disconnected
+                LOGGER.debug("Socket closed while sending blocks to peer {}: {}", peer, e.getMessage());
+            }
+
+        } catch (DataException e) {
+            LOGGER.error(String.format("Repository issue while sending blocks after %s to peer %s", Base58.encode(parentSignature), peer), e);
+        }
+    }
 
 	private void onNetworkGetBlockSummariesMessage(Peer peer, Message message) {
 		GetBlockSummariesMessage getBlockSummariesMessage = (GetBlockSummariesMessage) message;

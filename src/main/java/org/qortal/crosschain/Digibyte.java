@@ -47,6 +47,7 @@ public class Digibyte extends Bitcoiny {
 					// Servers chosen on NO BASIS WHATSOEVER from various sources!
 					// Status verified at https://1209k.com/bitcoin-eye/ele.php?chain=dgb
 					new Server("electrum.qortal.link", Server.ConnectionType.SSL, 55002),
+					new Server("electrum.cipig.net", Server.ConnectionType.SSL, 20059),
 					new Server("electrum1.cipig.net", Server.ConnectionType.SSL, 20059),
 					new Server("electrum2.cipig.net", Server.ConnectionType.SSL, 20059),
 					new Server("electrum3.cipig.net", Server.ConnectionType.SSL, 20059)
@@ -133,14 +134,14 @@ public class Digibyte extends Bitcoiny {
 	// Constructors and instance
 
 	private Digibyte(DigibyteNet digibyteNet, BitcoinyBlockchainProvider blockchain, Context bitcoinjContext, String currencyCode) {
-		super(blockchain, bitcoinjContext, currencyCode, DEFAULT_FEE_PER_KB);
-		this.digibyteNet = digibyteNet;
+        super(blockchain, bitcoinjContext, currencyCode, DEFAULT_FEE_PER_KB);
+        this.digibyteNet = digibyteNet;
 
-		LOGGER.info(() -> String.format("Starting Digibyte support using %s", this.digibyteNet.name()));
+        LOGGER.info(() -> String.format("Starting Digibyte support using %s", this.digibyteNet.name()));
 	}
 
 	public static synchronized Digibyte getInstance() {
-		if (instance == null) {
+		if (instance == null && Settings.getInstance().isWalletEnabled("DGB")) {
 			DigibyteNet digibyteNet = Settings.getInstance().getDigibyteNet();
 
 			BitcoinyBlockchainProvider electrumX = new ElectrumX("Digibyte-" + digibyteNet.name(), digibyteNet.getGenesisHash(), digibyteNet.getServers(), DEFAULT_ELECTRUMX_PORTS);

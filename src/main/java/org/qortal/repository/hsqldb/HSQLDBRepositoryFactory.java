@@ -43,8 +43,10 @@ public class HSQLDBRepositoryFactory implements RepositoryFactory {
 		this.connectionUrl = connectionUrl;
 
 		// Check no-one else is accessing database
+		LOGGER.info("Opening database connection (this may take a while if replaying transaction logs)...");
 		try (Connection connection = DriverManager.getConnection(this.connectionUrl)) {
 			// We only need to check we can obtain connection. It will be auto-closed.
+			LOGGER.info("Database connection established");
 		} catch (SQLException e) {
 			Throwable cause = e.getCause();
 			if (!(cause instanceof HsqlException))
@@ -137,8 +139,10 @@ public class HSQLDBRepositoryFactory implements RepositoryFactory {
 	}
 
 	private void setupConnection(Connection connection) throws SQLException {
-		// Set transaction level
-		connection.setTransactionIsolation(Connection.TRANSACTION_SERIALIZABLE);
+		// Set transaction level to READ_COMMITTED for better concurrency
+		// SERIALIZABLE was causing excessive serialization failures under concurrent load
+		// Application-level locking (blockchainLock) provides the necessary consensus protection
+		connection.setTransactionIsolation(Connection.TRANSACTION_READ_COMMITTED);
 		connection.setAutoCommit(false);
 	}
 

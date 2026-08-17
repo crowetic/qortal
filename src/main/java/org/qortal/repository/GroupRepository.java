@@ -2,7 +2,9 @@ package org.qortal.repository;
 
 import org.qortal.data.group.*;
 
+import java.util.Collection;
 import java.util.List;
+import java.util.Set;
 
 public interface GroupRepository {
 
@@ -17,6 +19,8 @@ public interface GroupRepository {
 	public boolean groupExists(String groupName) throws DataException;
 
 	public boolean reducedGroupNameExists(String reducedGroupName) throws DataException;
+
+	public List<GroupBalanceData> getGroupMemberBalances(Integer limit, Integer offset, Boolean reverse) throws DataException;
 
 	public List<GroupData> getAllGroups(Integer limit, Integer offset, Boolean reverse) throws DataException;
 
@@ -34,6 +38,12 @@ public interface GroupRepository {
 
 	public default List<GroupData> getGroupsWithMember(String member) throws DataException {
 		return getGroupsWithMember(member, null, null, null);
+	}
+
+	public List<GroupData> getGroupsByAdmin(String address, Integer limit, Integer offset, Boolean reverse) throws DataException;
+
+	public default List<GroupData> getGroupsByAdmin(String address) throws DataException {
+		return getGroupsByAdmin(address, null, null, null);
 	}
 
 	public void save(GroupData groupData) throws DataException;
@@ -54,6 +64,8 @@ public interface GroupRepository {
 
 	public boolean adminExists(int groupId, String address) throws DataException;
 
+	public Set<String> getGroupAdminAddresses(int groupId, Collection<String> addresses) throws DataException;
+
 	public List<GroupAdminData> getGroupAdmins(int groupId, Integer limit, Integer offset, Boolean reverse) throws DataException;
 
 	public default List<GroupAdminData> getGroupAdmins(int groupId) throws DataException {
@@ -73,11 +85,15 @@ public interface GroupRepository {
 
 	public boolean memberExists(int groupId, String address) throws DataException;
 
+	public Set<String> getGroupMemberAddresses(int groupId, Collection<String> addresses) throws DataException;
+
 	public List<GroupMemberData> getGroupMembers(int groupId, Integer limit, Integer offset, Boolean reverse) throws DataException;
 
 	public default List<GroupMemberData> getGroupMembers(int groupId) throws DataException {
 		return getGroupMembers(groupId, null, null, null);
 	}
+
+	List<GroupMemberData> getAllGroupMemberships() throws DataException;
 
 	/** Returns number of group members, or null if group doesn't exist */
 	public Integer countGroupMembers(int groupId) throws DataException;
@@ -120,6 +136,9 @@ public interface GroupRepository {
 		return getGroupJoinRequests(groupId, null, null, null);
 	}
 
+	/** Returns all join requests for the given group IDs in one query. Order: by group_id, then joiner. */
+	public List<GroupJoinRequestData> getJoinRequestsByGroupIds(List<Integer> groupIds) throws DataException;
+
 	public List<GroupJoinRequestData> getJoinRequestsByJoiner(String joiner, Integer limit, Integer offset, Boolean reverse) throws DataException;
 
 	public default List<GroupJoinRequestData> getJoinRequestsByJoiner(String joiner) throws DataException {
@@ -149,8 +168,15 @@ public interface GroupRepository {
 		return getGroupBans(groupId, null, null, null);
 	}
 
+    List<GroupMemberTransactionCounterData> getBanCountsForYear(int year, Integer limit, Integer offset) throws DataException;
+
+	List<GroupMemberTransactionCounterData> getKickCountsForYear(int year, Integer limit, Integer offset) throws DataException;
+
+	List<GroupMemberTransactionCounterData> getJoinCountsForYear(int year, Integer limit, Integer offset) throws DataException;
+
+	List<GroupMemberTransactionCounterData> getLeaveCountsForYear(int year, Integer limit, Integer offset) throws DataException;
+
 	public void save(GroupBanData groupBanData) throws DataException;
 
 	public void deleteBan(int groupId, String offender) throws DataException;
-
 }

@@ -1,5 +1,7 @@
 # Qortal Project - Qortal Core - Primary Repository
-The Qortal Core is the blockchain and node component of the overall project. It contains the primary API, and ability to make calls to create transactions, and interact with the Qortal Blockchain Network. 
+The Qortal Core is the blockchain and node component of the overall project. It contains the primary API, ability to make API calls to create transactions, publish data to QDN, and interact with the Qortal Blockchain Network. The Qortal Core does not maintain any private information such as private keys, thus creating essentially an 'air gapped by default' environment. Qortal Hub, the current 'primary' interface for the project, maintains encrypted private keys and submits only signed transactions to the Qortal Core for processing. 
+
+Qortal's model is decentralization (distributed/decentralized) first, meaning the primary method of accessing and utilizing the network, is to install the Qortal Core and Qortal Hub on a computer, and access by communication only to your local system.
 
 In order to run the Qortal Core, a machine with java 11+ installed is required. Minimum RAM specs will vary depending on settings, but as low as 4GB of RAM should be acceptable in most scenarios. 
 
@@ -9,7 +11,7 @@ Qortal contains extensive functionality geared toward complete decentralization 
 
 Over time Qortal has progressed into a fully featured environment catering to any and all types of people and organizations, and will continue to advance as time goes on. Brining more features, capability, device support, and availale replacements for web2.0. Ultimately building a new, completely user-controlled digital world without limits. 
 
-Qortal has no owner, no company on top of it, and is completely community built, run, and funded. A community-established and run group of developers known as the 'dev-group' or Qortal Development Group, make group_approval based decisions for the project's future. If you are a developer interested in assisting with the project, you meay reach out to the Qortal Development Group in any of the available Qortal community locations. Either on the Qortal network itself, or on one of the temporary centralized social media locations. 
+Qortal has no owner, no company on top of it, and is completely community built, run, and funded. A community-established and run group of developers known as the 'dev-group' or 'Qortal Development Group', make GROUP_APPROVAL based decisions for the project's future. If you are a developer interested in assisting with the project, you may reach out to the Qortal Development Group in any of the available Qortal community locations. Either on the Qortal network itself, or on one of the temporary centralized social media locations. 
 
 Building the future one block at a time. Welcome to Qortal. 
 
@@ -26,6 +28,21 @@ Building the future one block at a time. Welcome to Qortal.
 - Run JAR in same working directory as *settings.json*: `java -jar target/qortal-1.0.jar`
 - Wrap in shell script, add JVM flags, redirection, backgrounding, etc. as necessary.
 - Or use supplied example shell script: *start.sh*
+
+## Docker Build / Run
+
+- Copy env template: `cp .env.example .env`
+- Build and start with host port publishing (default): `docker compose up -d --build`
+- Internal Docker network only (no host port publishing): `docker compose -f docker-compose.internal.yml up -d --build`
+- Stop container: `docker compose down`
+- Node data and *settings.json* are stored in: `./data/qortal`
+- JVM start arguments file is stored in: `./data/qortal/start-arguments.txt`
+  - Default content: `-XX:MaxRAMPercentage=25 -XX:+UseG1GC -Xss1024k`
+  - Edit this file and restart the container to apply memory/runtime argument changes
+- Follow logs: `docker compose logs -f qortal`
+- Network name can be set using `QORTAL_NETWORK_NAME` in `.env`
+- Port source of truth is `./data/qortal/settings.json`; keep `.env` `QORTAL_API_PORT` / `QORTAL_P2P_PORT` / `QORTAL_QDN_PORT` in sync
+- If other containers need API access, update API whitelist in `settings.json` (by default only loopback is allowed)
 
 ## IntelliJ IDEA Configuration
 
@@ -50,7 +67,8 @@ https://qortal.dev contains dev documentation for building JS/React (and other c
 If the project interests you, you may learn more from the various web2 and QDN based websites focused on introductory information. 
 
 https://qortal.org - primary internet presence 
-https://qortal.dev - secondary and development focused website with links to many new developments and documentation
+https://qortal.dev - new primary project site 
 https://wiki.qortal.org - community built and managed wiki with detailed information regarding the project
+https://qortal.dev/wiki - a simpler setup-focused wiki
 
 links to telegram and discord communities are at the top of https://qortal.org as well. 

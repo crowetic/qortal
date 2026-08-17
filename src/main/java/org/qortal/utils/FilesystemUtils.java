@@ -2,6 +2,8 @@ package org.qortal.utils;
 
 import org.apache.commons.io.FileUtils;
 import org.apache.commons.lang3.ArrayUtils;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.qortal.settings.Settings;
 
 import java.io.File;
@@ -10,8 +12,12 @@ import java.io.InputStream;
 import java.io.RandomAccessFile;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
+import java.nio.file.attribute.BasicFileAttributes;
+import java.util.stream.Stream;
 
 public class FilesystemUtils {
+
+    private static final Logger LOGGER = LogManager.getLogger(FilesystemUtils.class);
 
     public static boolean isDirectoryEmpty(Path path) throws IOException {
         if (Files.isDirectory(path)) {
@@ -208,13 +214,27 @@ public class FilesystemUtils {
     }
 
     public static long getDirectorySize(Path path) throws IOException {
+        return getDirectorySize(path, false);
+    }
+
+    public static long getDirectorySize(Path path, boolean excludeQortalDirectory) throws IOException {
         if (path == null || !Files.exists(path)) {
             return 0L;
         }
         return Files.walk(path)
                 .filter(p -> p.toFile().isFile())
+                .filter(p -> !excludeQortalDirectory || !isQortalMetadataPath(p))
                 .mapToLong(p -> p.toFile().length())
                 .sum();
+    }
+
+    private static boolean isQortalMetadataPath(Path path) {
+        for (Path part : path) {
+            if (".qortal".equals(part.toString())) {
+                return true;
+            }
+        }
+        return false;
     }
 
 
@@ -317,4 +337,67 @@ public class FilesystemUtils {
         return (lastCharacter.equals("\n") || lastCharacter.equals("\r"));
     }
 
+    public static boolean isFileRecent(Path filePath, long now, long cleanupAfter) {
+        try {
+            BasicFileAttributes attr = Files.readAttributes(filePath, BasicFileAttributes.class);
+            long timeSinceCreated = now - attr.creationTime().toMillis();
+            long timeSinceModified = now - attr.lastModifiedTime().toMillis();
+
+
+            // Check if the file has been created or modified recently
+            if (timeSinceCreated > cleanupAfter) {
+                return false;
+            }
+            if (timeSinceModified > cleanupAfter) {
+                return false;
+            }
+
+        } catch (IOException e) {
+            // Can't read file attributes, so assume it's recent so that we don't delete something accidentally
+        }
+        return true;
+    }
+
+    public static void deleteFilesByTime(Path directory, long now, long minAge) throws IOException {
+        try (Stream<Path> paths = Files.list(directory)) {
+            paths.filter(path -> !isFileRecent(path, now, minAge))
+                    .forEach(path -> {
+                        try {
+                            Files.delete(path);
+                            LOGGER.debug("deleted {}", path);
+                        } catch (IOException e) {
+                            LOGGER.warn("failed to delete {}", path);
+                        }
+                    });
+        }
+    }
+
+    /**
+     * Get Disk Usage
+     *
+     * @param file the file
+     *
+     * @return the size in bytes, zero if an i/o exception is thrown
+     */
+    public static long getDiskUsage(File file) {
+        try {
+            // Logical file size in bytes
+            long logicalSize = file.length();
+
+            // Get file store information to estimate actual disk usage
+            Path path = Paths.get(file.getAbsolutePath());
+            FileStore store = Files.getFileStore(path);
+
+            // Get cluster/allocation unit size
+            long blockSize = store.getBlockSize();
+
+            // Calculate approximate actual disk usage
+            long blocksUsed = (logicalSize + blockSize - 1) / blockSize; // Ceiling division
+            long actualDiskUsage = blocksUsed * blockSize;
+
+            return actualDiskUsage;
+        } catch (IOException e) {
+            return 0;
+        }
+    }
 }

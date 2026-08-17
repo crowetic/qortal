@@ -35,6 +35,8 @@ public class PirateLightClient extends BitcoinyBlockchainProvider {
 
 	private static final int RESPONSE_TIME_READINGS = 5;
 	private static final long MAX_AVG_RESPONSE_TIME = 500L; // ms
+	private static final int MAX_INBOUND_MESSAGE_BYTES = 16 * 1024 * 1024;
+	private static final int MAX_INBOUND_METADATA_BYTES = 8 * 1024;
 	private static final ChainSpec DEFAULT_CHAIN_SPEC = ChainSpec.newBuilder().build();
 	private static final int MAX_SERVER_HEIGHT_BEHIND = 100_000; // avoid connecting to servers that lag far behind the
 																																// best known height
@@ -659,6 +661,14 @@ public class PirateLightClient extends BitcoinyBlockchainProvider {
 		return this.recorder.getConnections();
 	}
 
+	public int getConnectedServerCount() {
+		return this.currentServer != null && this.channel != null && !this.channel.isShutdown() ? 1 : 0;
+	}
+
+	public int getKnownServerCount() {
+		return this.servers.size();
+	}
+
 	@Override
 	public ChainableServer getServer(String hostName, ChainableServer.ConnectionType type, int port) {
 		return new PirateLightClient.Server(hostName, type, port);
@@ -780,10 +790,17 @@ public class PirateLightClient extends BitcoinyBlockchainProvider {
 		LOGGER.info(() -> String.format("Connecting to %s", server));
 
 		try {
-			this.channel = ManagedChannelBuilder.forAddress(server.getHostName(), server.getPort()).build();
+			ManagedChannelBuilder<?> channelBuilder = ManagedChannelBuilder.forAddress(server.getHostName(), server.getPort());
+			channelBuilder.maxInboundMessageSize(MAX_INBOUND_MESSAGE_BYTES);
+			channelBuilder.maxInboundMetadataSize(MAX_INBOUND_METADATA_BYTES);
+			if (server.getConnectionType() == ChainableServer.ConnectionType.SSL)
+				channelBuilder.useTransportSecurity();
+			else
+				channelBuilder.usePlaintext();
 
+			this.channel = channelBuilder.build();
 			CompactTxStreamerGrpc.CompactTxStreamerBlockingStub stub = CompactTxStreamerGrpc.newBlockingStub(this.channel);
-			LightdInfo lightdInfo = stub.getLightdInfo(Empty.newBuilder().build());
+			LightdInfo lightdInfo = stub.withDeadlineAfter(10, TimeUnit.SECONDS).getLightdInfo(Empty.newBuilder().build());
 
 			if (lightdInfo == null || lightdInfo.getBlockHeight() <= 0)
 				return Optional.of(this.recorder.recordConnection(server, requestedBy, true, false, "lightd info issues"));

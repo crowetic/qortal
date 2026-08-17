@@ -1,16 +1,14 @@
 package org.qortal.api.websocket;
 
 import org.eclipse.jetty.websocket.api.Session;
-import org.eclipse.jetty.websocket.api.WebSocketException;
+import org.eclipse.jetty.websocket.api.WriteCallback;
 import org.eclipse.jetty.websocket.api.annotations.*;
-import org.eclipse.jetty.websocket.servlet.WebSocketServletFactory;
+import org.eclipse.jetty.websocket.server.JettyWebSocketServletFactory;
 import org.qortal.controller.ChatNotifier;
+import org.qortal.controller.ChatTransactionDelegate;
 import org.qortal.crypto.Crypto;
 import org.qortal.data.chat.ActiveChats;
 import org.qortal.data.transaction.ChatTransactionData;
-import org.qortal.repository.DataException;
-import org.qortal.repository.Repository;
-import org.qortal.repository.RepositoryManager;
 
 import java.io.IOException;
 import java.io.StringWriter;
@@ -25,14 +23,20 @@ import static org.qortal.data.chat.ChatMessage.Encoding;
 @SuppressWarnings("serial")
 public class ActiveChatsWebSocket extends ApiWebSocket {
 
+	/**
+	 * Jetty 10 implementation of configure.
+	 * This maps the current servlet instance to the websocket upgrade path.
+	 */
 	@Override
-	public void configure(WebSocketServletFactory factory) {
-		factory.register(ActiveChatsWebSocket.class);
+	protected void configure(JettyWebSocketServletFactory factory) {
+		factory.addMapping("/", (req, res) -> this);
 	}
 
 	@OnWebSocketConnect
 	@Override
 	public void onWebSocketConnect(Session session) {
+		super.onWebSocketConnect(session);
+
 		Map<String, String> pathParams = getPathParams(session, "/{address}");
 
 		String address = pathParams.get("address");
@@ -53,6 +57,8 @@ public class ActiveChatsWebSocket extends ApiWebSocket {
 	@Override
 	public void onWebSocketClose(Session session, int statusCode, String reason) {
 		ChatNotifier.getInstance().deregister(session);
+		// Parent class cleanup
+		super.onWebSocketClose(session, statusCode, reason);
 	}
 
 	@OnWebSocketError
@@ -63,7 +69,7 @@ public class ActiveChatsWebSocket extends ApiWebSocket {
 	@OnWebSocketMessage
 	public void onWebSocketMessage(Session session, String message) {
 		if (Objects.equals(message, "ping")) {
-			session.getRemote().sendStringByFuture("pong");
+			session.getRemote().sendString("pong", WriteCallback.NOOP);
 		}
 	}
 
@@ -76,10 +82,10 @@ public class ActiveChatsWebSocket extends ApiWebSocket {
 				return;
 		}
 
-		try (final Repository repository = RepositoryManager.getRepository()) {
+		try {
 			Boolean hasChatReference = getHasChatReference(session);
 
-			ActiveChats activeChats = repository.getChatRepository().getActiveChats(ourAddress, getTargetEncoding(session), hasChatReference);
+			ActiveChats activeChats = ChatTransactionDelegate.getInstance().getActiveChats(ourAddress, getTargetEncoding(session), hasChatReference);
 
 			StringWriter stringWriter = new StringWriter();
 
@@ -91,9 +97,13 @@ public class ActiveChatsWebSocket extends ApiWebSocket {
 				return;
 
 			previousOutput.set(output);
-			session.getRemote().sendStringByFuture(output);
-		} catch (DataException | IOException | WebSocketException e) {
-			// No output this time?
+
+			// Ensure session is still open before sending
+			if (session.isOpen()) {
+				session.getRemote().sendString(output, WriteCallback.NOOP);
+			}
+		} catch (IOException e) {
+			// No output this time
 		}
 	}
 
@@ -102,13 +112,17 @@ public class ActiveChatsWebSocket extends ApiWebSocket {
 		Map<String, List<String>> queryParams = session.getUpgradeRequest().getParameterMap();
 		List<String> encodingList = queryParams.get("encoding");
 		String encoding = (encodingList != null && encodingList.size() == 1) ? encodingList.get(0) : "BASE58";
-		return Encoding.valueOf(encoding);
+		try {
+			return Encoding.valueOf(encoding);
+		} catch (IllegalArgumentException e) {
+			return Encoding.BASE58;
+		}
 	}
 
 	private Boolean getHasChatReference(Session session) {
 		Map<String, List<String>> queryParams = session.getUpgradeRequest().getParameterMap();
 		List<String> hasChatReferenceList = queryParams.get("haschatreference");
-	
+
 		// Return null if not specified
 		if (hasChatReferenceList != null && hasChatReferenceList.size() == 1) {
 			String value = hasChatReferenceList.get(0).toLowerCase();
@@ -120,5 +134,4 @@ public class ActiveChatsWebSocket extends ApiWebSocket {
 		}
 		return null; // Ignored if not present
 	}
-
 }

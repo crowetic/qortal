@@ -419,8 +419,8 @@ public class Block {
 		else if (isOnlineAccountsBlock(height)) {
 			// Standard online accounts block - add online accounts in regular way
 
-			// Fetch our list of online accounts, removing any that are missing a nonce
-			List<OnlineAccountData> onlineAccounts = OnlineAccountsManager.getInstance().getOnlineAccounts(onlineAccountsTimestamp);
+			// Fetch accounts with signatures valid for this block height, then remove any missing a nonce.
+			List<OnlineAccountData> onlineAccounts = OnlineAccountsManager.getInstance().getOnlineAccounts(onlineAccountsTimestamp, height);
 			onlineAccounts.removeIf(a -> a.getNonce() == null || a.getNonce() < 0);
 
 			// After feature trigger, remove any online accounts that are level 0
@@ -453,8 +453,25 @@ public class Block {
 			}
 
 			if (onlineAccounts.isEmpty()) {
-				LOGGER.debug("No online accounts - not even our own?");
-				return null;
+				// new v5.1.0, don't fail (25 blocks before payout) when isSingleNodeTestnet == true
+				if (Settings.getInstance().isSingleNodeTestnet()) {
+					Integer nonce = new Random().nextInt(500000);
+					byte[] timestampBytes = Longs.toByteArray(onlineAccountsTimestamp);
+					// Even single-node fallback blocks must use the signature scheme active at this height.
+					byte[] signature = OnlineAccountsManager.isSignatureV2Active(height)
+							? Qortal25519Extras.sign(minter.getPrivateKey(), timestampBytes)
+							: Qortal25519Extras.signForAggregation(minter.getPrivateKey(), timestampBytes);
+					byte[] publicKey = minter.getPublicKey();
+					OnlineAccountData me = new OnlineAccountData(
+							NTP.getTime(),
+							signature,
+							publicKey,
+							nonce);
+					onlineAccounts.add(me);	// safe to add because isEmpty
+				} else {
+					LOGGER.error("No online accounts - not even our own?; We will fail to Mint!");
+					return null;
+				}
 			}
 
 			// Load sorted list of reward share public keys into memory, so that the indexes can be obtained.
@@ -481,25 +498,30 @@ public class Block {
 			encodedOnlineAccounts = BlockTransformer.encodeOnlineAccounts(onlineAccountsSet);
 			onlineAccountsCount = onlineAccountsSet.size();
 
-			// Collate all signatures
-			Collection<byte[]> signaturesToAggregate = indexedOnlineAccounts.values()
-					.stream()
-					.map(OnlineAccountData::getSignature)
-					.collect(Collectors.toList());
+			// After the signature V2 height we store each account's signature individually
+			// (secure per-account Ed25519), otherwise the legacy forgeable aggregate single signature.
+			boolean signatureV2 = OnlineAccountsManager.isSignatureV2Active(height);
 
-			// Aggregated, single signature
-			onlineAccountsSignatures = Qortal25519Extras.aggregateSignatures(signaturesToAggregate);
+			// Build ordered lists of signatures and nonces, in account-index order, so that block
+			// validation can pair each signature/nonce with the correct reward-share public key.
+			List<byte[]> orderedSignatures = new ArrayList<>();
+			List<Integer> nonces = new ArrayList<>();
+			for (int i = 0; i < onlineAccountsCount; ++i) {
+				Integer accountIndex = accountIndexes.get(i);
+				OnlineAccountData onlineAccountData = indexedOnlineAccounts.get(accountIndex);
+				orderedSignatures.add(onlineAccountData.getSignature());
+				nonces.add(onlineAccountData.getNonce());
+			}
+
+			if (signatureV2)
+				// Per-account standard Ed25519 signatures, stored individually
+				onlineAccountsSignatures = BlockTransformer.encodeTimestampSignatures(orderedSignatures);
+			else
+				// Legacy aggregated, single signature
+				onlineAccountsSignatures = Qortal25519Extras.aggregateSignatures(orderedSignatures);
 
 			// Add nonces to the end of the online accounts signatures
 			try {
-				// Create ordered list of nonce values
-				List<Integer> nonces = new ArrayList<>();
-				for (int i = 0; i < onlineAccountsCount; ++i) {
-					Integer accountIndex = accountIndexes.get(i);
-					OnlineAccountData onlineAccountData = indexedOnlineAccounts.get(accountIndex);
-					nonces.add(onlineAccountData.getNonce());
-				}
-
 				// Encode the nonces to a byte array
 				byte[] encodedNonces = BlockTransformer.encodeOnlineAccountNonces(nonces);
 
@@ -1204,22 +1226,28 @@ public class Block {
 		if (this.blockData.getOnlineAccountsSignatures() == null || this.blockData.getOnlineAccountsSignatures().length == 0)
 			return ValidationResult.ONLINE_ACCOUNT_SIGNATURES_MISSING;
 
-		final int signaturesLength = Transformer.SIGNATURE_LENGTH;
+		// Check signatures
+		long onlineTimestamp = this.blockData.getOnlineAccountsTimestamp();
+		byte[] onlineTimestampBytes = Longs.toByteArray(onlineTimestamp);
+
+		// After the signature V2 height, each online account carries its own standard Ed25519
+		// signature; before it, a single legacy aggregate signature covers the whole set.
+		boolean signatureV2 = OnlineAccountsManager.isSignatureV2Active(this.blockData.getHeight());
+
+		final int signaturesLength = signatureV2
+				? onlineRewardShares.size() * Transformer.SIGNATURE_LENGTH
+				: Transformer.SIGNATURE_LENGTH;
 		final int noncesLength = onlineRewardShares.size() * Transformer.INT_LENGTH;
 
 		// We expect nonces to be appended to the online accounts signatures
 		if (this.blockData.getOnlineAccountsSignatures().length != signaturesLength + noncesLength)
 			return ValidationResult.ONLINE_ACCOUNT_SIGNATURES_MALFORMED;
 
-		// Check signatures
-		long onlineTimestamp = this.blockData.getOnlineAccountsTimestamp();
-		byte[] onlineTimestampBytes = Longs.toByteArray(onlineTimestamp);
-
 		byte[] encodedOnlineAccountSignatures = this.blockData.getOnlineAccountsSignatures();
 
 		// Split online account signatures into signature(s) + nonces, then validate the nonces
 		byte[] extractedSignatures = BlockTransformer.extract(encodedOnlineAccountSignatures, 0, signaturesLength);
-		byte[] extractedNonces = BlockTransformer.extract(encodedOnlineAccountSignatures, signaturesLength, onlineRewardShares.size() * Transformer.INT_LENGTH);
+		byte[] extractedNonces = BlockTransformer.extract(encodedOnlineAccountSignatures, signaturesLength, noncesLength);
 		encodedOnlineAccountSignatures = extractedSignatures;
 
 		List<Integer> nonces = BlockTransformer.decodeOnlineAccountNonces(extractedNonces);
@@ -1237,10 +1265,11 @@ public class Block {
 		// Remove those already validated & cached by online accounts manager - no need to re-validate them
 		OnlineAccountsManager.getInstance().removeKnown(onlineAccounts, onlineTimestamp);
 
-		// Validate the rest
-		for (OnlineAccountData onlineAccount : onlineAccounts)
-			if (!OnlineAccountsManager.getInstance().verifyMemoryPoW(onlineAccount, null))
-				return ValidationResult.ONLINE_ACCOUNT_NONCE_INCORRECT;
+		// Validate the rest : v5.1.0 Added enhanced speed processing for SingleTestNet Node
+		if(!Settings.getInstance().isSingleNodeTestnet())
+			for (OnlineAccountData onlineAccount : onlineAccounts)
+				if (!OnlineAccountsManager.getInstance().verifyMemoryPoW(onlineAccount, null))
+					return ValidationResult.ONLINE_ACCOUNT_NONCE_INCORRECT;
 
 		// Cache the valid online accounts as they will likely be needed for the next block
 		OnlineAccountsManager.getInstance().addBlocksOnlineAccounts(onlineAccounts, onlineTimestamp);
@@ -1248,18 +1277,33 @@ public class Block {
 		// Extract online accounts' timestamp signatures from block data. Only one signature if aggregated.
 		List<byte[]> onlineAccountsSignatures = BlockTransformer.decodeTimestampSignatures(encodedOnlineAccountSignatures);
 
-		// Aggregate all public keys
-		Collection<byte[]> publicKeys = onlineRewardShares.stream()
-				.map(RewardShareData::getRewardSharePublicKey)
-				.collect(Collectors.toList());
+		if (signatureV2) {
+			// Secure scheme: verify each account's standard Ed25519 signature against its own public key.
+			// Signatures are stored in the same account-index order as onlineRewardShares.
+			if (onlineAccountsSignatures.size() != onlineRewardShares.size())
+				return ValidationResult.ONLINE_ACCOUNT_SIGNATURES_MALFORMED;
 
-		byte[] aggregatePublicKey = Qortal25519Extras.aggregatePublicKeys(publicKeys);
+			for (int i = 0; i < onlineRewardShares.size(); ++i) {
+				byte[] publicKey = onlineRewardShares.get(i).getRewardSharePublicKey();
+				byte[] signature = onlineAccountsSignatures.get(i);
 
-		byte[] aggregateSignature = onlineAccountsSignatures.get(0);
+				if (!OnlineAccountsManager.getInstance().verifyOrCacheV2OnlineAccountSignature(publicKey, signature, onlineTimestamp))
+					return ValidationResult.ONLINE_ACCOUNT_SIGNATURE_INCORRECT;
+			}
+		} else {
+			// Legacy scheme: aggregate all public keys and do one-step aggregate verification.
+			Collection<byte[]> publicKeys = onlineRewardShares.stream()
+					.map(RewardShareData::getRewardSharePublicKey)
+					.collect(Collectors.toList());
 
-		// One-step verification of aggregate signature using aggregate public key
-		if (!Qortal25519Extras.verifyAggregated(aggregatePublicKey, aggregateSignature, onlineTimestampBytes))
-			return ValidationResult.ONLINE_ACCOUNT_SIGNATURE_INCORRECT;
+			byte[] aggregatePublicKey = Qortal25519Extras.aggregatePublicKeys(publicKeys);
+
+			byte[] aggregateSignature = onlineAccountsSignatures.get(0);
+
+			// One-step verification of aggregate signature using aggregate public key
+			if (!Qortal25519Extras.verifyAggregated(aggregatePublicKey, aggregateSignature, onlineTimestampBytes))
+				return ValidationResult.ONLINE_ACCOUNT_SIGNATURE_INCORRECT;
+		}
 
 		// All online accounts valid, so save our list of online accounts for potential later use
 		this.cachedOnlineRewardShares = onlineRewardShares;
@@ -1347,6 +1391,10 @@ public class Block {
 			// Create repository savepoint here so we can rollback to it after testing transactions
 			repository.setSavepoint();
 
+			// Set current block context so GROUP_APPROVAL can resolve same-block pending transactions
+			// (they are not in the repository yet during validation)
+			BlockValidationContext.set(this.getTransactions().stream().map(Transaction::getTransactionData).collect(Collectors.toList()));
+
 			if (!isTestnet) {
 				if (this.blockData.getHeight() == 212937) {
 					// Apply fix for block 212937 but fix will be rolled back before we exit method
@@ -1432,6 +1480,8 @@ public class Block {
 			LOGGER.info("DataException during transaction validation", e);
 			return ValidationResult.TRANSACTION_INVALID;
 		} finally {
+			// Always clear block validation context so ThreadLocal is never left set
+			BlockValidationContext.clear();
 			// Rollback repository changes made by test-processing transactions above
 			try {
 				this.repository.rollbackToSavepoint();
@@ -1674,7 +1724,8 @@ public class Block {
 		// Also update "transaction participants" in repository for "transactions involving X" support in API
 		linkTransactionsToBlock();
 
-		postBlockTidy();
+        if(blockchainHeight % 100 == 0) // Only sweep the balance table once every 100 blocks for 0 balances
+		    postBlockTidy();
 
 		// Log some debugging info relating to the block weight calculation
 		this.logDebugInfo();
@@ -1879,6 +1930,11 @@ public class Block {
 
 	protected void processAtFeesAndStates() throws DataException {
 		ATRepository atRepository = this.repository.getATRepository();
+
+		// Safety check: ourAtStates should have been populated during validation
+		if (this.ourAtStates == null) {
+			throw new IllegalStateException("Cannot process AT fees and states: ourAtStates is null. Block validation may have failed.");
+		}
 
 		for (ATStateData atStateData : this.ourAtStates) {
 			Account atAccount = new Account(this.repository, atStateData.getATAddress());
@@ -2553,9 +2609,9 @@ public class Block {
 						.map(GroupAdminData::getAdmin)
 						.collect(Collectors.toList());
 
-				LOGGER.info("Removing NULL Account Address, Dev Admin Count = {}", devAdminAddresses.size());
+				LOGGER.debug("Removing NULL Account Address, Dev Admin Count = {}", devAdminAddresses.size());
 				devAdminAddresses.removeIf( address -> Group.NULL_OWNER_ADDRESS.equals(address) );
-				LOGGER.info("Removed NULL Account Address, Dev Admin Count = {}", devAdminAddresses.size());
+				LOGGER.debug("Removed NULL Account Address, Dev Admin Count = {}", devAdminAddresses.size());
 
 				BlockRewardDistributor devAdminDistributor
 					= (distributionAmount, balanceChanges) -> distributeToAccounts(distributionAmount, devAdminAddresses, balanceChanges);

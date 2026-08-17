@@ -17,6 +17,8 @@ import org.qortal.api.ApiExceptionFactory;
 import org.qortal.api.Security;
 import org.qortal.api.model.crosschain.PirateChainBalance;
 import org.qortal.api.model.crosschain.PirateChainSendRequest;
+import org.qortal.api.model.crosschain.ForeignCoinStatus;
+import org.qortal.controller.PirateChainWalletController;
 import org.qortal.crosschain.ChainableServer;
 import org.qortal.crosschain.ForeignBlockchainException;
 import org.qortal.crosschain.PirateChain;
@@ -25,6 +27,7 @@ import org.qortal.crosschain.ServerConnectionInfo;
 import org.qortal.crosschain.ServerInfo;
 import org.qortal.crosschain.SimpleTransaction;
 import org.qortal.crosschain.ServerConfigurationInfo;
+import org.qortal.settings.Settings;
 
 import javax.servlet.http.HttpServletRequest;
 import javax.ws.rs.GET;
@@ -49,6 +52,37 @@ public class CrossChainPirateChainResource {
 	HttpServletRequest request;
 	@Context
 	HttpHeaders headers;
+
+	@GET
+	@Path("/status")
+	@Operation(summary = "Returns wallet and lightwallet-server status", responses = {
+			@ApiResponse(content = @Content(schema = @Schema(implementation = ForeignCoinStatus.class)))
+	})
+	public ForeignCoinStatus getPirateStatus() {
+		PirateChainWalletController walletController = PirateChainWalletController.getInstance();
+		PirateChain pirateChain = PirateChain.getInstance();
+		int connections = 0;
+		int known = 0;
+		if (pirateChain.getBlockchainProvider() instanceof PirateLightClient) {
+			PirateLightClient lightClient = (PirateLightClient) pirateChain.getBlockchainProvider();
+			connections = lightClient.getConnectedServerCount();
+			known = lightClient.getKnownServerCount();
+		}
+		return new ForeignCoinStatus(walletController != null, connections, known);
+	}
+
+	@POST
+	@Path("/start")
+	@Operation(summary = "Enables and starts the Pirate Chain wallet controller")
+	@SecurityRequirement(name = "apiKey")
+	public String startPirateChainWallet(@HeaderParam(Security.API_KEY_HEADER) String apiKey) {
+		Security.checkApiCallAllowed(request);
+		Settings.getInstance().enableWallet("ARRR");
+		PirateChainWalletController walletController = PirateChainWalletController.getInstance();
+		if (walletController != null && walletController.getState() == Thread.State.NEW)
+			walletController.start();
+		return Boolean.toString(walletController != null);
+	}
 
 	@GET
 	@Path("/height")

@@ -161,7 +161,7 @@ public class PirateChain extends Bitcoiny {
 	}
 
 	public static synchronized PirateChain getInstance() {
-		if (instance == null) {
+		if (instance == null && Settings.getInstance().isWalletEnabled("ARRR")) {
 			PirateChainNet pirateChainNet = Settings.getInstance().getPirateChainNet();
 
 			BitcoinyBlockchainProvider pirateLightClient = new PirateLightClient("PirateChain-" + pirateChainNet.name(),
