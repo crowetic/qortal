@@ -8,14 +8,14 @@ import org.json.JSONException;
 import org.json.JSONObject;
 import org.qortal.arbitrary.ArbitraryDataFile;
 import org.qortal.arbitrary.ArbitraryDataReader;
-import org.qortal.arbitrary.ArbitraryDataResource;
 import org.qortal.arbitrary.exception.MissingDataException;
+import org.qortal.arbitrary.misc.Service;
 import org.qortal.crosschain.ForeignBlockchainException;
 import org.qortal.crosschain.PirateChain;
 import org.qortal.crosschain.PirateLightClient;
 import org.qortal.crosschain.PirateWallet;
 import org.qortal.crosschain.ChainableServer;
-import org.qortal.data.arbitrary.ArbitraryResourceStatus;
+import org.qortal.crypto.Crypto;
 import org.qortal.data.transaction.ArbitraryTransactionData;
 import org.qortal.data.transaction.TransactionData;
 import org.qortal.network.Network;
@@ -24,10 +24,7 @@ import org.qortal.repository.DataException;
 import org.qortal.repository.Repository;
 import org.qortal.repository.RepositoryManager;
 import org.qortal.settings.Settings;
-import org.qortal.transaction.ArbitraryTransaction;
-import org.qortal.utils.ArbitraryTransactionUtils;
 import org.qortal.utils.Base58;
-import org.qortal.utils.FilesystemUtils;
 import org.qortal.utils.NTP;
 
 import java.io.IOException;
@@ -80,6 +77,9 @@ public class PirateChainWalletController extends Thread {
     private static final long SYNC_STATUS_INIT_TIMEOUT_MS = 30_000L;
     private static final long SYNC_CALL_TIMEOUT_MS = 60_000L;
     private static final int SYNC_STATUS_STALL_THRESHOLD = 8;
+    // Unified Wallet can spend minutes persisting a historical shard-tree batch
+    // without moving the externally reported block height.
+    private static final int UNIFIED_SYNC_STATUS_STALL_THRESHOLD = 72;
     private static final int SYNC_STATUS_IDLE_THRESHOLD = 5;
     private static final int SYNC_STATUS_REPEAT_THRESHOLD = 5;
     private static final long SYNC_STATUS_ROTATE_COOLDOWN_MS = 5 * 60 * 1000L;
@@ -110,7 +110,12 @@ public class PirateChainWalletController extends Thread {
     private volatile boolean restartRequested = false;
     private volatile String restartReason = null;
 
-    private static final String qdnWalletSignature = "EsfUw54perxkEtfoUoL7Z97XPrNsZRZXePVZPz3cwRm9qyEPSofD5KmgVpDqVitQp7LhnZRmL6z2V9hEe1YS45T";
+    /**
+     * The reviewed Pirate Unified Wallet production bundle. Operators can
+     * override it with pirateChainWalletQdnSignature to test a specific,
+     * immutable QDN publication without changing production data.
+     */
+    public static final String DEFAULT_QDN_WALLET_SIGNATURE = "5mjggoNvtQ9KCA5Ytbdc1BhQiUyjovSR62JgthQGWUgBzN8awE4KNS7LxjnHECqASSEZFfTXiTNv4WNa6nbWBEX8";
 
     private PirateChainWalletController() {
         this.running = Settings.getInstance().isWalletEnabled("ARRR");
@@ -257,7 +262,9 @@ public class PirateChainWalletController extends Thread {
 
         try {
             while (running && !Controller.isStopping()) {
-                Thread.sleep(1000);
+                if (!this.sleepUntilNextControllerWork(1000)) {
+                    continue;
+                }
 
                 if (this.restartRequested) {
                     this.performRestart();
@@ -328,6 +335,9 @@ public class PirateChainWalletController extends Thread {
                             // We may have to set wallet to ready if this is the first ever successful sync
                             if (Objects.equals(result, "success")) {
                                 this.currentWallet.setReady(true);
+                                if (this.currentWallet.isSynchronized()) {
+                                    this.currentWallet.archiveLegacyWalletCacheAfterUnifiedMigration();
+                                }
                             } else {
                                 String reason = json.optString("reason", null);
                                 if (reason != null && !reason.isEmpty()) {
@@ -355,7 +365,9 @@ public class PirateChainWalletController extends Thread {
                 }
 
                 // Rate limit sync attempts
-                Thread.sleep(30000);
+                if (!this.sleepUntilNextControllerWork(30000)) {
+                    continue;
+                }
 
                 // Save wallet if needed
                 long now = this.getNowMillis();
@@ -365,6 +377,23 @@ public class PirateChainWalletController extends Thread {
             }
         } catch (InterruptedException e) {
             // Fall-through to exit
+        }
+    }
+
+    /**
+     * A status request can request a recovery while this controller is sleeping
+     * between sync attempts. Wake promptly for that request, but preserve a
+     * normal shutdown interrupt as an exit condition.
+     */
+    private boolean sleepUntilNextControllerWork(long durationMs) throws InterruptedException {
+        try {
+            Thread.sleep(durationMs);
+            return true;
+        } catch (InterruptedException e) {
+            if (this.restartRequested && this.running && !Controller.isStopping()) {
+                return false;
+            }
+            throw e;
         }
     }
 
@@ -388,6 +417,14 @@ public class PirateChainWalletController extends Thread {
 
             this.updateLoadStatus("Loading Pirate Chain wallet library...");
 
+            String qdnWalletSignature = Settings.getInstance().getPirateChainWalletQdnSignature();
+            if (!PirateChainWalletController.isValidQdnWalletSignature(qdnWalletSignature)) {
+                LOGGER.error("Invalid pirateChainWalletQdnSignature setting");
+                this.updateLoadStatus("Invalid Pirate Chain wallet QDN transaction signature in settings");
+                return;
+            }
+            LOGGER.info("Loading Pirate Chain wallet JNI selected by QDN transaction {}", qdnWalletSignature);
+
             // Check if architecture is supported
             String libFileName = PirateChainWalletController.getRustLibFilename();
             if (libFileName == null) {
@@ -398,21 +435,30 @@ public class PirateChainWalletController extends Thread {
             }
 
             // Check if the library exists in the wallets folder
-            Path libDirectory = PirateChainWalletController.getRustLibOuterDirectory();
+            Path libDirectory = PirateChainWalletController.getRustLibOuterDirectory(qdnWalletSignature);
             Path libPath = Paths.get(libDirectory.toString(), libFileName);
             if (Files.exists(libPath)) {
                 // Already downloaded; we can load the library right away
+                LOGGER.info("Loading cached Pirate Chain wallet JNI selected by QDN transaction {}", qdnWalletSignature);
                 this.updateLoadStatus("Loading cached Pirate Chain library from disk...");
                 LiteWalletJni.loadLibrary();
-                this.onLibraryLoaded();
+                if (LiteWalletJni.isLoaded()) {
+                    this.onLibraryLoaded();
+                } else {
+                    this.updateLoadStatus("Unable to load cached Pirate Chain JNI library");
+                }
                 return;
             }
 
             // Library not found, so check if we've fetched the resource from QDN
-            ArbitraryTransactionData t = this.getTransactionData(repository);
-            if (t == null || t.getService() == null) {
-                // Can't find the transaction - maybe on a different chain?
-                this.updateLoadStatus("Waiting for Pirate Chain library publish transaction to appear on QDN...");
+            ArbitraryTransactionData t = this.getTransactionData(repository, qdnWalletSignature);
+            if (t == null) {
+                this.updateLoadStatus("Waiting for configured Pirate Chain library transaction to appear on QDN...");
+                return;
+            }
+            if (t.getService() != Service.ARBITRARY_DATA) {
+                LOGGER.error("Configured Pirate Chain wallet transaction is not an ARBITRARY_DATA publication: {}", qdnWalletSignature);
+                this.updateLoadStatus("Configured Pirate Chain wallet transaction is not an ARBITRARY_DATA publication");
                 return;
             }
 
@@ -424,46 +470,44 @@ public class PirateChainWalletController extends Thread {
                 return;
             }
 
-            // Build resource
-            ArbitraryDataReader arbitraryDataReader = new ArbitraryDataReader(t.getName(),
-                    ArbitraryDataFile.ResourceIdType.NAME, t.getService(), t.getIdentifier());
+            // Fetch the immutable transaction selected in settings. Using NAME here would
+            // instead build the latest state for that name and could load a different bundle.
+            ArbitraryDataReader arbitraryDataReader = new ArbitraryDataReader(qdnWalletSignature,
+                    ArbitraryDataFile.ResourceIdType.TRANSACTION_DATA, t.getService(), t.getIdentifier());
+            arbitraryDataReader.setTransactionData(t);
             try {
                 arbitraryDataReader.loadSynchronously(false);
             } catch (MissingDataException e) {
-                LOGGER.info("Missing data when loading Pirate Chain library");
-            }
-
-            // Check its status
-            ArbitraryResourceStatus status = ArbitraryTransactionUtils.getStatus(
-                    t.getService(), t.getName(), t.getIdentifier(), false, true);
-
-            if (status.getStatus() != ArbitraryResourceStatus.Status.READY) {
-                LOGGER.info("Not ready yet: {}", status.getTitle());
-                this.updateLoadStatus(
-                        String.format("Downloading files from QDN... (%d / %d)", status.getLocalChunkCount(),
-                                status.getTotalChunkCount()));
+                LOGGER.info("Missing data when loading configured Pirate Chain library");
+                this.updateLoadStatus("Downloading configured Pirate Chain library from QDN...");
                 return;
             }
 
-            // Files are downloaded, so copy the necessary files to the wallets folder
-            // Delete the wallets/*/lib directory first, in case earlier versions of the
-            // wallet are present
-            Path walletsLibDirectory = PirateChainWalletController.getWalletsLibDirectory();
-            if (Files.exists(walletsLibDirectory)) {
-                FilesystemUtils.safeDeleteDirectory(walletsLibDirectory, false);
+            Path resourcePath = arbitraryDataReader.getFilePath();
+            if (resourcePath == null || !Files.isDirectory(resourcePath)) {
+                LOGGER.error("Configured Pirate Chain wallet library was not built as a directory: {}", resourcePath);
+                this.updateLoadStatus("Configured Pirate Chain library could not be read from QDN");
+                return;
             }
+            if (!Files.isRegularFile(resourcePath.resolve(libFileName))) {
+                LOGGER.error("Configured Pirate Chain wallet library is missing {}", libFileName);
+                this.updateLoadStatus(String.format("Configured Pirate Chain library is missing %s", libFileName));
+                return;
+            }
+
+            // The cache directory is tied to the selected QDN transaction. Do not delete
+            // the shared lib root: that could remove another (including production) bundle.
             Files.createDirectories(libDirectory);
             this.updateLoadStatus("Copying Pirate Chain library into wallets folder...");
-            FileUtils.copyDirectory(arbitraryDataReader.getFilePath().toFile(), libDirectory.toFile());
-
-            // Clear reader cache so only one copy exists
-            ArbitraryDataResource resource = new ArbitraryDataResource(t.getName(),
-                    ArbitraryDataFile.ResourceIdType.NAME, t.getService(), t.getIdentifier());
-            resource.deleteCache();
+            FileUtils.copyDirectory(resourcePath.toFile(), libDirectory.toFile());
 
             // Finally, load the library
             LiteWalletJni.loadLibrary();
-            this.onLibraryLoaded();
+            if (LiteWalletJni.isLoaded()) {
+                this.onLibraryLoaded();
+            } else {
+                this.updateLoadStatus("Unable to load configured Pirate Chain JNI library");
+            }
 
         } catch (DataException e) {
             LOGGER.error("Repository issue when loading Pirate Chain library", e);
@@ -479,20 +523,15 @@ public class PirateChainWalletController extends Thread {
         this.updateLoadStatus("Pirate Chain library loaded and ready");
     }
 
-    private ArbitraryTransactionData getTransactionData(Repository repository) {
+    private ArbitraryTransactionData getTransactionData(Repository repository, String qdnWalletSignature) {
         try {
             byte[] signature = Base58.decode(qdnWalletSignature);
             TransactionData transactionData = repository.getTransactionRepository().fromSignature(signature);
             if (!(transactionData instanceof ArbitraryTransactionData))
                 return null;
 
-            ArbitraryTransaction arbitraryTransaction = new ArbitraryTransaction(repository, transactionData);
-            if (arbitraryTransaction != null) {
-                return (ArbitraryTransactionData) arbitraryTransaction.getTransactionData();
-            }
-
-            return null;
-        } catch (DataException e) {
+            return (ArbitraryTransactionData) transactionData;
+        } catch (DataException | NumberFormatException e) {
             return null;
         }
     }
@@ -505,9 +544,9 @@ public class PirateChainWalletController extends Thread {
             return "librust-macos-x86_64.dylib";
         } else if (osName.equals("Mac OS X") && osArchitecture.equals("aarch64")) {
             return "librust-macos-aarch64.dylib";
-        } else if ((osName.equals("Linux") || osName.equals("FreeBSD")) && osArchitecture.equals("aarch64")) {
+        } else if (osName.equals("Linux") && osArchitecture.equals("aarch64")) {
             return "librust-linux-aarch64.so";
-        } else if ((osName.equals("Linux") || osName.equals("FreeBSD")) && osArchitecture.equals("amd64")) {
+        } else if (osName.equals("Linux") && osArchitecture.equals("amd64")) {
             return "librust-linux-x86_64.so";
         } else if (osName.contains("Windows") && osArchitecture.equals("amd64")) {
             return "librust-windows-x86_64.dll";
@@ -521,8 +560,39 @@ public class PirateChainWalletController extends Thread {
     }
 
     public static Path getRustLibOuterDirectory() {
-        String sigPrefix = qdnWalletSignature.substring(0, 8);
-        return Paths.get(Settings.getInstance().getWalletsPath(), "PirateChain", "lib", sigPrefix);
+        return PirateChainWalletController.getRustLibOuterDirectory(
+                Settings.getInstance().getPirateChainWalletQdnSignature());
+    }
+
+    static Path getRustLibOuterDirectory(String qdnWalletSignature) {
+        return Paths.get(Settings.getInstance().getWalletsPath(), "PirateChain", "lib",
+                PirateChainWalletController.getWalletLibraryCacheKey(qdnWalletSignature));
+    }
+
+    static boolean isValidQdnWalletSignature(String qdnWalletSignature) {
+        if (qdnWalletSignature == null) {
+            return false;
+        }
+
+        try {
+            return Base58.decode(qdnWalletSignature).length == Crypto.SIGNATURE_LENGTH;
+        } catch (NumberFormatException e) {
+            return false;
+        }
+    }
+
+    static String getWalletLibraryCacheKey(String qdnWalletSignature) {
+        if (!PirateChainWalletController.isValidQdnWalletSignature(qdnWalletSignature)) {
+            throw new IllegalArgumentException("Invalid QDN wallet transaction signature");
+        }
+
+        // The active production bundle gets a short cache directory. Legacy and
+        // test publications get a full-signature directory so they cannot
+        // overwrite the production bundle.
+        if (DEFAULT_QDN_WALLET_SIGNATURE.equals(qdnWalletSignature)) {
+            return qdnWalletSignature.substring(0, 8);
+        }
+        return qdnWalletSignature;
     }
 
     // Wallet functions
@@ -631,6 +701,21 @@ public class PirateChainWalletController extends Thread {
                             this.currentWallet.isReady(),
                             this.currentWallet.isInitialized(),
                             this.currentWallet.isSynchronized());
+
+                    /*
+                     * The Unified JNI service keeps its last progress snapshot after a
+                     * cancelled sync, but removes the active native sync session. A
+                     * status request made while recreating the wallet can consequently
+                     * report the old scan as still in progress. Start the replacement
+                     * scan here rather than waiting for the controller loop to infer
+                     * that one is needed from that stale status.
+                     */
+                    if (!this.currentWallet.isNullSeedWallet()
+                            && this.currentWallet.usesPersistentUnifiedStorage()) {
+                        this.resetSyncStatusStallTracker();
+                        LOGGER.info("Starting Pirate Unified wallet sync after wallet initialization");
+                        this.startUnifiedSync();
+                    }
                 }
                 if (this.currentWallet == null) {
                     LOGGER.info("Pirate wallet init failed after retry: wallet not ready");
@@ -689,6 +774,12 @@ public class PirateChainWalletController extends Thread {
             if (this.currentWallet == null) {
                 return;
             }
+            if (this.currentWallet.usesPersistentUnifiedStorage()) {
+                // Pirate Unified Wallet persists mutations in its own encrypted
+                // SQLite store. It must not be serialized as a legacy .dat file.
+                this.lastSaveTime = this.getNowMillis();
+                return;
+            }
             if (this.currentWallet.save()) {
                 this.lastSaveTime = this.getNowMillis();
             }
@@ -740,11 +831,7 @@ public class PirateChainWalletController extends Thread {
         }
         try {
             JSONObject json = new JSONObject(response);
-            if (json.optBoolean("syncing", false)) {
-                throw new ForeignBlockchainException("Sync in progress. Please try again later.");
-            }
-            boolean inProgress = json.optBoolean("in_progress", false);
-            if (inProgress) {
+            if (PirateChainWalletController.isSyncInProgress(json)) {
                 String progress = this.formatSyncProgress(json);
                 String progressSuffix = progress != null ? String.format(" (%s)", progress) : "";
                 throw new ForeignBlockchainException(
@@ -785,11 +872,8 @@ public class PirateChainWalletController extends Thread {
         long endBlock = statusJson.optLong("end_block", -1);
         long startBlock = statusJson.optLong("start_block", -1);
 
-        if (endBlock > 0 && syncedBlocks >= 0) {
-            long currentHeight = endBlock - 1 + syncedBlocks;
-            if (startBlock > 0 && currentHeight > startBlock) {
-                currentHeight = startBlock;
-            }
+        if (startBlock >= 0 && syncedBlocks >= 0) {
+            long currentHeight = PirateChainWalletController.calculateSyncHeight(startBlock, endBlock, syncedBlocks);
 
             Long chainHeight = this.fetchChainHeight();
             if (chainHeight != null && chainHeight >= 0) {
@@ -806,6 +890,25 @@ public class PirateChainWalletController extends Thread {
         }
 
         return null;
+    }
+
+    /**
+     * Unified Wallet's synced_blocks counter is relative to start_block, not
+     * end_block. Keep it bounded by the captured sync target for a stable
+     * progress display even if the chain advances during the sync.
+     */
+    static long calculateSyncHeight(long startBlock, long endBlock, long syncedBlocks) {
+        long currentHeight = startBlock + syncedBlocks;
+        return endBlock >= startBlock ? Math.min(currentHeight, endBlock) : currentHeight;
+    }
+
+    /**
+     * Unified Wallet uses {@code in_progress}. Some deployed JNI builds retain
+     * the older {@code syncing} field, so accept both while publishing a
+     * backwards-compatible Core response for Qortal Hub and Q-Wallets.
+     */
+    static boolean isSyncInProgress(JSONObject statusJson) {
+        return statusJson.optBoolean("in_progress", false) || statusJson.optBoolean("syncing", false);
     }
 
     private String formatSyncStatus(PirateWallet wallet) {
@@ -829,8 +932,7 @@ public class PirateChainWalletController extends Thread {
             return "Sync status unavailable";
         }
 
-        boolean inProgress = json.optBoolean("in_progress", false);
-        if (inProgress) {
+        if (PirateChainWalletController.isSyncInProgress(json)) {
             String progress = this.formatSyncProgress(json);
             if (this.handleStalledSyncStatus(json, progress)) {
                 return "Switching servers";
@@ -859,7 +961,7 @@ public class PirateChainWalletController extends Thread {
             this.resetRepeatTracker();
             return false;
         }
-        if (json.optBoolean("in_progress", false)) {
+        if (PirateChainWalletController.isSyncInProgress(json)) {
             this.resetRepeatTracker();
             return false;
         }
@@ -878,13 +980,9 @@ public class PirateChainWalletController extends Thread {
             this.syncStatusRepeatCount = 1;
         }
         if (this.syncStatusRepeatCount >= SYNC_STATUS_REPEAT_THRESHOLD) {
-            long now = System.currentTimeMillis();
-            if (now - this.lastSyncStatusRotateMs >= SYNC_STATUS_ROTATE_COOLDOWN_MS && !this.isSwitching()) {
-                this.lastSyncStatusRotateMs = now;
-                this.requestRestart("syncStatus repeated");
-            }
+            boolean switching = this.requestSyncStatusRestart("syncStatus repeated");
             this.resetRepeatTracker();
-            return true;
+            return switching;
         }
         return false;
     }
@@ -902,7 +1000,7 @@ public class PirateChainWalletController extends Thread {
             this.lastSyncStatusIdleHeight = -1L;
             return;
         }
-        if (json.optBoolean("in_progress", false)) {
+        if (PirateChainWalletController.isSyncInProgress(json)) {
             this.syncStatusIdleCount = 0;
             this.lastSyncStatusIdleHeight = -1L;
             return;
@@ -922,18 +1020,14 @@ public class PirateChainWalletController extends Thread {
             this.lastSyncStatusIdleHeight = scannedHeight;
         }
         if (this.syncStatusIdleCount >= SYNC_STATUS_IDLE_THRESHOLD) {
-            long now = System.currentTimeMillis();
-            if (now - this.lastSyncStatusRotateMs >= SYNC_STATUS_ROTATE_COOLDOWN_MS && !this.isSwitching()) {
-                this.lastSyncStatusRotateMs = now;
-                this.requestRestart("syncStatus idle");
-            }
+            this.requestSyncStatusRestart("syncStatus idle");
             this.syncStatusIdleCount = 0;
             this.lastSyncStatusIdleHeight = -1L;
         }
     }
 
     private boolean handleStalledSyncStatus(JSONObject json, String progress) {
-        if (!json.optBoolean("in_progress", false)) {
+        if (!PirateChainWalletController.isSyncInProgress(json)) {
             this.resetSyncStatusStallTracker();
             return false;
         }
@@ -952,19 +1046,45 @@ public class PirateChainWalletController extends Thread {
             this.lastSyncProgress = progress;
         }
 
-        if (this.syncStatusStallCount >= SYNC_STATUS_STALL_THRESHOLD) {
-            long now = System.currentTimeMillis();
-            if (now - this.lastSyncStatusRotateMs >= SYNC_STATUS_ROTATE_COOLDOWN_MS && !this.isSwitching()) {
+        int stallThreshold = this.currentWallet != null && this.currentWallet.usesPersistentUnifiedStorage()
+                ? UNIFIED_SYNC_STATUS_STALL_THRESHOLD
+                : SYNC_STATUS_STALL_THRESHOLD;
+        if (this.syncStatusStallCount >= stallThreshold) {
+            boolean switching = this.requestSyncStatusRestart("syncStatus stalled");
+            if (switching) {
                 LOGGER.info("Pirate wallet syncStatus stalled; rotating server (syncId={}, progress={})",
                         syncId, progress);
-                this.lastSyncStatusRotateMs = now;
-                this.requestRestart("syncStatus stalled");
             }
             this.syncStatusStallCount = 0;
-            return true;
+            return switching;
         }
 
         return false;
+    }
+
+    /**
+     * Return true only when a recovery was actually scheduled. Previously the
+     * status endpoint could say "Switching servers" during its cooldown even
+     * though the native scan was left stalled on the same endpoint.
+     */
+    private boolean requestSyncStatusRestart(String reason) {
+        if (this.restartRequested) {
+            LOGGER.info("Pirate wallet {} recovery already scheduled", reason);
+            return true;
+        }
+        long now = System.currentTimeMillis();
+        if (this.isSwitching()) {
+            LOGGER.info("Pirate wallet {} recovery already in progress", reason);
+            return false;
+        }
+        if (now - this.lastSyncStatusRotateMs < SYNC_STATUS_ROTATE_COOLDOWN_MS) {
+            LOGGER.info("Pirate wallet {} recovery skipped during rotation cooldown", reason);
+            return false;
+        }
+
+        this.lastSyncStatusRotateMs = now;
+        this.requestRestart(reason);
+        return true;
     }
 
     private void resetSyncStatusStallTracker() {
@@ -1110,6 +1230,10 @@ public class PirateChainWalletController extends Thread {
     }
 
     private String executeSyncWithTimeout() {
+        if (this.currentWallet != null && this.currentWallet.usesPersistentUnifiedStorage()) {
+            return this.startUnifiedSync();
+        }
+
         final String[] responseHolder = new String[1];
         Thread syncThread = new Thread(() -> {
             try {
@@ -1138,6 +1262,39 @@ public class PirateChainWalletController extends Thread {
         }
         this.activeSyncThread = null;
         return responseHolder[0];
+    }
+
+    /**
+     * Unified JNI sync owns a persistent background service. Do not apply the
+     * legacy 60-second blocking-call watchdog to it: a scan can remain active
+     * while status calls continue to report progress. Starting a second sync or
+     * restarting the wallet at that point interrupts a healthy scan.
+     */
+    private String startUnifiedSync() {
+        if (this.isSyncThreadActive()) {
+            return "{\"result\":\"success\"}";
+        }
+
+        Thread syncThread = new Thread(() -> {
+            try {
+                String response = LiteWalletJni.execute("sync", "");
+                if (response == null || response.trim().isEmpty()) {
+                    LOGGER.info("Pirate Unified wallet sync returned empty response");
+                } else {
+                    LOGGER.debug("Pirate Unified wallet sync response: {}", response);
+                }
+            } catch (Exception e) {
+                LOGGER.info("Pirate Unified wallet sync failed: {}", e.getClass().getSimpleName());
+            } finally {
+                if (this.activeSyncThread == Thread.currentThread()) {
+                    this.activeSyncThread = null;
+                }
+            }
+        }, "PirateUnifiedWalletSync");
+        syncThread.setDaemon(true);
+        this.activeSyncThread = syncThread;
+        syncThread.start();
+        return "{\"result\":\"success\"}";
     }
 
     public String getSyncStatusWithInit(String entropy58) throws ForeignBlockchainException {
@@ -1251,6 +1408,10 @@ public class PirateChainWalletController extends Thread {
         Thread syncThread = this.activeSyncThread;
         if (syncThread != null && syncThread.isAlive()) {
             syncThread.interrupt();
+        }
+        if (this.currentWallet != null && this.currentWallet.usesPersistentUnifiedStorage()) {
+            this.currentWallet.cancelUnifiedSync();
+            return;
         }
         try {
             LiteWalletJni.execute("stop", "");

@@ -40,9 +40,11 @@ public class PirateWallet {
     protected static final Logger LOGGER = LogManager.getLogger(PirateWallet.class);
     private static final int MIN_WALLET_BYTES = 1024;
     private static final long VALIDATOR_TIMEOUT_MS = 45_000L;
+    private static final String UNIFIED_WALLET_REGISTRY_FILENAME = "wallet_registry.db";
 
     private byte[] entropyBytes;
     private final boolean isNullSeedWallet;
+    private final boolean unifiedWallet;
     private String seedPhrase;
     private boolean ready = false;
 
@@ -59,15 +61,24 @@ public class PirateWallet {
     public PirateWallet(byte[] entropyBytes, boolean isNullSeedWallet) throws IOException {
         this.entropyBytes = entropyBytes;
         this.isNullSeedWallet = isNullSeedWallet;
+        this.unifiedWallet = Settings.getInstance().isPirateChainWalletUnified();
 
         Path libDirectory = PirateChainWalletController.getRustLibOuterDirectory();
-        if (!Files.exists(Paths.get(libDirectory.toString(), COIN_PARAMS_FILENAME))) {
-            return;
-        }
+        if (this.unifiedWallet) {
+            // Pirate Unified Wallet retains these JNI arguments for source
+            // compatibility, but no longer reads the legacy parameter files.
+            this.params = "";
+            this.saplingOutput64 = "";
+            this.saplingSpend64 = "";
+        } else {
+            if (!Files.exists(Paths.get(libDirectory.toString(), COIN_PARAMS_FILENAME))) {
+                return;
+            }
 
-        this.params = Files.readString(Paths.get(libDirectory.toString(), COIN_PARAMS_FILENAME));
-        this.saplingOutput64 = Files.readString(Paths.get(libDirectory.toString(), SAPLING_OUTPUT_FILENAME));
-        this.saplingSpend64 = Files.readString(Paths.get(libDirectory.toString(), SAPLING_SPEND_FILENAME));
+            this.params = Files.readString(Paths.get(libDirectory.toString(), COIN_PARAMS_FILENAME));
+            this.saplingOutput64 = Files.readString(Paths.get(libDirectory.toString(), SAPLING_OUTPUT_FILENAME));
+            this.saplingSpend64 = Files.readString(Paths.get(libDirectory.toString(), SAPLING_SPEND_FILENAME));
+        }
 
         this.ready = this.initialize();
     }
@@ -93,6 +104,15 @@ public class PirateWallet {
             // Pirate library uses base64 encoding
             String entropy64 = Base64.toBase64String(this.entropyBytes);
 
+            // Check before configurestorage(): configuring a previously unused
+            // namespace creates its registry file. A registry means that the
+            // unified client, rather than Qortal, owns the wallet's birthday.
+            boolean hasUnifiedWalletRegistry = this.unifiedWallet && this.hasUnifiedWalletRegistry();
+            boolean hasLegacyWalletCache = this.unifiedWallet && Files.exists(this.getCurrentWalletPath());
+            if (this.unifiedWallet && !this.configureUnifiedStorage()) {
+                return false;
+            }
+
             // Derive seed phrase from entropy bytes
             String inputSeedResponse = LiteWalletJni.getseedphrasefromentropyb64(entropy64);
             JSONObject inputSeedJson = parseJsonObject(inputSeedResponse, "getseedphrasefromentropyb64");
@@ -108,76 +128,118 @@ public class PirateWallet {
             int configuredBirthday = Settings.getInstance().getArrrDefaultBirthday();
             boolean forceFullRescan = !this.isNullSeedWallet && configuredBirthday <= 1;
 
-            String wallet = this.load();
-            boolean loadedFromCache = wallet != null;
-            if (wallet != null && forceFullRescan) {
-                LOGGER.info("Forcing full rescan due to configured birthday {}", configuredBirthday);
-                this.deleteWalletCache();
-                wallet = null;
-                loadedFromCache = false;
-            }
-            if (wallet == null) {
-                // Wallet doesn't exist, so create a new one
-                LOGGER.info("Creating new Pirate wallet (birthday={})", configuredBirthday);
-
-                int birthday = configuredBirthday;
-                if (this.isNullSeedWallet) {
-                    try {
-                        // Attempt to set birthday to the current block for null seed wallets
-                        birthday = PirateChain.getInstance().blockchainProvider.getCurrentHeight();
-                    } catch (ForeignBlockchainException e) {
-                        // Use the default height
-                    }
+            if (this.unifiedWallet) {
+                if (forceFullRescan) {
+                    LOGGER.warn("A full rescan requested by birthday {} is not yet supported for persistent Pirate Unified Wallet storage", configuredBirthday);
                 }
 
-                // Initialize new wallet
+                Integer requestedNewWalletBirthday = Settings.getInstance().getArrrNewWalletBirthday();
+                boolean fetchCurrentHeight = this.isNullSeedWallet
+                        || (!hasUnifiedWalletRegistry && !hasLegacyWalletCache && requestedNewWalletBirthday == null);
+                Integer currentHeight = fetchCurrentHeight ? this.getCurrentLightwalletHeight(provider) : null;
+                int birthday = PirateWallet.chooseUnifiedWalletBirthday(
+                        configuredBirthday,
+                        requestedNewWalletBirthday,
+                        this.isNullSeedWallet,
+                        hasUnifiedWalletRegistry,
+                        hasLegacyWalletCache,
+                        currentHeight);
+
+                if (!this.isNullSeedWallet && !hasUnifiedWalletRegistry && !hasLegacyWalletCache
+                        && requestedNewWalletBirthday == null && currentHeight != null) {
+                    LOGGER.info("Creating fresh Pirate Unified Wallet at current lightwallet height {}", birthday);
+                } else {
+                    LOGGER.info("Initializing Pirate Unified Wallet with birthday {} (registryExists={}, legacyCacheExists={})",
+                            birthday, hasUnifiedWalletRegistry, hasLegacyWalletCache);
+                }
+
                 if (!this.initFromSeed(serverUri, inputSeedPhrase, birthday)) {
                     LOGGER.info("Pirate wallet initFromSeed failed (birthday={})", birthday);
                     return false;
                 }
-            } else {
-                // Restore existing wallet
-                String response = LiteWalletJni.initfromb64(serverUri, params, wallet, saplingOutput64, saplingSpend64);
-                if (response != null && !isInitSuccess(response)) {
-                    if (isBufferFillError(response)) {
-                        LOGGER.info("Pirate wallet init reported buffer error; backing up cache and retrying");
-                        this.backupAndDeleteWalletCache();
-                        response = LiteWalletJni.initfromb64(serverUri, params, wallet, saplingOutput64,
-                                saplingSpend64);
-                    }
-                    if (response != null && !isInitSuccess(response)) {
-                        LOGGER.info("Unable to initialize Pirate Chain wallet at {}: {}", serverUri, response);
-                        return false;
-                    }
-                }
-                LOGGER.info("Loaded Pirate wallet from cache");
-                this.seedPhrase = inputSeedPhrase;
-            }
 
-            // Check that we're able to communicate with the library
-            Integer ourHeight = this.getHeight();
-            if (ourHeight == null || ourHeight <= 0) {
-                LOGGER.info("Pirate wallet height unavailable after init (height={})", ourHeight);
-                return false;
-            }
-            LOGGER.info("Pirate wallet height after init: {}", ourHeight);
-
-            if (!this.isNullSeedWallet && configuredBirthday > 1 && ourHeight < configuredBirthday) {
-                if (loadedFromCache) {
-                    LOGGER.warn("Pirate wallet height {} below configured birthday {}. Recreating wallet cache.",
-                            ourHeight, configuredBirthday);
-                    this.deleteWalletCache();
-                    if (!this.initFromSeed(serverUri, inputSeedPhrase, configuredBirthday)) {
-                        LOGGER.info("Pirate wallet re-init from seed failed (birthday={})", configuredBirthday);
-                        return false;
-                    }
-                    ourHeight = this.getHeight();
-                }
-
-                if (ourHeight == null || ourHeight <= 0 || ourHeight < configuredBirthday) {
-                    LOGGER.warn("Pirate wallet initialized below configured birthday {} (height {}).",
-                            configuredBirthday, ourHeight);
+                Integer ourHeight = this.getHeight();
+                if (ourHeight == null || ourHeight <= 0) {
+                    LOGGER.info("Pirate Unified Wallet height unavailable after init (height={})", ourHeight);
                     return false;
+                }
+                if (!this.isNullSeedWallet && birthday > 1 && ourHeight < birthday) {
+                    LOGGER.warn("Pirate Unified Wallet initialized below birthday {} (height {}).",
+                            birthday, ourHeight);
+                    return false;
+                }
+            } else {
+                String wallet = this.load();
+                boolean loadedFromCache = wallet != null;
+                if (wallet != null && forceFullRescan) {
+                    LOGGER.info("Forcing full rescan due to configured birthday {}", configuredBirthday);
+                    this.deleteWalletCache();
+                    wallet = null;
+                    loadedFromCache = false;
+                }
+                if (wallet == null) {
+                    // Wallet doesn't exist, so create a new one
+                    LOGGER.info("Creating new Pirate wallet (birthday={})", configuredBirthday);
+
+                    int birthday = configuredBirthday;
+                    if (this.isNullSeedWallet) {
+                        try {
+                            // Attempt to set birthday to the current block for null seed wallets
+                            birthday = PirateChain.getInstance().blockchainProvider.getCurrentHeight();
+                        } catch (ForeignBlockchainException e) {
+                            // Use the default height
+                        }
+                    }
+
+                    // Initialize new wallet
+                    if (!this.initFromSeed(serverUri, inputSeedPhrase, birthday)) {
+                        LOGGER.info("Pirate wallet initFromSeed failed (birthday={})", birthday);
+                        return false;
+                    }
+                } else {
+                    // Restore existing wallet
+                    String response = LiteWalletJni.initfromb64(serverUri, params, wallet, saplingOutput64, saplingSpend64);
+                    if (response != null && !isInitSuccess(response)) {
+                        if (isBufferFillError(response)) {
+                            LOGGER.info("Pirate wallet init reported buffer error; backing up cache and retrying");
+                            this.backupAndDeleteWalletCache();
+                            response = LiteWalletJni.initfromb64(serverUri, params, wallet, saplingOutput64,
+                                    saplingSpend64);
+                        }
+                        if (response != null && !isInitSuccess(response)) {
+                            LOGGER.info("Unable to initialize Pirate Chain wallet at {}: {}", serverUri, response);
+                            return false;
+                        }
+                    }
+                    LOGGER.info("Loaded Pirate wallet from cache");
+                    this.seedPhrase = inputSeedPhrase;
+                }
+
+                // Check that we're able to communicate with the library
+                Integer ourHeight = this.getHeight();
+                if (ourHeight == null || ourHeight <= 0) {
+                    LOGGER.info("Pirate wallet height unavailable after init (height={})", ourHeight);
+                    return false;
+                }
+                LOGGER.info("Pirate wallet height after init: {}", ourHeight);
+
+                if (!this.isNullSeedWallet && configuredBirthday > 1 && ourHeight < configuredBirthday) {
+                    if (loadedFromCache) {
+                        LOGGER.warn("Pirate wallet height {} below configured birthday {}. Recreating wallet cache.",
+                                ourHeight, configuredBirthday);
+                        this.deleteWalletCache();
+                        if (!this.initFromSeed(serverUri, inputSeedPhrase, configuredBirthday)) {
+                            LOGGER.info("Pirate wallet re-init from seed failed (birthday={})", configuredBirthday);
+                            return false;
+                        }
+                        ourHeight = this.getHeight();
+                    }
+
+                    if (ourHeight == null || ourHeight <= 0 || ourHeight < configuredBirthday) {
+                        LOGGER.warn("Pirate wallet initialized below configured birthday {} (height {}).",
+                                configuredBirthday, ourHeight);
+                        return false;
+                    }
                 }
             }
 
@@ -190,19 +252,101 @@ public class PirateWallet {
         return false;
     }
 
+    private boolean configureUnifiedStorage() throws IOException {
+        String encryptionKey = this.getEncryptionKey();
+        if (encryptionKey == null) {
+            LOGGER.info("Unable to configure Pirate Unified Wallet storage: missing encryption key");
+            return false;
+        }
+
+        Path storageDirectory = this.getUnifiedWalletDirectory();
+        Files.createDirectories(storageDirectory);
+        String response = LiteWalletJni.configurestorage(storageDirectory.toString(), encryptionKey);
+        JSONObject json = parseJsonObject(response, "configurestorage");
+        if (json == null || !json.optBoolean("initialized", false)) {
+            LOGGER.info("Unable to configure Pirate Unified Wallet storage: {}", response);
+            return false;
+        }
+
+        this.enableUnifiedDebugLoggingIfConfigured();
+
+        return true;
+    }
+
+    private void enableUnifiedDebugLoggingIfConfigured() {
+        if (!Settings.getInstance().isPirateChainWalletDebugLogging()) {
+            return;
+        }
+
+        try {
+            JSONObject request = new JSONObject()
+                    .put("method", "set_debug_logging_enabled")
+                    .put("enabled", true);
+            JSONObject response = parseJsonObject(LiteWalletJni.invokeJson(request.toString(), false),
+                    "set_debug_logging_enabled");
+            if (response != null && response.optBoolean("ok", false)) {
+                LOGGER.info("Pirate Unified Wallet redacted diagnostic logging enabled");
+            } else {
+                LOGGER.info("Unable to enable Pirate Unified Wallet diagnostic logging");
+            }
+        } catch (RuntimeException | UnsatisfiedLinkError e) {
+            LOGGER.info("Unable to enable Pirate Unified Wallet diagnostic logging: {}", e.getMessage());
+        }
+    }
+
+    private boolean hasUnifiedWalletRegistry() {
+        return Files.exists(this.getUnifiedWalletDirectory().resolve(UNIFIED_WALLET_REGISTRY_FILENAME));
+    }
+
+    private Integer getCurrentLightwalletHeight(BitcoinyBlockchainProvider provider) {
+        try {
+            int height = provider.getCurrentHeight();
+            return height > 0 ? height : null;
+        } catch (ForeignBlockchainException e) {
+            LOGGER.info("Unable to determine current lightwallet height for new Pirate Unified Wallet: {}", e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * A stored Unified wallet or a legacy cache might represent historic funds,
+     * so it must retain the conservative configured birthday. Only a clean,
+     * entropy-backed Unified namespace can safely use the current tip by
+     * default. Recovery callers can set arrrNewWalletBirthday explicitly.
+     */
+    static int chooseUnifiedWalletBirthday(int configuredBirthday, Integer requestedNewWalletBirthday,
+                                           boolean nullSeedWallet, boolean hasUnifiedWalletRegistry,
+                                           boolean hasLegacyWalletCache, Integer currentLightwalletHeight) {
+        if (nullSeedWallet) {
+            return currentLightwalletHeight != null && currentLightwalletHeight > 0
+                    ? currentLightwalletHeight : configuredBirthday;
+        }
+
+        if (hasUnifiedWalletRegistry || hasLegacyWalletCache) {
+            return configuredBirthday;
+        }
+
+        if (requestedNewWalletBirthday != null && requestedNewWalletBirthday > 0) {
+            return requestedNewWalletBirthday;
+        }
+
+        return currentLightwalletHeight != null && currentLightwalletHeight > 0
+                ? currentLightwalletHeight : configuredBirthday;
+    }
+
     private boolean initFromSeed(String serverUri, String inputSeedPhrase, int birthday) {
         String birthdayString = String.format("%d", birthday);
         String outputSeedResponse = LiteWalletJni.initfromseed(serverUri, this.params, inputSeedPhrase, birthdayString,
                 this.saplingOutput64, this.saplingSpend64); // Thread-safe.
         String outputSeedPhrase = parseSeedPhrase(outputSeedResponse, "initfromseed");
-        if (outputSeedPhrase == null && isBufferFillError(outputSeedResponse)) {
+        if (!this.unifiedWallet && outputSeedPhrase == null && isBufferFillError(outputSeedResponse)) {
             LOGGER.info("Pirate wallet initfromseed reported buffer error; backing up cache and retrying");
             this.backupAndDeleteWalletCache();
             outputSeedResponse = LiteWalletJni.initfromseed(serverUri, this.params, inputSeedPhrase, birthdayString,
                     this.saplingOutput64, this.saplingSpend64); // Thread-safe.
             outputSeedPhrase = parseSeedPhrase(outputSeedResponse, "initfromseed");
         }
-        if (outputSeedPhrase == null && isWalletAlreadyExistsError(outputSeedResponse)) {
+        if (!this.unifiedWallet && outputSeedPhrase == null && isWalletAlreadyExistsError(outputSeedResponse)) {
             LOGGER.info("Clearing litewallet cache after initfromseed reported existing wallet");
             this.backupAndDeleteLitewalletCache();
             outputSeedResponse = LiteWalletJni.initfromseed(serverUri, this.params, inputSeedPhrase, birthdayString,
@@ -244,6 +388,10 @@ public class PirateWallet {
     }
 
     private void deleteWalletCache() {
+        if (this.unifiedWallet) {
+            LOGGER.warn("Refusing to delete active Pirate Unified Wallet storage; the legacy cache reset is not applicable");
+            return;
+        }
         Path walletPath = this.getCurrentWalletPath();
         boolean walletExists = Files.exists(walletPath);
         LOGGER.info(
@@ -280,6 +428,10 @@ public class PirateWallet {
     }
 
     private void backupAndDeleteWalletCache() {
+        if (this.unifiedWallet) {
+            LOGGER.warn("Refusing to delete active Pirate Unified Wallet storage; the legacy cache recovery is not applicable");
+            return;
+        }
         Path walletPath = this.getCurrentWalletPath();
         if (walletPath == null) {
             return;
@@ -478,6 +630,11 @@ public class PirateWallet {
             // Don't save wallets that have a null seed
             return false;
         }
+        if (this.unifiedWallet) {
+            // Unified Wallet persists each mutation to its encrypted SQLite
+            // store; serializing a legacy .dat snapshot would be incorrect.
+            return true;
+        }
 
         // Encrypt first (will do nothing if already encrypted)
         this.encrypt();
@@ -537,7 +694,71 @@ public class PirateWallet {
         return true;
     }
 
+    /**
+     * The Unified Wallet database cannot consume the old encrypted LiteWallet
+     * snapshot. Preserve that snapshot only after the replacement wallet has
+     * reached the chain tip, so an operator can still recover it if a migration
+     * issue is discovered.
+     */
+    public void archiveLegacyWalletCacheAfterUnifiedMigration() {
+        if (!this.unifiedWallet || this.isNullSeedWallet() || this.entropyBytes == null) {
+            return;
+        }
+
+        Path legacyWalletPath = this.getCurrentWalletPath();
+        try {
+            Path archivePath = PirateWallet.archiveLegacyWalletCache(legacyWalletPath);
+            if (archivePath != null) {
+                LOGGER.info("Archived legacy Pirate wallet cache to {} after Unified Wallet synchronization", archivePath);
+            }
+        } catch (IOException e) {
+            // The Unified Wallet database is already persistent. Retain the legacy
+            // snapshot in place if it cannot be archived rather than risking data loss.
+            LOGGER.warn("Unable to archive legacy Pirate wallet cache {}: {}", legacyWalletPath, e.getMessage());
+        }
+    }
+
+    static Path archiveLegacyWalletCache(Path legacyWalletPath) throws IOException {
+        if (!Files.isRegularFile(legacyWalletPath)) {
+            return null;
+        }
+
+        Path archivePath = PirateWallet.findLegacyWalletArchivePath(legacyWalletPath);
+        PirateWallet.moveWithoutReplacement(legacyWalletPath, archivePath);
+
+        Path legacyChecksumPath = PirateWallet.getChecksumPath(legacyWalletPath);
+        if (Files.isRegularFile(legacyChecksumPath)) {
+            PirateWallet.moveWithoutReplacement(legacyChecksumPath, PirateWallet.getChecksumPath(archivePath));
+        }
+
+        return archivePath;
+    }
+
+    private static Path findLegacyWalletArchivePath(Path legacyWalletPath) {
+        String filename = legacyWalletPath.getFileName().toString();
+        Path parent = legacyWalletPath.getParent();
+        Path archivePath = parent.resolve(filename + ".legacy-before-unified");
+        int suffix = 1;
+        while (Files.exists(archivePath) || Files.exists(PirateWallet.getChecksumPath(archivePath))) {
+            archivePath = parent.resolve(filename + ".legacy-before-unified-" + suffix++);
+        }
+        return archivePath;
+    }
+
+    private static void moveWithoutReplacement(Path source, Path destination) throws IOException {
+        try {
+            Files.move(source, destination, StandardCopyOption.ATOMIC_MOVE);
+        } catch (AtomicMoveNotSupportedException e) {
+            Files.move(source, destination);
+        }
+    }
+
     public String load() throws IOException {
+        if (this.unifiedWallet) {
+            // Unified Wallet state is selected by configurestorage() and then
+            // initialized deterministically from the entropy-derived mnemonic.
+            return null;
+        }
         if (this.isNullSeedWallet()) {
             // Don't load wallets that have a null seed
             return null;
@@ -641,7 +862,58 @@ public class PirateWallet {
         return Paths.get(Settings.getInstance().getWalletsPath(), "PirateChain", filename);
     }
 
-    private Path getChecksumPath(Path walletPath) {
+    private Path getUnifiedWalletDirectory() {
+        String entropyHash58 = this.getEntropyHash58();
+        return Paths.get(Settings.getInstance().getWalletsPath(), "PirateChain", "unified", entropyHash58);
+    }
+
+    public boolean usesPersistentUnifiedStorage() {
+        return this.unifiedWallet;
+    }
+
+    /**
+     * The Unified JNI owns the sync task asynchronously. Its legacy command
+     * surface intentionally has no "stop" command, so ask its JSON service to
+     * cancel the active persistent-wallet session before changing servers.
+     */
+    public void cancelUnifiedSync() {
+        if (!this.unifiedWallet) {
+            return;
+        }
+
+        try {
+            JSONObject activeWallet = parseJsonObject(
+                    LiteWalletJni.invokeJson("{\"method\":\"get_active_wallet\"}", false),
+                    "get_active_wallet");
+            if (activeWallet == null || !activeWallet.optBoolean("ok", false)
+                    || activeWallet.isNull("result")) {
+                LOGGER.info("Unable to cancel Pirate Unified Wallet sync: active wallet was unavailable");
+                return;
+            }
+
+            String walletId = activeWallet.optString("result", null);
+            if (walletId == null || walletId.isBlank()) {
+                LOGGER.info("Unable to cancel Pirate Unified Wallet sync: active wallet ID was unavailable");
+                return;
+            }
+
+            JSONObject cancelRequest = new JSONObject()
+                    .put("method", "cancel_sync")
+                    .put("wallet_id", walletId);
+            JSONObject cancelResponse = parseJsonObject(
+                    LiteWalletJni.invokeJson(cancelRequest.toString(), false), "cancel_sync");
+            if (cancelResponse == null || !cancelResponse.optBoolean("ok", false)) {
+                LOGGER.info("Pirate Unified Wallet sync cancellation was not acknowledged");
+                return;
+            }
+
+            LOGGER.info("Pirate Unified Wallet sync cancellation acknowledged");
+        } catch (RuntimeException | UnsatisfiedLinkError e) {
+            LOGGER.info("Unable to cancel Pirate Unified Wallet sync: {}", e.getMessage());
+        }
+    }
+
+    private static Path getChecksumPath(Path walletPath) {
         return walletPath.resolveSibling(walletPath.getFileName().toString() + ".sha256");
     }
 
@@ -923,6 +1195,17 @@ public class PirateWallet {
     }
 
     public String getWalletAddress() {
+        if (this.unifiedWallet) {
+            // The Unified Wallet's export command returns the active address and
+            // its matching key material. Do not pick the first balance address:
+            // after Ironwood activation that could be an older Sapling address.
+            String address = PirateWallet.getUnifiedExportAddress(LiteWalletJni.execute("export", ""));
+            if (address == null) {
+                LOGGER.info("Unable to obtain active Unified Wallet address from export");
+            }
+            return address;
+        }
+
         // Get balance, which also contains wallet addresses
         String response = LiteWalletJni.execute("balance", "");
         JSONObject json = parseJsonObject(response, "balance");
@@ -939,6 +1222,26 @@ public class PirateWallet {
             }
         }
         return address;
+    }
+
+    static String getUnifiedExportAddress(String response) {
+        if (response == null || response.trim().isEmpty()) {
+            return null;
+        }
+
+        try {
+            JSONArray entries = new JSONArray(response);
+            if (entries.isEmpty()) {
+                return null;
+            }
+            JSONObject firstEntry = entries.getJSONObject(0);
+            if (!firstEntry.has("address") || firstEntry.isNull("address")) {
+                return null;
+            }
+            return firstEntry.getString("address");
+        } catch (JSONException e) {
+            return null;
+        }
     }
 
     public String getPrivateKey() {

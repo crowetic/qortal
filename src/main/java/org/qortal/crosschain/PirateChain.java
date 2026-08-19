@@ -61,9 +61,7 @@ public class PirateChain extends Bitcoiny {
 						new Server("arrr.qortal.link", Server.ConnectionType.SSL, 443),
 						new Server("arrr2.qortal.link", Server.ConnectionType.SSL, 443),
 						new Server("lightd.pirate.black", Server.ConnectionType.SSL, 443),
-						new Server("lightd1.pirate.black", Server.ConnectionType.SSL, 443),
-						new Server("piratelightd1.cryptoforge.cc", Server.ConnectionType.SSL, 443),
-						new Server("piratelightd2.cryptoforge.cc", Server.ConnectionType.SSL, 443));
+						new Server("lightd1.pirate.black", Server.ConnectionType.SSL, 443));
 			}
 
 			@Override
@@ -190,7 +188,7 @@ public class PirateChain extends Bitcoiny {
 	}
 
 	/**
-	 * Returns estimated LTC fee, in sats per 1000bytes, optionally for historic
+	 * Returns estimated Cross-Chain fee, in sats per 1000bytes, optionally for historic
 	 * timestamp.
 	 * 
 	 * @param timestamp optional milliseconds since epoch, or null for 'now'

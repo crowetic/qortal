@@ -505,8 +505,28 @@ public class CrossChainPirateChainResource {
 		}
 		String uri = this.request.getRequestURI();
 		String query = this.request.getQueryString();
-		String path = query == null ? uri : uri + "?" + query;
+		String path = query == null ? uri : uri + "?" + CrossChainPirateChainResource.redactQueryString(query);
 		LOGGER.info("Pirate API {} request: {}{}", action, path, info);
+	}
+
+	/** Keep API keys out of request logs when clients use the query parameter form. */
+	static String redactQueryString(String query) {
+		String[] parameters = query.split("&", -1);
+		StringBuilder redacted = new StringBuilder(query.length());
+		for (int index = 0; index < parameters.length; ++index) {
+			if (index > 0) {
+				redacted.append('&');
+			}
+			String parameter = parameters[index];
+			int separator = parameter.indexOf('=');
+			String name = separator >= 0 ? parameter.substring(0, separator) : parameter;
+			if ("apiKey".equalsIgnoreCase(name)) {
+				redacted.append(name).append("=<redacted>");
+			} else {
+				redacted.append(parameter);
+			}
+		}
+		return redacted.toString();
 	}
 
 	private void logResponse(String action, Object response, boolean sensitive) {
