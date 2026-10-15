@@ -4,7 +4,6 @@ import com.google.common.hash.HashCode;
 import com.rust.litewalletjni.LiteWalletJni;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
-import org.bitcoinj.core.Bech32;
 import org.bitcoinj.core.Coin;
 import org.qortal.account.PrivateKeyAccount;
 import org.qortal.account.PublicKeyAccount;
@@ -120,12 +119,11 @@ public class PirateChainACCTv3TradeBot implements AcctTradeBot {
 			throw new DataException("Pirate wallet not found. Check wallets screen for details.");
 		}
 
-		if (!PirateChain.getInstance().isValidAddress(tradeBotCreateRequest.receivingAddress)) {
+		if (!PirateChainAddress.isValid(tradeBotCreateRequest.receivingAddress)) {
 			throw new DataException("Unsupported Pirate Chain receiving address: " + tradeBotCreateRequest.receivingAddress);
 		}
 
-		Bech32.Bech32Data decodedReceivingAddress = Bech32.decode(tradeBotCreateRequest.receivingAddress);
-		byte[] pirateChainReceivingAccountInfo = decodedReceivingAddress.data;
+		byte[] pirateChainReceivingAccountInfo = PirateChainAddress.toReceivingAccountInfo(tradeBotCreateRequest.receivingAddress);
 
 		PublicKeyAccount creator = new PublicKeyAccount(repository, tradeBotCreateRequest.creatorPublicKey);
 
@@ -179,25 +177,16 @@ public class PirateChainACCTv3TradeBot implements AcctTradeBot {
 	 * Creates a trade-bot entry from the 'Alice' viewpoint, i.e. matching ARRR to an existing offer.
 	 * <p>
 	 * Requires a chosen trade offer from Bob, passed by <tt>crossChainTradeData</tt>
-	 * and access to a PirateChain wallet via <tt>xprv58</tt>.
+	 * and access to a PirateChain wallet via <tt>entropy58</tt>.
 	 * <p>
 	 * The <tt>crossChainTradeData</tt> contains the current trade offer state
 	 * as extracted from the AT's data segment.
 	 * <p>
-	 * Access to a funded wallet is via a PirateChain BIP32 hierarchical deterministic key,
-	 * passed via <tt>xprv58</tt>.
-	 * <b>This key will be stored in your node's database</b>
-	 * to allow trade-bot to create/fund the necessary P2SH transactions!
-	 * However, due to the nature of BIP32 keys, it is possible to give the trade-bot
-	 * only a subset of wallet access (see BIP32 for more details).
-	 * <p>
-	 * As an example, the xprv58 can be extract from a <i>legacy, password-less</i>
-	 * Electrum wallet by going to the console tab and entering:<br>
-	 * <tt>wallet.keystore.xprv</tt><br>
-	 * which should result in a base58 string starting with either 'xprv' (for PirateChain main-net)
-	 * or 'tprv' for (PirateChain test-net).
-	 * <p>
-	 * It is envisaged that the value in <tt>xprv58</tt> will actually come from a Qortal-UI-managed wallet.
+	 * Access to a funded wallet is via 32 bytes of wallet entropy, Base58 encoded.
+	 * Core derives the deterministic mnemonic from this entropy and the native
+	 * wallet derives the shielded spending keys. The entropy is a wallet secret:
+	 * it is stored as foreignKey in the trade-bot database and recovery backups
+	 * so the wallet can be reopened for a refund.
 	 * <p>
 	 * If sufficient funds are available, <b>this method will actually fund the P2SH-A</b>
 	 * with the PirateChain amount expected by 'Bob'.
@@ -209,11 +198,11 @@ public class PirateChainACCTv3TradeBot implements AcctTradeBot {
 	 * <p>
 	 * @param repository
 	 * @param crossChainTradeData chosen trade OFFER that Alice wants to match
-	 * @param seed58 funded wallet xprv in base58
+	 * @param entropy58 funded wallet's 32-byte entropy, Base58 encoded
 	 * @return true if P2SH-A funding transaction successfully broadcast to PirateChain network, false otherwise
 	 * @throws DataException
 	 */
-	public ResponseResult startResponse(Repository repository, ATData atData, ACCT acct, CrossChainTradeData crossChainTradeData, String seed58, String receivingAddress) throws DataException {
+	public ResponseResult startResponse(Repository repository, ATData atData, ACCT acct, CrossChainTradeData crossChainTradeData, String entropy58, String receivingAddress) throws DataException {
 		byte[] tradePrivateKey = TradeBot.generateTradePrivateKey();
 		byte[] secretA = TradeBot.generateSecret();
 		byte[] hashOfSecretA = Crypto.hash160(secretA);
@@ -226,10 +215,6 @@ public class PirateChainACCTv3TradeBot implements AcctTradeBot {
 		byte[] tradeForeignPublicKeyHash = Crypto.hash160(tradeForeignPublicKey);
 		byte[] receivingPublicKeyHash = Base58.decode(receivingAddress); // Actually the whole address, not just PKH
 
-		String tradePrivateKey58 = Base58.encode(tradePrivateKey);
-        String tradeForeignPublicKey58 = Base58.encode(tradeForeignPublicKey);
-		String secret58 = Base58.encode(secretA);
-
 		// We need to generate lockTime-A: add tradeTimeout to now
 		long now = NTP.getTime();
 		int lockTimeA = crossChainTradeData.tradeTimeout * 60 + (int) (now / 1000L);
@@ -241,13 +226,13 @@ public class PirateChainACCTv3TradeBot implements AcctTradeBot {
 				secretA, hashOfSecretA,
 				SupportedBlockchain.PIRATECHAIN.name(),
 				tradeForeignPublicKey, tradeForeignPublicKeyHash,
-				crossChainTradeData.expectedForeignAmount, seed58, null, lockTimeA, receivingPublicKeyHash);
+				crossChainTradeData.expectedForeignAmount, entropy58, null, lockTimeA, receivingPublicKeyHash);
 
 		// Attempt to backup the trade bot data
 		// Include tradeBotData as an additional parameter, since it's not in the repository yet
 		TradeBot.backupTradeBotData(repository, Arrays.asList(tradeBotData));
 
-		// Check we have enough funds via xprv58 to fund P2SH to cover expectedForeignAmount
+		// Check the entropy-backed wallet can fund P2SH to cover expectedForeignAmount.
 		long p2shFee;
 		try {
 			p2shFee = PirateChain.getInstance().getP2shFee(now);
@@ -268,7 +253,7 @@ public class PirateChainACCTv3TradeBot implements AcctTradeBot {
 
 		// Send to P2SH address
 		try {
-			String txid = PirateChain.getInstance().fundP2SH(seed58, p2shAddressT3, amountA, redeemScriptWithPrefix58);
+			String txid = PirateChain.getInstance().fundP2SH(entropy58, p2shAddressT3, amountA, redeemScriptWithPrefix58);
 			LOGGER.info("fundingTxidHex: {}", txid);
 
 		} catch (ForeignBlockchainException e) {
@@ -747,7 +732,12 @@ public class PirateChainACCTv3TradeBot implements AcctTradeBot {
 		long feeTimestamp = calcFeeTimestamp(lockTimeA, crossChainTradeData.tradeTimeout);
 		long p2shFee = PirateChain.getInstance().getP2shFee(feeTimestamp);
 		long minimumAmountA = crossChainTradeData.expectedForeignAmount + p2shFee;
-		String receivingAddress = Bech32.encode("zs", receivingAccountInfo);
+		String receivingAddress;
+		try {
+			receivingAddress = PirateChainAddress.fromReceivingAccountInfo(receivingAccountInfo);
+		} catch (IllegalArgumentException e) {
+			throw new DataException("Invalid stored Pirate Chain receiving address", e);
+		}
 
 		BitcoinyHTLC.Status htlcStatusA = PirateChainHTLC.determineHtlcStatus(pirateChain.getBlockchainProvider(), p2shAddress, minimumAmountA);
 

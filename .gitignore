@@ -2,6 +2,7 @@
 /lists/
 /bin/
 /target/
+/codegraph-cache/
 /qortal-backup/
 /log.txt.*
 /arbitrary*

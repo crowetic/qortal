@@ -1,0 +1,126 @@
+package org.qortal.controller.tradebot;
+
+import com.rust.litewalletjni.LiteWalletJni;
+import org.bitcoinj.core.Bech32;
+import org.json.JSONObject;
+import org.junit.After;
+import org.junit.Before;
+import org.junit.Test;
+import org.qortal.api.model.crosschain.TradeBotCreateRequest;
+import org.qortal.crosschain.PirateChainAddress;
+import org.qortal.crosschain.SupportedBlockchain;
+import org.qortal.data.crosschain.TradeBotData;
+import org.qortal.repository.DataException;
+import org.qortal.repository.Repository;
+import org.qortal.repository.RepositoryManager;
+import org.qortal.settings.Settings;
+import org.qortal.test.common.Common;
+
+import java.lang.reflect.Field;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.List;
+
+import static org.junit.Assert.*;
+
+/** Offline trade creation plus real HSQLDB and backup round trips. No native spending. */
+public class PirateChainACCTv3TradeBotTests extends Common {
+
+	private static final String SAPLING = "zs1mj80tkyjqjhc84aquetymwgrasxjdkkft0qcn5xtp2p9r42vs5ernyv4nzgufmz6xzuqvw20w9z";
+	private static final String IRONWOOD = "pirate1lyp0g5438qkp9s5me5epku9ak9k0dxqsfyt9z894zym8qw38sps488ljyee27yw29vc2cyj8mse";
+	private Field loadedField;
+	private boolean previouslyLoaded;
+	private Field exportPathField;
+	private String previousExportPath;
+	private Path backupDirectory;
+
+	@Before
+	public void beforeTest() throws Exception {
+		Common.useDefaultSettings();
+		// Creation only needs a creator reference, not a live chain or genesis replay.
+		try (Repository repository = RepositoryManager.getRepository()) {
+			Common.getTestAccount(repository, "alice").setLastReference(new byte[64]);
+			repository.saveChanges();
+		}
+		backupDirectory = Files.createTempDirectory(Path.of("target"), "pirate-tradebot-backup-");
+		exportPathField = Settings.class.getDeclaredField("exportPath");
+		exportPathField.setAccessible(true);
+		previousExportPath = Settings.getInstance().getExportPath();
+		exportPathField.set(Settings.getInstance(), backupDirectory.toString());
+		// The seller only needs the architecture/load gate; creation must not call JNI.
+		loadedField = LiteWalletJni.class.getDeclaredField("loaded");
+		loadedField.setAccessible(true);
+		previouslyLoaded = loadedField.getBoolean(null);
+		loadedField.setBoolean(null, true);
+	}
+
+	@After
+	public void afterTest() throws Exception {
+		if (loadedField != null)
+			loadedField.setBoolean(null, previouslyLoaded);
+		if (exportPathField != null)
+			exportPathField.set(Settings.getInstance(), previousExportPath);
+	}
+
+	@Test
+	public void ironwoodSellOrderSurvivesDatabaseAndBackupWithoutWalletSecret() throws Exception {
+		TradeBotData saved = createAndReload(IRONWOOD);
+		assertEquals(IRONWOOD, new String(saved.getReceivingAccountInfo(), StandardCharsets.US_ASCII));
+	}
+
+	@Test
+	public void saplingSellOrderKeepsLegacyStorageAndSettlement() throws Exception {
+		TradeBotData saved = createAndReload(SAPLING);
+		assertArrayEquals(Bech32.decode(SAPLING).data, saved.getReceivingAccountInfo());
+	}
+
+	@Test
+	public void invalidReceivingAddressDoesNotCreateATOrTradeRecord() throws Exception {
+		try (Repository repository = RepositoryManager.getRepository()) {
+			TradeBotCreateRequest request = request(repository, "invalid");
+			try {
+				PirateChainACCTv3TradeBot.getInstance().createTrade(repository, request);
+				fail("Expected invalid receiving address to be rejected");
+			} catch (DataException expected) {
+				assertTrue(expected.getMessage().contains("Unsupported Pirate Chain receiving address"));
+			}
+			assertTrue(repository.getCrossChainRepository().getAllTradeBotData().isEmpty());
+		}
+	}
+
+	private TradeBotData createAndReload(String address) throws Exception {
+		byte[] tradePrivateKey;
+		try (Repository repository = RepositoryManager.getRepository()) {
+			byte[] unsignedAT = PirateChainACCTv3TradeBot.getInstance().createTrade(repository, request(repository, address));
+			assertTrue(unsignedAT.length > 0);
+			List<TradeBotData> trades = repository.getCrossChainRepository().getAllTradeBotData();
+			assertEquals(1, trades.size());
+			tradePrivateKey = trades.get(0).getTradePrivateKey();
+		}
+
+		try (Repository repository = RepositoryManager.getRepository()) {
+			TradeBotData saved = repository.getCrossChainRepository().getTradeBotData(tradePrivateKey);
+			assertNotNull(saved);
+			assertNull("Sellers must not persist a wallet secret", saved.getForeignKey());
+			assertEquals(address, PirateChainAddress.fromReceivingAccountInfo(saved.getReceivingAccountInfo()));
+			JSONObject backup = new JSONObject(Files.readString(backupDirectory.resolve("TradeBotStates.json")));
+			TradeBotData restored = TradeBotData.fromJson(backup.getJSONArray("data").getJSONObject(0));
+			assertEquals(address, PirateChainAddress.fromReceivingAccountInfo(restored.getReceivingAccountInfo()));
+			assertNull(restored.getForeignKey());
+			return saved;
+		}
+	}
+
+	private TradeBotCreateRequest request(Repository repository, String address) {
+		TradeBotCreateRequest request = new TradeBotCreateRequest();
+		request.creatorPublicKey = Common.getTestAccount(repository, "alice").getPublicKey();
+		request.foreignBlockchain = SupportedBlockchain.PIRATECHAIN;
+		request.receivingAddress = address;
+		request.qortAmount = 100_000_000L;
+		request.fundingQortAmount = 200_000_000L;
+		request.foreignAmount = 100_000_000L;
+		request.tradeTimeout = 60;
+		return request;
+	}
+}

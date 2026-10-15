@@ -1256,22 +1256,34 @@ public class PirateWallet {
     }
 
     public String getWalletAddress() {
+        if (this.unifiedWallet) {
+            // Ask for the active pool's address without exporting spending keys.
+            // Re-read it after sync so a cached Sapling address cannot mask the
+            // switch to Ironwood when the activation height becomes known.
+            JSONObject activeWallet = parseJsonObject(
+                    LiteWalletJni.invokeJson("{\"method\":\"get_active_wallet\"}", false),
+                    "get_active_wallet");
+            if (activeWallet == null || !activeWallet.optBoolean("ok", false)
+                    || !(activeWallet.opt("result") instanceof String)) {
+                return null;
+            }
+            String walletId = activeWallet.optString("result", null);
+            if (walletId == null || walletId.isBlank()) {
+                return null;
+            }
+            JSONObject request = new JSONObject()
+                    .put("method", "current_receive_address")
+                    .put("wallet_id", walletId);
+            String address = PirateWallet.getUnifiedReceiveAddress(LiteWalletJni.invokeJson(request.toString(), false));
+            if (address == null) {
+                LOGGER.info("Unable to obtain active Unified Wallet receiving address");
+            }
+            return address;
+        }
+
         String cachedAddress = this.walletAddress;
         if (cachedAddress != null) {
             return cachedAddress;
-        }
-
-        if (this.unifiedWallet) {
-            // The Unified Wallet's export command returns the active address and
-            // its matching key material. Do not pick the first balance address:
-            // after Ironwood activation that could be an older Sapling address.
-            String address = PirateWallet.getUnifiedExportAddress(LiteWalletJni.execute("export", ""));
-            if (address == null) {
-                LOGGER.info("Unable to obtain active Unified Wallet address from export");
-            } else {
-                this.walletAddress = address;
-            }
-            return address;
         }
 
         // Get balance, which also contains wallet addresses
@@ -1295,21 +1307,18 @@ public class PirateWallet {
         return address;
     }
 
-    static String getUnifiedExportAddress(String response) {
+    static String getUnifiedReceiveAddress(String response) {
         if (response == null || response.trim().isEmpty()) {
             return null;
         }
 
         try {
-            JSONArray entries = new JSONArray(response);
-            if (entries.isEmpty()) {
+            JSONObject json = new JSONObject(response);
+            if (!json.optBoolean("ok", false) || !(json.opt("result") instanceof String)) {
                 return null;
             }
-            JSONObject firstEntry = entries.getJSONObject(0);
-            if (!firstEntry.has("address") || firstEntry.isNull("address")) {
-                return null;
-            }
-            return firstEntry.getString("address");
+            String address = json.getString("result");
+            return PirateChainAddress.isValid(address) ? address : null;
         } catch (JSONException e) {
             return null;
         }
