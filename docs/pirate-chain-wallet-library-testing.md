@@ -41,9 +41,29 @@ artifact: pirate-unified-wallet-qortal-jni-artifacts-v1.2.6.zip
 sha256:   60c91d1abfba16f97e22bf0f78b4aa846f9bd5b7455ab7d2f7155a3f5f9d1bc5
 ```
 
-The confirmed Core default remains the v1.1.9 publication recorded below.
-Updating the script pins does not publish v1.2.6 or change that default. Stage,
-test, publish, and verify a new immutable transaction before selecting v1.2.6.
+Core now defaults to the confirmed v1.2.6 publication recorded below. The
+staging and publication scripts also pin this release's archive checksum.
+
+### Confirmed v1.2.6 default publication
+
+The cross-platform release was verified through the Core transaction API:
+
+```text
+name:       PirateChainWallet
+identifier: LiteWalletJNI-2026-10-unified-v1.2.6
+signature:  3mK3T9pGj6FYSiD4KtkadNBzMDChcgLX4mtPRCnDrFpnSg3VGHasrYA9ByFNc84ok1yA8M2W13UYgXp6tJwMaKML
+block:      2774289
+fee:        0.01000000 QORT
+size:       333259728 bytes
+bundle:     Cross-platform (all five supported native libraries)
+```
+
+It is an `ARBITRARY_DATA` (service 100) `PUT` publication. Core selects this
+exact transaction when `pirateChainWalletQdnSignature` is absent from settings,
+and enables `pirateChainWalletUnified` by default. An existing explicit
+signature override still takes precedence; remove it or select the signature
+above when testing this default. Restart the JVM after selecting another
+bundle because a loaded native library cannot be replaced in a running JVM.
 
 ### Historical v1.1.7 Linux x86_64 test publication
 
@@ -63,9 +83,9 @@ exact signature as the latest resource transaction for `testARRR` and the
 identifier above. Use it only for Linux x86_64 Unified Wallet smoke tests; a
 different staged publication is required for every other host platform.
 
-### Confirmed v1.1.9 production Unified Wallet publication
+### Historical v1.1.9 production Unified Wallet publication
 
-The reviewed cross-platform release is confirmed and is the Core default:
+The previous cross-platform default remains confirmed on QDN:
 
 ```text
 name:       PirateChainWallet
@@ -76,10 +96,9 @@ fee:        0.01000000 QORT
 bundle:     Cross-platform (all five supported native libraries)
 ```
 
-It is an `ARBITRARY_DATA` `PUT` publication. New Core configurations select
-this exact transaction and enable `pirateChainWalletUnified` by default.
-Operators overriding the signature to load a legacy bundle must set
-`pirateChainWalletUnified: false` explicitly.
+It is an `ARBITRARY_DATA` `PUT` publication. An explicit signature override
+can still select this Unified Wallet bundle. Operators selecting a legacy
+pre-Unified bundle must set `pirateChainWalletUnified: false` explicitly.
 
 ### Compatibility review: 26 October 2026
 
@@ -132,14 +151,15 @@ Validation of the combined source:
   is server indexing or historical fixture assumptions. It prevents claiming
   that live HTLC discovery is verified. Recheck after daemon/index recovery.
 
-The default QDN signature above still selects v1.1.9. v1.2.6 adds relevant
+At the start of this review, the default QDN signature selected v1.1.9.
+The confirmed v1.2.6 publication above is now the default. v1.2.6 adds relevant
 sync-interruption, transaction-accounting, recovery-deadline, and transport
-fixes; it merits a separate bundle upgrade before a wider release. Selecting
-it requires a reviewed cross-platform QDN publication and a new immutable
-signature; downloading or testing its ZIP does not update existing nodes.
+fixes. Downloading or testing its ZIP alone does not update existing nodes;
+they must run a build selecting the new immutable signature, with any explicit
+old signature override removed or updated.
 Both staging and publication scripts now pin the v1.2.6 archive checksum.
 They reject older archives and manifests; retained v1.1.9 publications and
-Core's default signature remain unchanged.
+wallet data remain available.
 
 Before release, complete funded send, HTLC completion/refund, legacy migration,
 and recovery of wallet state that scanned the discarded chain against the

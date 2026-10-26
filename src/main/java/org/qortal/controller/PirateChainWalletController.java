@@ -112,11 +112,11 @@ public class PirateChainWalletController extends Thread {
     private volatile boolean restartRotateServer = true;
 
     /**
-     * The reviewed Pirate Unified Wallet production bundle. Operators can
+     * The reviewed Stashi v1.2.6 Qortal JNI cross-platform bundle. Operators can
      * override it with pirateChainWalletQdnSignature to test a specific,
      * immutable QDN publication without changing production data.
      */
-    public static final String DEFAULT_QDN_WALLET_SIGNATURE = "5drafi8G5WTjGVGh8B66runy51DDxupEEFaT67rAXgosDf6u22NWGntHZZ3jxv7Sq7AXtker7dxeXUkgxQ5yPcG1";
+    public static final String DEFAULT_QDN_WALLET_SIGNATURE = "3mK3T9pGj6FYSiD4KtkadNBzMDChcgLX4mtPRCnDrFpnSg3VGHasrYA9ByFNc84ok1yA8M2W13UYgXp6tJwMaKML";
 
     private PirateChainWalletController() {
         this.running = Settings.getInstance().isWalletEnabled("ARRR");
