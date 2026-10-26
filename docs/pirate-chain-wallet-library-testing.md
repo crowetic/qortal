@@ -80,7 +80,74 @@ this exact transaction and enable `pirateChainWalletUnified` by default.
 Operators overriding the signature to load a legacy bundle must set
 `pirateChainWalletUnified: false` explicitly.
 
-Download, verify, and extract it into a new local staging directory:
+### Compatibility review: 26 October 2026
+
+The combined `pirate-changes` build incorporates upstream `develop`
+`181996b2cd1b84e844d33c2721614259679eae01`, including Phil's client-signed
+BTC-family payments (`17e06908b`), payment-status checks (`5c434bb8c`), and
+dust-threshold correction (`1864a7765`). It also retains the October 14 Pirate
+fixes in `07baa1798`. Local `develop` tracks `qortal-upstream/develop`;
+the combined test candidate is delivered on `crowetic/qortal:pirate-changes`.
+
+Pirate's wallet project has moved to
+[Stashi-Wallet](https://github.com/PirateNetwork/Stashi-Wallet). Its latest
+published Qortal JNI artifact at review time is
+[v1.2.6](https://github.com/PirateNetwork/Stashi-Wallet/releases/tag/v1.2.6),
+published October 2, before the October 14 incident:
+
+```text
+artifact: pirate-unified-wallet-qortal-jni-artifacts-v1.2.6.zip
+sha256:   60c91d1abfba16f97e22bf0f78b4aa846f9bd5b7455ab7d2f7155a3f5f9d1bc5
+```
+
+Core loads JNI rather than launching `pirate-qortal-cli`, as described in the
+[upstream handoff](https://github.com/PirateNetwork/Stashi-Wallet/blob/v1.2.6/docs/qortal-handoff.md).
+The v1.1.9 and v1.2.6 network parameters and light-client consensus-validation
+sources are identical. No rollback-specific Java, protobuf, or JNI replacement
+was identified as required by this review. Pirate's mandatory full-node
+consensus fixes are documented in its
+[6.0.10 security release notes](https://github.com/PirateNetwork/pirate/blob/v6.0.14-b14db80/doc/release-notes/release-notes-6.0.10.md);
+they must be applied on the daemon side independently.
+
+Validation of the combined source:
+
+- All 49 focused offline tests passed, covering JNI serialization, wallet
+  migration, addresses, history, controller behavior, Pirate trade state,
+  client-signed BTC-family payments, API JSON, and active-chat membership.
+- The opt-in production compact-block gate passed. `arrr.qortal.link` and
+  `arrr2.qortal.link` served linked recent blocks at heights 4,185,775 and
+  4,185,776. `arrr3.qortal.link` and `lightd1.pirate.black` returned HTTP 502;
+  `lightd.pirate.black` timed out. These are observations, not endpoint changes.
+- In separate Linux x86_64 JVMs and fresh isolated storage, both the pinned
+  v1.1.9 library and the checksum-verified v1.2.6 library initialized a public,
+  unfunded test wallet four blocks before the live tip and synchronized to
+  height 4,185,776. Balance remained zero and history empty; no transaction
+  was signed or broadcast.
+- The broader `Pirate*Tests` run had seven failures in the existing live
+  historical HTLC/address-history tests. Both responding Qortal endpoints
+  returned empty `GetTaddressTxids` results for the fixture addresses even
+  over the full height range; direct lookup still returned the known funding
+  transaction at height 1,908,942. This does not establish whether the cause
+  is server indexing or historical fixture assumptions. It prevents claiming
+  that live HTLC discovery is verified. Recheck after daemon/index recovery.
+
+The default QDN signature above still selects v1.1.9. v1.2.6 adds relevant
+sync-interruption, transaction-accounting, recovery-deadline, and transport
+fixes; it merits a separate bundle upgrade before a wider release. Selecting
+it requires a reviewed cross-platform QDN publication and a new immutable
+signature; downloading or testing its ZIP does not update existing nodes.
+The staging script remains pinned to v1.1.9 and will reject the newer ZIP.
+
+Before release, complete funded send, HTLC completion/refund, legacy migration,
+and recovery of wallet state that scanned the discarded chain against the
+recovered servers and matching Hub build. A fresh-tip smoke test does not
+validate deep rollback recovery. Back up wallet directories and trade-bot data
+before those tests. Do not downgrade a node managing local-funding trades in
+state 80; retain its matching JAR, settings, and backups for recovery, as
+described in [local-wallet-signing.md](local-wallet-signing.md).
+
+Download, verify, and extract the published v1.1.9 bundle into a new local
+staging directory:
 
 ```bash
 curl -fL \
