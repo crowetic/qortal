@@ -6,8 +6,8 @@ set -euo pipefail
 # library and is the only shape accepted by the guarded release workflow.
 # This script deliberately does not publish or sign anything.
 
-readonly EXPECTED_SHA256='059781c5a2cdeb8c5d60f1130c4bf3a217822d39438e560bc11633993df0e1e9'
-readonly RELEASE_URL='https://github.com/PirateNetwork/Pirate-Unified-Light-Wallet/releases/download/v1.1.9/pirate-unified-wallet-qortal-jni-artifacts-v1.1.9.zip'
+readonly EXPECTED_SHA256='60c91d1abfba16f97e22bf0f78b4aa846f9bd5b7455ab7d2f7155a3f5f9d1bc5'
+readonly RELEASE_URL='https://github.com/PirateNetwork/Stashi-Wallet/releases/download/v1.2.6/pirate-unified-wallet-qortal-jni-artifacts-v1.2.6.zip'
 
 usage() {
 	cat <<'EOF'
@@ -18,7 +18,7 @@ Platforms: linux-x86_64, linux-aarch64, macos-x86_64, macos-aarch64, windows-x86
 Use "all" to stage the five-library cross-platform production bundle.
 When omitted, platform defaults to the publishing host.
 
-The artifact must be the Pirate Unified Wallet v1.1.9 Qortal JNI archive with
+The artifact must be the Stashi Wallet v1.2.6 Qortal JNI archive with
 the SHA-256 pinned in this script. The output directory must not exist.
 EOF
 }
