@@ -135,6 +135,46 @@ public class ArbitraryResourceSearchTests extends Common {
         }
     }
 
+    @Test
+    public void testLatestSelectionRemainsIndependentForEachService() throws Exception {
+        try (Repository repository = RepositoryManager.getRepository()) {
+            saveResource(repository, "Alpha", "old", 100L, "Old title");
+            saveResource(repository, "Alpha", "new", 300L, "New title");
+            saveResource(repository, Service.FILE, "Alpha", "file", 500L, null);
+            List<ArbitraryResourceData> results = search(repository, null, null, null, null,
+                    false, false, SearchMode.LATEST, null, null, null);
+            assertEquals(1, results.size());
+            assertEquals("new", results.get(0).identifier);
+
+            results = repository.getArbitraryRepository().searchArbitraryResources(null, null, null,
+                    null, null, null, null, false, null, false, SearchMode.LATEST, null, false, false,
+                    false, false, null, null, null, null, null);
+            assertEquals(2, results.size());
+            assertEquals(Service.WEBSITE, results.get(0).service);
+            assertEquals(Long.valueOf(300L), results.get(0).created);
+            assertEquals(Service.FILE, results.get(1).service);
+            assertEquals(Long.valueOf(500L), results.get(1).created);
+        }
+    }
+
+    @Test
+    public void testLatestFiltersDoNotFallBackToOlderResources() throws Exception {
+        try (Repository repository = RepositoryManager.getRepository()) {
+            saveResource(repository, "Alpha", "old", 100L, "Old title");
+            saveResource(repository, "Alpha", "new", 300L, "New title");
+            assertTrue(search(repository, null, "old", null, null,
+                    false, false, SearchMode.LATEST, null, null, null).isEmpty());
+            List<ArbitraryResourceData> results = search(repository, null, "new", null, null,
+                    false, false, SearchMode.LATEST, null, null, null);
+            assertEquals(1, results.size());
+            assertEquals("new", results.get(0).identifier);
+            results = repository.getArbitraryRepository().searchArbitraryResources(Service.WEBSITE, null, null,
+                    null, null, null, null, false, null, false, SearchMode.LATEST, null, false, false,
+                    false, false, 200L, null, null, null, null);
+            assertTrue("A date filter must not select an older identifier", results.isEmpty());
+        }
+    }
+
     private static List<ArbitraryResourceData> search(Repository repository, String query, String title,
             String description, List<String> keywords, boolean defaultResource, Boolean includeMetadata,
             SearchMode mode, Integer limit, Integer offset, Boolean reverse) throws Exception {
@@ -157,9 +197,14 @@ public class ArbitraryResourceSearchTests extends Common {
 
     private static void saveResource(Repository repository, String name, String identifier, long created,
             String title) throws Exception {
+        saveResource(repository, Service.WEBSITE, name, identifier, created, title);
+    }
+
+    private static void saveResource(Repository repository, Service service, String name, String identifier,
+            long created, String title) throws Exception {
         ArbitraryResourceData resource = new ArbitraryResourceData();
         resource.name = name;
-        resource.service = Service.WEBSITE;
+        resource.service = service;
         resource.identifier = identifier;
         resource.size = 123;
         resource.created = created;

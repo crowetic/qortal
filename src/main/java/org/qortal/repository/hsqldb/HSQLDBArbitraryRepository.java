@@ -1108,7 +1108,14 @@ public class HSQLDBArbitraryRepository implements ArbitraryRepository {
 			case LATEST:
 				// Include latest item only for a name/service combination
 				sql.append(" JOIN (SELECT name, service, MAX(created_when) AS latest " +
-						"FROM ArbitraryResourcesCache GROUP BY name, service) LatestResources " +
+						"FROM ArbitraryResourcesCache");
+				// Service is a grouping key, so restricting it here preserves the latest row
+				// for each name while avoiding aggregation of every other service's resources.
+				if (service != null) {
+					sql.append(" WHERE service = ?");
+					bindParams.add(service.value);
+				}
+				sql.append(" GROUP BY name, service) LatestResources " +
 						"ON name=LatestResources.name AND service=LatestResources.service " +
 						"AND created_when=LatestResources.latest");
 				break;
