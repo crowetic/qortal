@@ -1080,6 +1080,13 @@ public class HSQLDBDatabaseUpdates {
 
 					break;
 
+				case 53:
+					// Block processing and orphaning remove zero balances after every block.
+					// The existing (asset_id, balance) index cannot find zeroes across all assets.
+					LOGGER.info("Adding zero-balance cleanup index - this may take a while...");
+					stmt.execute("CREATE INDEX IF NOT EXISTS AccountBalancesBalanceIndex ON AccountBalances (balance)");
+					break;
+
 				default:
 					// nothing to do
 					return false;
