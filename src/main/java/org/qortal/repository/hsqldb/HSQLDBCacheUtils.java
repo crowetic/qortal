@@ -32,10 +32,12 @@ import java.util.AbstractMap;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.Timer;
 import java.util.TimerTask;
 import java.util.concurrent.ConcurrentHashMap;
@@ -201,11 +203,15 @@ public class HSQLDBCacheUtils {
             stream = stream.filter( candidate -> candidate.created < before.get().longValue() );
         }
 
-        if(exclude.isPresent())
-            stream = stream.filter( candidate -> !exclude.get().get().contains( candidate.name ));
+        // Resolve each list once per search, rather than rebuilding it for every candidate.
+        if (exclude.isPresent()) {
+            Set<String> excludedNames = new HashSet<>(exclude.get().get());
+            stream = stream.filter(candidate -> !excludedNames.contains(candidate.name));
+        }
 
-        if( includeOnly.isPresent()) {
-            stream = stream.filter( candidate -> includeOnly.get().get().contains( candidate.name ));
+        if (includeOnly.isPresent()) {
+            Set<String> includedNames = new HashSet<>(includeOnly.get().get());
+            stream = stream.filter(candidate -> includedNames.contains(candidate.name));
         }
 
         // filter by service
@@ -250,40 +256,14 @@ public class HSQLDBCacheUtils {
             });
         }
 
-        if (keywords.isPresent() && !keywords.get().isEmpty()) {
-            List<String> searchKeywords = keywords.get().stream()
-                .map(String::toLowerCase)
-                .collect(Collectors.toList());
-
-            stream = stream.filter(candidate -> {
-                if (candidate.metadata != null && candidate.metadata.getDescription() != null) {
-            String descriptionLower = candidate.metadata.getDescription().toLowerCase();
-            return searchKeywords.stream().anyMatch(descriptionLower::contains);
-                }
-                return false;
-            });
-        }
-
         // if exact names is set, retain resources with exact names
         if( exactMatchNames.isPresent() && !exactMatchNames.get().isEmpty()) {
-
-            // key the data by lower case name
-            Map<String, List<ArbitraryResourceData>> dataByName
-                    = stream.collect(Collectors.groupingBy(data -> data.name.toLowerCase()));
-
-            // lower the case of the exact names
-            // retain the lower case names of the data above
-            List<String> exactNamesToSearch
+            Set<String> exactNamesToSearch
                 = exactMatchNames.get().stream()
                     .map(String::toLowerCase)
-                    .collect(Collectors.toList());
-            exactNamesToSearch.retainAll(dataByName.keySet());
+                    .collect(Collectors.toSet());
 
-            // get the data for the names retained and
-            // set them to the stream
-            stream
-                = dataByName.entrySet().stream()
-                    .filter(entry -> exactNamesToSearch.contains(entry.getKey())).flatMap(entry -> entry.getValue().stream());
+            stream = stream.filter(data -> exactNamesToSearch.contains(data.name.toLowerCase()));
         }
         // if exact names is not set, retain resources that match
         else if( names.isPresent() && !names.get().isEmpty() ) {
@@ -319,60 +299,23 @@ public class HSQLDBCacheUtils {
         // truncate to limit
         if( limit.isPresent() && limit.get() > 0 ) stream = stream.limit(limit.get());
 
-        List<ArbitraryResourceData> listCopy1 = stream.collect(Collectors.toList());
-
-        List<ArbitraryResourceData> listCopy2 = new ArrayList<>(listCopy1.size());
-
-        // remove metadata from the first copy
-        if( includeMetadata.isEmpty() || !includeMetadata.get() ) {
-            for( ArbitraryResourceData data : listCopy1 ) {
-                ArbitraryResourceData copy = new ArbitraryResourceData();
-                copy.name = data.name;
-                copy.service = data.service;
-                copy.identifier = data.identifier;
-                copy.status = data.status;
-                copy.metadata = null;
-
-                copy.size = data.size;
-                copy.created = data.created;
-                copy.updated = data.updated;
-                copy.latestSignature = data.latestSignature;
-
-                listCopy2.add(copy);
-            }
-        }
-        // put the list copy 1 into the second copy
-        else {
-            listCopy2.addAll(listCopy1);
-        }
-
-        // remove status from final copy
-        if( includeStatus.isEmpty() || !includeStatus.get() ) {
-
-            List<ArbitraryResourceData> finalCopy = new ArrayList<>(listCopy2.size());
-
-            for( ArbitraryResourceData data : listCopy2 ) {
-                ArbitraryResourceData copy = new ArbitraryResourceData();
-                copy.name = data.name;
-                copy.service = data.service;
-                copy.identifier = data.identifier;
-                copy.status = null;
-                copy.metadata = data.metadata;
-
-                copy.size = data.size;
-                copy.created = data.created;
-                copy.updated = data.updated;
-                copy.latestSignature = data.latestSignature;
-
-                finalCopy.add(copy);
-            }
-
-            return finalCopy;
-        }
-        // keep status included by returning the second copy
-        else {
-            return listCopy2;
-        }
+        boolean keepMetadata = includeMetadata.orElse(false);
+        boolean keepStatus = includeStatus.orElse(false);
+        // Copy once after pagination, preserving the shared cache entries when hiding fields.
+        return stream.map(data -> {
+            if (keepMetadata && keepStatus) return data;
+            ArbitraryResourceData copy = new ArbitraryResourceData();
+            copy.name = data.name;
+            copy.service = data.service;
+            copy.identifier = data.identifier;
+            copy.status = keepStatus ? data.status : null;
+            copy.metadata = keepMetadata ? data.metadata : null;
+            copy.size = data.size;
+            copy.created = data.created;
+            copy.updated = data.updated;
+            copy.latestSignature = data.latestSignature;
+            return copy;
+        }).collect(Collectors.toList());
     }
 
     /**
@@ -585,11 +528,13 @@ public class HSQLDBCacheUtils {
     }
 
     private static Predicate<String> getContainsPredicate(String term) {
-        return value -> value != null && value.toLowerCase().contains(term.toLowerCase());
+        String lowerTerm = term.toLowerCase();
+        return value -> value != null && value.toLowerCase().contains(lowerTerm);
     }
 
     private static Predicate<String> getPrefixPredicate(String term) {
-        return value -> value != null && value.toLowerCase().startsWith(term.toLowerCase());
+        String lowerTerm = term.toLowerCase();
+        return value -> value != null && value.toLowerCase().startsWith(lowerTerm);
     }
 
     /**
