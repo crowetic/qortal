@@ -1,13 +1,27 @@
 package org.qortal.crosschain;
 
 import org.json.JSONObject;
+import org.junit.BeforeClass;
 import org.junit.Test;
 import org.qortal.api.model.crosschain.PirateChainSpendability;
+import org.qortal.settings.Settings;
+
+import java.net.URL;
 
 import static org.junit.Assert.*;
 
 /** Offline fixtures for the pinned JNI's compatibility and typed response contracts. */
 public class PirateSpendResponseTests {
+
+	@BeforeClass
+	public static void useFixtureSettings() {
+		// PirateChain inherits Bitcoiny's settings-backed executor. Load public test
+		// settings before its first use rather than depending on a local settings.json
+		// or another test class running first.
+		URL fixture = PirateSpendResponseTests.class.getClassLoader().getResource("test-settings-v2.json");
+		assertNotNull("Missing test settings fixture", fixture);
+		Settings.fileInstance(fixture.getPath());
+	}
 
 	@Test
 	public void sendAndTradeFundingRecognizeActualInsufficientFunds() throws Exception {
