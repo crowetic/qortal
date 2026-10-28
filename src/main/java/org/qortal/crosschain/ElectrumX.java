@@ -40,7 +40,9 @@ public class ElectrumX extends BitcoinyBlockchainProvider {
 
 	// See: https://electrumx.readthedocs.io/en/latest/protocol-changes.html
 	private static final double MIN_PROTOCOL_VERSION = 1.2;
-	private static final double MAX_PROTOCOL_VERSION = 2.0; // Higher than current latest, for hopeful future-proofing
+	// Advertise only implemented semantics: 1.6 changes header responses and 1.7
+	// removes the blockchain.scripthash methods used for wallet discovery/spending.
+	private static final double MAX_PROTOCOL_VERSION = 1.4;
 	private static final int MIN_TARGET_CONNECTIONS = 2;
 	private static final int DEFAULT_TARGET_CONNECTIONS = 3;
 	private static final double TARGET_CONNECTIONS_FRACTION = 0.75d;
