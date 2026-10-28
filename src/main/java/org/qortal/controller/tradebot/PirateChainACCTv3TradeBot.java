@@ -256,9 +256,12 @@ public class PirateChainACCTv3TradeBot implements AcctTradeBot {
 			String txid = PirateChain.getInstance().fundP2SH(entropy58, p2shAddressT3, amountA, redeemScriptWithPrefix58);
 			LOGGER.info("fundingTxidHex: {}", txid);
 
-		} catch (ForeignBlockchainException e) {
-			LOGGER.debug("Unable to build and send P2SH-A funding transaction - lack of funds?");
+		} catch (ForeignBlockchainException.InsufficientFundsException e) {
+			LOGGER.warn("Unable to fund PirateChain P2SH-A: {}", e.getMessage());
 			return ResponseResult.BALANCE_ISSUE;
+		} catch (ForeignBlockchainException e) {
+			LOGGER.warn("Unable to fund PirateChain P2SH-A: {}", e.getMessage());
+			return ResponseResult.NETWORK_ISSUE;
 		}
 
 		// Attempt to send MESSAGE to Bob's Qortal trade address

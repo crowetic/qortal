@@ -12,6 +12,7 @@ import org.libdohj.params.LitecoinTestNet3Params;
 import org.libdohj.params.PirateChainMainNetParams;
 import org.qortal.api.model.crosschain.PirateChainBalance;
 import org.qortal.api.model.crosschain.PirateChainSendRequest;
+import org.qortal.api.model.crosschain.PirateChainSpendability;
 import org.qortal.controller.PirateChainWalletController;
 import org.qortal.crosschain.PirateLightClient.Server;
 import org.qortal.crosschain.ChainableServer.ConnectionType;
@@ -327,6 +328,45 @@ public class PirateChain extends Bitcoiny {
 		}
 	}
 
+	public PirateChainSpendability getWalletSpendability(String entropy58) throws ForeignBlockchainException {
+		PirateChainWalletController walletController = PirateChainWalletController.getInstance();
+		if (walletController == null)
+			throw new ForeignBlockchainException("Pirate wallet is disabled");
+		// Do not require height synchronization: callers need to see readiness while syncing too.
+		walletController.beginWalletUse(entropy58, false, false, true);
+		try {
+			if (!walletController.getCurrentWallet().usesPersistentUnifiedStorage())
+				throw new ForeignBlockchainException("Spendability status requires the Pirate Unified Wallet library");
+
+			String walletId = getUnifiedEnvelopeString(parseLitewalletResponse(
+					LiteWalletJni.invokeJson("{\"method\":\"get_active_wallet\"}", false), "get_active_wallet"),
+					"get_active_wallet");
+			JSONObject statusRequest = new JSONObject().put("method", "get_spendability_status")
+					.put("wallet_id", walletId);
+			return parseSpendabilityResponse(LiteWalletJni.invokeJson(statusRequest.toString(), false));
+		} finally {
+			walletController.endWalletUse();
+		}
+	}
+
+	static PirateChainSpendability parseSpendabilityResponse(String response) throws ForeignBlockchainException {
+		JSONObject result = getUnifiedEnvelopeObject(parseLitewalletResponse(response, "get_spendability_status"),
+				"get_spendability_status");
+		try {
+			PirateChainSpendability status = new PirateChainSpendability();
+			status.spendable = result.getBoolean("spendable");
+			status.rescan_required = result.getBoolean("rescan_required");
+			status.target_height = result.getLong("target_height");
+			status.anchor_height = result.getLong("anchor_height");
+			status.validated_anchor_height = result.getLong("validated_anchor_height");
+			status.repair_queued = result.getBoolean("repair_queued");
+			status.reason_code = result.getString("reason_code");
+			return status;
+		} catch (JSONException e) {
+			throw new ForeignBlockchainException("Pirate Unified get_spendability_status returned an invalid result");
+		}
+	}
+
 	/**
 	 * Establish Connection
 	 *
@@ -633,7 +673,9 @@ public class PirateChain extends Bitcoiny {
 	private static Object getUnifiedEnvelopeResult(JSONObject envelope, String command)
 			throws ForeignBlockchainException {
 		if (!envelope.optBoolean("ok", false) || !envelope.has("result") || envelope.isNull("result")) {
-			throw new ForeignBlockchainException("Pirate Unified " + command + " failed");
+			String error = envelope.optString("error", "");
+			throw new ForeignBlockchainException("Pirate Unified " + command + " failed"
+					+ (error.isBlank() ? "" : ": " + error));
 		}
 		return envelope.get("result");
 	}
@@ -785,24 +827,11 @@ public class PirateChain extends Bitcoiny {
 			// Send the coins
 			walletController.getCurrentWallet().clearTransactionHistoryCache();
 			String response = LiteWalletJni.execute("send", txnString);
-			JSONObject json = parseLitewalletResponse(response, "send");
-			try {
-				if (json.has("txid")) { // Success
-					String txId = json.getString("txid");
-					this.rememberSentRecipient(walletController.getCurrentWallet(), txId,
-							pirateChainSendRequest.receivingAddress, pirateChainSendRequest.arrrAmount,
-							pirateChainSendRequest.memo);
-					return txId;
-				} else if (json.has("error")) {
-					String error = json.getString("error");
-					throw new ForeignBlockchainException(error);
-				}
-
-			} catch (JSONException e) {
-				throw new ForeignBlockchainException(e.getMessage());
-			}
-
-			throw new ForeignBlockchainException("Something went wrong");
+			String txId = parseSpendResponse(response, "send");
+			this.rememberSentRecipient(walletController.getCurrentWallet(), txId,
+					pirateChainSendRequest.receivingAddress, pirateChainSendRequest.arrrAmount,
+					pirateChainSendRequest.memo);
+			return txId;
 		} finally {
 			walletController.endWalletUse();
 		}
@@ -837,26 +866,29 @@ public class PirateChain extends Bitcoiny {
 			// Send the coins
 			walletController.getCurrentWallet().clearTransactionHistoryCache();
 			String response = LiteWalletJni.execute("sendp2sh", txnString);
-			JSONObject json = parseLitewalletResponse(response, "sendp2sh");
-			try {
-				if (json.has("txid")) { // Success
-					String txId = json.getString("txid");
-					this.rememberSentRecipient(walletController.getCurrentWallet(), txId,
-							receivingAddress, amount, null);
-					return txId;
-				} else if (json.has("error")) {
-					String error = json.getString("error");
-					throw new ForeignBlockchainException(error);
-				}
-
-			} catch (JSONException e) {
-				throw new ForeignBlockchainException(e.getMessage());
-			}
-
-			throw new ForeignBlockchainException("Something went wrong");
+			String txId = parseSpendResponse(response, "sendp2sh");
+			this.rememberSentRecipient(walletController.getCurrentWallet(), txId, receivingAddress, amount, null);
+			return txId;
 		} finally {
 			walletController.endWalletUse();
 		}
+	}
+
+	static String parseSpendResponse(String response, String command) throws ForeignBlockchainException {
+		JSONObject json = parseLitewalletResponse(response, command);
+		Object error = json.opt("error");
+		if (error instanceof String && !((String) error).isBlank()) {
+			String message = (String) error;
+			// The JNI compatibility commands return plain strings rather than typed errors.
+			// Only the native insufficient-funds result establishes a balance issue.
+			if (message.startsWith("Insufficient funds:"))
+				throw new ForeignBlockchainException.InsufficientFundsException(message);
+			throw new ForeignBlockchainException(message);
+		}
+		Object txId = json.opt("txid");
+		if (!json.has("error") && txId instanceof String && !((String) txId).isBlank())
+			return (String) txId;
+		throw new ForeignBlockchainException("Pirate " + command + " returned an invalid spend result");
 	}
 
 	public String redeemP2sh(String p2shAddress, String receivingAddress, long amount, String redeemScript58,

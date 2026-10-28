@@ -15,6 +15,76 @@ There are two intentionally separate publication paths:
 The scripts reject a host-specific bundle in the release path and reject the
 cross-platform bundle in the test path.
 
+## Q-App address validation and spend readiness
+
+Q-Apps should validate ARRR recipients against the selected Core instead of
+requiring a `zs` prefix or exactly 78 characters. Core accepts mainnet Sapling
+(`zs…`) and Ironwood (`pirate1…`) shielded addresses and checks their Bech32
+checksum, receiver length and padding. Use the public endpoint:
+
+```text
+GET /crosschain/arrr/validateaddress?address=<URL-encoded-complete-address>
+```
+
+The JSON response is `true` or `false`. Missing, malformed, wrong-network and
+checksum-invalid addresses return `false`. No API key, wallet entropy, wallet
+initialization or external server connection is needed. This is format
+validation, not proof that a wallet owns an address or can spend. An app using
+the selected Core's base URL can validate on blur or debounce input changes:
+
+```javascript
+const response = await fetch(
+  `${coreBaseUrl}/crosschain/arrr/validateaddress?address=${encodeURIComponent(recipient)}`
+);
+if (!response.ok) throw new Error('Core address validation is unavailable');
+const valid = await response.json();
+if (typeof valid !== 'boolean') throw new Error('Unexpected Core validation response');
+```
+
+Discard responses for an input or selected Core that has changed since the
+request. If an older Core returns 404, display that validation is unavailable
+and request a Core update; a successful HTTP response alone does not mean an
+address is valid. The app must replace its old prefix/length gate to use this
+endpoint. Installing the Core update does not change an app's existing checks.
+
+For wallet diagnostics, the API-key-protected endpoint below accepts the same
+Base58-encoded 32-byte entropy body as `/walletbalance`:
+
+```text
+POST /crosschain/arrr/spendability
+Content-Type: text/plain
+X-API-KEY: <Core API key>
+```
+
+It returns the Unified Wallet's `spendable`, `rescan_required`, `target_height`,
+`anchor_height`, `validated_anchor_height`, `repair_queued` and `reason_code`
+fields. Unlike balance queries, it does not require height synchronization.
+It selects/initializes the requested wallet through the existing controller,
+which can start normal synchronization, but does not start a full rescan or
+send a transaction. It requires a Unified Wallet bundle; legacy bundles return
+an error rather than fabricated readiness.
+
+Keep this protected query inside the wallet host (for example Hub), using its
+existing wallet permission flow. Do not give a Q-App wallet entropy or the Core
+API key to call it. A Hub bridge returning readiness to Q-Apps must be added
+separately; the public validator requires no such bridge.
+
+Total or verified balance alone does not establish native spend readiness.
+For example, the history-only loopback fixture recovers a verified balance
+while reporting `ERR_RESCAN_REQUIRED` because it lacks a validated spending
+anchor. Native sends retain their own safety checks. A readiness response is
+a snapshot, not a reservation or guarantee of sufficient funds. Never clear a
+rescan requirement or automatically retry an ambiguous broadcast to make a
+payment proceed. Confirm a real affected wallet's reason and back it up before
+planning recovery.
+
+Pirate trade funding now returns a balance issue only for the native
+`Insufficient funds:` response. Other funding failures return a network issue
+and log their actual reason at WARN level as `Unable to fund PirateChain
+P2SH-A: …`. The send endpoint also preserves the native error message and
+distinguishes insufficient funds from other errors. These diagnostics do not
+establish the cause of a tester's failure without that tester's status or log.
+
 ## January candidate publication (legacy only)
 
 The January 2026 branch work already published an isolated candidate bundle:

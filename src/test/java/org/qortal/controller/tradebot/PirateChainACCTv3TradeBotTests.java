@@ -8,13 +8,16 @@ import org.junit.Before;
 import org.junit.Test;
 import org.qortal.api.model.crosschain.TradeBotCreateRequest;
 import org.qortal.crosschain.PirateChainAddress;
+import org.qortal.crosschain.PirateChainACCTv3;
 import org.qortal.crosschain.SupportedBlockchain;
 import org.qortal.data.crosschain.TradeBotData;
+import org.qortal.data.crosschain.CrossChainTradeData;
 import org.qortal.repository.DataException;
 import org.qortal.repository.Repository;
 import org.qortal.repository.RepositoryManager;
 import org.qortal.settings.Settings;
 import org.qortal.test.common.Common;
+import org.qortal.utils.Base58;
 
 import java.lang.reflect.Field;
 import java.nio.charset.StandardCharsets;
@@ -61,6 +64,25 @@ public class PirateChainACCTv3TradeBotTests extends Common {
 			loadedField.setBoolean(null, previouslyLoaded);
 		if (exportPathField != null)
 			exportPathField.set(Settings.getInstance(), previousExportPath);
+	}
+
+	@Test
+	public void unavailableWalletIsNotReportedAsInsufficientBalance() throws Exception {
+		// Exercise the actual buy funding path. The JNI load gate prevents any native spending.
+		loadedField.setBoolean(null, false);
+		try (Repository repository = RepositoryManager.getRepository()) {
+			CrossChainTradeData trade = new CrossChainTradeData();
+			trade.qortalAtAddress = Common.getTestAccount(repository, "bob").getAddress();
+			trade.creatorForeignPKH = new byte[20];
+			trade.tradeTimeout = 60;
+			trade.qortAmount = 100_000_000L;
+			trade.expectedForeignAmount = 500_000_000L;
+			assertEquals(AcctTradeBot.ResponseResult.NETWORK_ISSUE,
+					PirateChainACCTv3TradeBot.getInstance().startResponse(repository, null,
+							PirateChainACCTv3.getInstance(), trade, Base58.encode(new byte[32]),
+							Common.getTestAccount(repository, "alice").getAddress()));
+			assertTrue("Failed funding must not leave an active buy", repository.getCrossChainRepository().getAllTradeBotData().isEmpty());
+		}
 	}
 
 	@Test
