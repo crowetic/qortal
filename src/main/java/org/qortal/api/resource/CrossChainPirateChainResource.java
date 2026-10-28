@@ -61,8 +61,10 @@ public class CrossChainPirateChainResource {
 	@Operation(summary = "Validates an ARRR payment address",
 			description = "Checks the mainnet shielded address format, network and checksum using the same validator as Core. Supports Sapling and Ironwood. Does not require a wallet or API key, or check whether the address has funds.",
 			responses = @ApiResponse(content = @Content(schema = @Schema(type = "boolean"))))
-	public boolean validateAddress(@Parameter(description = "Complete recipient address") @QueryParam("address") String address) {
-		return PirateChainAddress.isValid(address);
+	public String validateAddress(@Parameter(description = "Complete recipient address") @QueryParam("address") String address) {
+		// Jersey's JSON writer does not serialize a bare Boolean. Emit the JSON
+		// boolean literal through its String writer, as with other scalar APIs.
+		return Boolean.toString(PirateChainAddress.isValid(address));
 	}
 
 	@GET
