@@ -140,6 +140,8 @@ validate_bundle() {
 		|| die "Invalid expected bundle kind: $expected_bundle_kind"
 	[[ -d $bundle_directory ]] || die "Bundle directory does not exist: $bundle_directory"
 	bundle_directory=$(cd "$bundle_directory" && pwd -P)
+	[[ -z $(find "$bundle_directory" -mindepth 1 ! -type f -print -quit) ]] \
+		|| die 'Bundle must not contain subdirectories, symlinks, or special files.'
 
 	local required_file
 	for required_file in MANIFEST.txt LICENSE-qortal-jni.txt qortal-handoff.md; do

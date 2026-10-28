@@ -3,6 +3,7 @@
 /bin/
 /target/
 /codegraph-cache/
+__pycache__/
 /qortal-backup/
 /log.txt.*
 /arbitrary*
