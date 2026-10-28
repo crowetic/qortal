@@ -1104,7 +1104,17 @@ public class PirateWallet {
             return false;
         }
 
-        // Assume synchronized if within 2 blocks of the chain tip
+        if (this.unifiedWallet) {
+            long lag = (long) chainTip - height;
+            boolean synchronizedNow = height > 0 && chainTip > 0 && Math.abs(lag) <= 2;
+            if (!synchronizedNow) {
+                LOGGER.info("Pirate Unified wallet needs sync (walletHeight={}, liveChainHeight={}, lag={})",
+                        height, chainTip, lag);
+            }
+            return synchronizedNow;
+        }
+
+        // Preserve the legacy client's height comparison.
         return height >= (chainTip - 2);
     }
 
@@ -1204,6 +1214,26 @@ public class PirateWallet {
     }
 
     public Integer getChainTip() {
+        if (this.unifiedWallet) {
+            // Unified JNI's info.latest_block_height can be the target of its
+            // last completed sync. Comparing two cached heights can suppress
+            // incremental sync forever and construct already-expired sends.
+            try {
+                BitcoinyBlockchainProvider provider = PirateChain.getInstance().getBlockchainProvider();
+                int height = provider.getCurrentHeight();
+                // A failed query can rotate the Java endpoint. The controller
+                // must align the native wallet before trusting the new server.
+                if (!this.usesServer(provider.getCurrentServer())) {
+                    LOGGER.info("Pirate Unified wallet endpoint changed while checking live chain height");
+                    return null;
+                }
+                return height > 0 ? height : null;
+            } catch (ForeignBlockchainException | RuntimeException e) {
+                LOGGER.info("Unable to verify Pirate Unified wallet live chain height: {}", e.getMessage());
+                return null;
+            }
+        }
+
         String response = LiteWalletJni.execute("info", "");
         JSONObject json = parseJsonObject(response, "info");
         if (json != null && json.has("latest_block_height")) {

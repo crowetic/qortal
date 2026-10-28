@@ -511,6 +511,34 @@ After a stalled scan, preserve the file and inspect the final lines rather
 than deleting the wallet namespace; it contains the native sync-engine error
 that the legacy `syncstatus` response cannot represent.
 
+### Expired sends despite a synchronized status
+
+The Unified JNI compatibility `info.latest_block_height` can retain the target
+of its last completed sync. Core must query the selected lightwalletd's live
+height when checking a Unified wallet, rather than compare two cached heights.
+A wallet more than two blocks behind or ahead needs normal incremental sync;
+an unavailable live height or changed endpoint cannot establish readiness.
+This check applies to the sync scheduler and the send/trade-funding gate.
+
+For example, a construction target of 4,188,212 with the native 40-block expiry
+window is already expired when the node is past 4,188,353. Repeating that send
+cannot repair the construction height. Let incremental sync catch up first.
+The Core log reports `walletHeight`, `liveChainHeight` and `lag` when the wallet
+is out of date. No wallet reset or full rescan is implied by this error.
+
+The opt-in `PirateUnifiedWalletFreshnessTests` reproduces a cached JNI target
+against an advanced provider height using the pinned native library, isolated
+storage and loopback-only history. It also checks rollback, unavailable-height
+and endpoint-change cases. Set a dedicated absolute `PIRATE_DEBUG_LOG_PATH`
+when running native tests so their process cannot clear a user's native log.
+
+```bash
+PIRATE_DEBUG_LOG_PATH=/tmp/qortal-native-fixture-debug.log \
+mvn -DskipJUnitTests=false -Dtest=PirateUnifiedWalletFreshnessTests \
+  -Dqortal.runPirateUnifiedWalletFreshnessTests=true \
+  -Dqortal.pirateUnifiedBundlePath=/path/to/extracted-pinned-bundle test
+```
+
 Build the candidate JAR from this branch, then copy it into the isolated
 working directory, save the preceding JSON as its `settings.json`, and start
 it from there:
