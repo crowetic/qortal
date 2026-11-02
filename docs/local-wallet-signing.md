@@ -1,5 +1,8 @@
 # Public-wallet discovery and client-signed funding
 
+For ARRR feasibility, native wallet requirements and the proposed implementation
+sequence, see [PirateChain local signing](pirate-local-signing.md).
+
 The new authenticated wallet endpoints for BTC/LTC/DOGE/DGB/RVN are:
 
 - `POST /crosschain/<coin>/wallet/public/spend-context`, with `xpub58` and
