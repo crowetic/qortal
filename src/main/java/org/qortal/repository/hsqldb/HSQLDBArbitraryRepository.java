@@ -1158,11 +1158,13 @@ public class HSQLDBArbitraryRepository implements ArbitraryRepository {
 		boolean searchMetadata = (query != null && !defaultResource) || title != null || description != null
 				|| (keywords != null && !keywords.isEmpty());
 
-		sql.append("SELECT name, service, identifier, size, status, created_when, updated_when, latest_signature");
+		// Use explicit resource columns, not merged USING columns. HSQLDB otherwise evaluates
+		// resource-only predicates after the LEFT JOIN, causing unnecessary metadata reads.
+		sql.append("SELECT r.name, r.service, r.identifier, r.size, r.status, r.created_when, r.updated_when, r.latest_signature");
 		if (returnMetadata) {
-			sql.append(", title, description, category, tag1, tag2, tag3, tag4, tag5");
+			sql.append(", m.title, m.description, m.category, m.tag1, m.tag2, m.tag3, m.tag4, m.tag5");
 		}
-		sql.append(" FROM ArbitraryResourcesCache");
+		sql.append(" FROM ArbitraryResourcesCache r");
 
 		// Default to "latest" mode
 		if (mode == null) {
@@ -1174,8 +1176,8 @@ public class HSQLDBArbitraryRepository implements ArbitraryRepository {
 				// Include latest item only for a name/service combination
 				sql.append(" JOIN (SELECT name, service, MAX(created_when) AS latest " +
 						"FROM ArbitraryResourcesCache GROUP BY name, service) LatestResources " +
-						"ON name=LatestResources.name AND service=LatestResources.service " +
-						"AND created_when=LatestResources.latest");
+						"ON r.name=LatestResources.name AND r.service=LatestResources.service " +
+						"AND r.created_when=LatestResources.latest");
 				break;
 
 			case ALL:
@@ -1184,13 +1186,13 @@ public class HSQLDBArbitraryRepository implements ArbitraryRepository {
 
 		if (minLevel != null) {
 			// Join tables necessary for level filter
-			sql.append(" JOIN Names USING (name) JOIN Accounts ON Accounts.account=Names.owner");
+			sql.append(" JOIN Names ON Names.name=r.name JOIN Accounts ON Accounts.account=Names.owner");
 		}
 
 		if (returnMetadata || searchMetadata) {
-			sql.append(" LEFT JOIN ArbitraryMetadataCache USING (service, name, identifier)");
+			sql.append(" LEFT JOIN ArbitraryMetadataCache m ON m.service=r.service AND m.name=r.name AND m.identifier=r.identifier");
 		}
-		sql.append(" WHERE name IS NOT NULL");
+		sql.append(" WHERE r.name IS NOT NULL");
 
 		if (minLevel != null) {
 			// Add level filter
@@ -1199,12 +1201,12 @@ public class HSQLDBArbitraryRepository implements ArbitraryRepository {
 		}
 
 		if (service != null) {
-			sql.append(" AND service = ?");
+			sql.append(" AND r.service = ?");
 			bindParams.add(service.value);
 		}
 
 		if (defaultResource) {
-			sql.append(" AND identifier='default'");
+			sql.append(" AND r.identifier='default'");
 		}
 
 		// Handle general query matches
@@ -1216,12 +1218,12 @@ public class HSQLDBArbitraryRepository implements ArbitraryRepository {
 
 			if (defaultResource) {
 				// Default resource requested - search name only
-				sql.append(" AND LCASE(name) LIKE ?");
+				sql.append(" AND LCASE(r.name) LIKE ?");
 				bindParams.add(queryWildcard);
 			} else {
 				// Non-default resource requested
 				// In this case we search the identifier as well as the name
-				sql.append(" AND (LCASE(name) LIKE ? OR LCASE(identifier) LIKE ? OR LCASE(title) LIKE ? OR LCASE(description) LIKE ?)");
+				sql.append(" AND (LCASE(r.name) LIKE ? OR LCASE(r.identifier) LIKE ? OR LCASE(m.title) LIKE ? OR LCASE(m.description) LIKE ?)");
 				bindParams.add(queryWildcard); bindParams.add(queryWildcard); bindParams.add(queryWildcard); bindParams.add(queryWildcard);
 			}
 		}
@@ -1230,7 +1232,7 @@ public class HSQLDBArbitraryRepository implements ArbitraryRepository {
 		if (identifier != null) {
 			// Search anywhere in the identifier, unless "prefixOnly" has been requested
 			String queryWildcard = prefixOnly ? String.format("%s%%", identifier.toLowerCase()) : String.format("%%%s%%", identifier.toLowerCase());
-			sql.append(" AND LCASE(identifier) LIKE ?");
+			sql.append(" AND LCASE(r.identifier) LIKE ?");
 			bindParams.add(queryWildcard);
 		}
 
@@ -1238,7 +1240,7 @@ public class HSQLDBArbitraryRepository implements ArbitraryRepository {
 		if (title != null) {
 			// Search anywhere in the title, unless "prefixOnly" has been requested
 			String queryWildcard = prefixOnly ? String.format("%s%%", title.toLowerCase()) : String.format("%%%s%%", title.toLowerCase());
-			sql.append(" AND LCASE(title) LIKE ?");
+			sql.append(" AND LCASE(m.title) LIKE ?");
 			bindParams.add(queryWildcard);
 		}
 
@@ -1246,7 +1248,7 @@ public class HSQLDBArbitraryRepository implements ArbitraryRepository {
 		if (description != null) {
 			// Search anywhere in the description, unless "prefixOnly" has been requested
 			String queryWildcard = prefixOnly ? String.format("%s%%", description.toLowerCase()) : String.format("%%%s%%", description.toLowerCase());
-			sql.append(" AND LCASE(description) LIKE ?");
+			sql.append(" AND LCASE(m.description) LIKE ?");
 			bindParams.add(queryWildcard);
 		}
 
@@ -1257,7 +1259,7 @@ public class HSQLDBArbitraryRepository implements ArbitraryRepository {
 			List<String> bindValues = new ArrayList<>();
 		
 			for (int i = 0; i < searchKeywords.size(); i++) {
-				conditions.add("LOWER(description) LIKE ?"); 
+				conditions.add("LOWER(m.description) LIKE ?");
 				bindValues.add("%" + searchKeywords.get(i).trim().toLowerCase() + "%"); 
 			}
 		
@@ -1278,7 +1280,7 @@ public class HSQLDBArbitraryRepository implements ArbitraryRepository {
 				// Search anywhere in the name, unless "prefixOnly" has been requested
 				String queryWildcard = prefixOnly ? String.format("%s%%", names.get(i).toLowerCase()) : String.format("%%%s%%", names.get(i).toLowerCase());
 				if (i > 0) sql.append(" OR ");
-				sql.append("LCASE(name) LIKE ?");
+				sql.append("LCASE(r.name) LIKE ?");
 				bindParams.add(queryWildcard);
 			}
 			sql.append(")");
@@ -1286,7 +1288,7 @@ public class HSQLDBArbitraryRepository implements ArbitraryRepository {
 
 		// Handle name exact matches
 		if (exactMatchNames != null && !exactMatchNames.isEmpty()) {
-			sql.append(" AND LCASE(name) IN (?");
+			sql.append(" AND LCASE(r.name) IN (?");
 			bindParams.add(exactMatchNames.get(0).toLowerCase());
 
 			for (int i = 1; i < exactMatchNames.size(); ++i) {
@@ -1298,11 +1300,11 @@ public class HSQLDBArbitraryRepository implements ArbitraryRepository {
 
 		// Timestamp range
 		if (before != null) {
-			sql.append(" AND created_when < ?");
+			sql.append(" AND r.created_when < ?");
 			bindParams.add(before);
 		}
 		if (after != null) {
-			sql.append(" AND created_when > ?");
+			sql.append(" AND r.created_when > ?");
 			bindParams.add(after);
 		}
 
@@ -1310,7 +1312,7 @@ public class HSQLDBArbitraryRepository implements ArbitraryRepository {
 		if (followedOnly != null && followedOnly) {
 			List<String> followedNames = ListUtils.followedNames();
 			if (followedNames != null && !followedNames.isEmpty()) {
-				sql.append(" AND LCASE(name) IN (?");
+				sql.append(" AND LCASE(r.name) IN (?");
 				bindParams.add(followedNames.get(0).toLowerCase());
 
 				for (int i = 1; i < followedNames.size(); ++i) {
@@ -1325,7 +1327,7 @@ public class HSQLDBArbitraryRepository implements ArbitraryRepository {
 		if (excludeBlocked != null && excludeBlocked) {
 			List<String> blockedNames = ListUtils.blockedNames();
 			if (blockedNames != null && !blockedNames.isEmpty()) {
-				sql.append(" AND LCASE(name) NOT IN (?");
+				sql.append(" AND LCASE(r.name) NOT IN (?");
 				bindParams.add(blockedNames.get(0).toLowerCase());
 
 				for (int i = 1; i < blockedNames.size(); ++i) {
@@ -1336,13 +1338,20 @@ public class HSQLDBArbitraryRepository implements ArbitraryRepository {
 			}
 		}
 
-		sql.append(" ORDER BY created_when");
-
-		if (reverse != null && reverse) {
-			sql.append(" DESC");
-		}
+		String direction = Boolean.TRUE.equals(reverse) ? " DESC" : "";
+		sql.append(" ORDER BY ");
+		// service is constant when supplied. Include it in ORDER BY so HSQLDB can use
+		// (service, created_when) for both the service range and chronological pagination.
+		if (service != null)
+			sql.append("r.service").append(direction).append(", ");
+		sql.append("r.created_when").append(direction);
 
 		HSQLDBRepository.limitOffsetSql(sql, limit, offset);
+		if (limit != null && limit > 0) {
+			// Keep the ordered scan after qualifying resource filters. Otherwise HSQLDB can
+			// choose a service-only index and sort every match before applying LIMIT.
+			sql.append(" USING INDEX");
+		}
 
 		List<ArbitraryResourceData> arbitraryResources = new ArrayList<>();
 

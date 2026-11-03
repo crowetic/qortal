@@ -1080,6 +1080,12 @@ public class HSQLDBDatabaseUpdates {
 
 					break;
 
+				case 53:
+					// Restrict paginated QDN searches to a service while reading in creation order.
+					LOGGER.info("Adding service/creation-date index to arbitrary resources cache - please wait...");
+					stmt.execute("CREATE INDEX ArbitraryResourcesServiceCreatedIndex ON ArbitraryResourcesCache (service, created_when)");
+					break;
+
 				default:
 					// nothing to do
 					return false;
