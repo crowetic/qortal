@@ -8,6 +8,7 @@ import org.qortal.data.transaction.TransactionData;
 import org.qortal.event.DataMonitorEvent;
 import org.qortal.event.EventBus;
 import org.qortal.repository.DataException;
+import org.qortal.repository.ArbitraryRepository;
 import org.qortal.repository.Repository;
 import org.qortal.repository.RepositoryManager;
 import org.qortal.settings.Settings;
@@ -27,7 +28,6 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
-import java.util.stream.Collectors;
 
 import static org.qortal.controller.arbitrary.ArbitraryDataStorageManager.DELETION_THRESHOLD;
 
@@ -81,28 +81,38 @@ public class ArbitraryDataCleanupManager extends Thread {
 		return instance;
 	}
 
+	/** Maintains a stable newest-first sweep even when transactions disappear between batches. */
+	static final class TransactionBatch {
+		static final int LIMIT = 100;
+		private List<byte[]> signatures;
+		private long fetchedAt;
+		private int offset;
+		boolean startOfCycle;
+
+		List<ArbitraryTransactionData> next(ArbitraryRepository repository, long now) throws DataException {
+			boolean restart = this.signatures == null || this.offset >= this.signatures.size();
+			boolean refresh = restart && (this.signatures == null || now - this.fetchedAt >= TRANSACTION_LIST_REFRESH_INTERVAL);
+			List<byte[]> snapshot = refresh ? repository.getArbitraryTransactionSignatures() : this.signatures;
+			int from = restart ? 0 : this.offset;
+			int to = Math.min(from + LIMIT, snapshot.size());
+			List<ArbitraryTransactionData> transactions = repository.getArbitraryTransactionsBySignatures(snapshot.subList(from, to));
+
+			// Commit progress only after both queries succeed, so a failure retries the same batch.
+			this.signatures = snapshot;
+			if (refresh)
+				this.fetchedAt = now;
+			this.offset = to;
+			this.startOfCycle = restart;
+			return transactions;
+		}
+	}
+
 	@Override
 	public void run() {
 		Thread.currentThread().setName("Arbitrary Data Cleanup Manager");
 		Thread.currentThread().setPriority(NORM_PRIORITY);
 
-		// Paginate queries when fetching arbitrary transactions
-		final int limit = 100;
-		int offset = 0;
-
-		List<ArbitraryTransactionData> allArbitraryTransactionsInDescendingOrder;
-		long listFetchedAt;
-
-		try (final Repository repository = RepositoryManager.getRepository()) {
-			allArbitraryTransactionsInDescendingOrder
-					= repository.getArbitraryRepository()
-					.getLatestArbitraryTransactions();
-			listFetchedAt = System.currentTimeMillis();
-		} catch( Exception e) {
-			LOGGER.error(e.getMessage(), e);
-			allArbitraryTransactionsInDescendingOrder = new ArrayList<>(0);
-			listFetchedAt = System.currentTimeMillis();
-		}
+		TransactionBatch transactionsToClean = new TransactionBatch();
 
 		Set<ArbitraryTransactionDataHashWrapper> processedTransactions = new HashSet<>();
 
@@ -133,30 +143,23 @@ public class ArbitraryDataCleanupManager extends Thread {
 				}
 
 				// Periodically delete any unnecessary files from the temp directory
-				if (offset == 0 || offset % (limit * 10) == 0) {
+				if (transactionsToClean.offset % (TransactionBatch.LIMIT * 10) == 0) {
 					this.cleanupTempDirectory(now);
 				}
 
 				// Any arbitrary transactions we want to fetch data for?
 				try (final Repository repository = RepositoryManager.getRepository()) {
-					List<ArbitraryTransactionData> transactions = allArbitraryTransactionsInDescendingOrder.stream().skip(offset).limit(limit).collect(Collectors.toList());
+					// Fetch only after QDN, clock and storage checks. Keep a signature snapshot, then hydrate
+					// just the next batch rather than joining and retaining the entire QDN history.
+					List<ArbitraryTransactionData> transactions = transactionsToClean.next(
+							repository.getArbitraryRepository(), System.currentTimeMillis());
 					if (isStopping) {
 						return;
 					}
-
-					if (transactions == null || transactions.isEmpty()) {
-						offset = 0;
-						if (System.currentTimeMillis() - listFetchedAt >= TRANSACTION_LIST_REFRESH_INTERVAL) {
-							allArbitraryTransactionsInDescendingOrder
-									= repository.getArbitraryRepository()
-									.getLatestArbitraryTransactions();
-							listFetchedAt = System.currentTimeMillis();
-						}
-						transactions = allArbitraryTransactionsInDescendingOrder.stream().limit(limit).collect(Collectors.toList());
+					if (transactionsToClean.startOfCycle) {
 						processedTransactions.clear();
 					}
 
-					offset += limit;
 					now = NTP.getTime();
 
 					// Loop through the signatures in this batch

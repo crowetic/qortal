@@ -32,6 +32,15 @@ public interface ArbitraryRepository {
 
 	List<ArbitraryTransactionData> getLatestArbitraryTransactions(Integer limit) throws DataException;
 
+	/** All named arbitrary transaction signatures, newest first, including older resource versions. */
+	List<byte[]> getArbitraryTransactionSignatures() throws DataException;
+
+	/**
+	 * Fetch full records in the supplied signature order, retaining duplicates and omitting missing records.
+	 * Implementations must bound each database query. Payments are not loaded.
+	 */
+	List<ArbitraryTransactionData> getArbitraryTransactionsBySignatures(List<byte[]> signatures) throws DataException;
+
 	/** Lightweight fetch — returns only (signature, service, name, identifier) ordered newest-first. */
 	List<ArbitraryTransactionDataHashWrapper> getArbitraryTransactionSignaturesLite() throws DataException;
 

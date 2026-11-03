@@ -24,6 +24,7 @@ import org.qortal.settings.Settings;
 import org.qortal.transaction.ArbitraryTransaction;
 import org.qortal.transaction.Transaction.ApprovalStatus;
 import org.qortal.utils.Base58;
+import org.qortal.utils.ByteArray;
 import org.qortal.utils.ListUtils;
 
 import java.sql.ResultSet;
@@ -32,12 +33,21 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 
 public class HSQLDBArbitraryRepository implements ArbitraryRepository {
 
 	private static final Logger LOGGER = LogManager.getLogger(HSQLDBArbitraryRepository.class);
+
+	private static final int SIGNATURE_BATCH_SIZE = 500;
+	private static final String ARBITRARY_TRANSACTION_SELECT = "SELECT type, reference, signature, creator, Transactions.created_when, fee, " +
+			"tx_group_id, block_height, approval_status, approval_height, " +
+			"version, nonce, service, size, is_data_raw, data, metadata_hash, " +
+			"name, identifier, update_method, secret, compression FROM ArbitraryTransactions " +
+			"JOIN Transactions USING (signature) ";
 
 	protected HSQLDBRepository repository;
 	
@@ -236,10 +246,9 @@ public class HSQLDBArbitraryRepository implements ArbitraryRepository {
 
 	@Override
 	public List<ArbitraryTransactionData> getLatestArbitraryTransactions(Integer limit) throws DataException {
-		// ponytail: when limited, pick the newest N signatures via an index-only scan on
-		// ArbitraryTransactions (no join, no sort pass — same plan as the "Lite" query), then
+		// When limited, pick the newest N signatures from ArbitraryTransactions, then
 		// constrain the join to just those N rows. Turns a 325k-row PK-probe join into N probes.
-		// No limit => we'd read every row anyway, so the join is unavoidable; keep it as-is.
+		// Full-history callers should prefer a signature snapshot and bounded hydration.
 		Object[] bindParams = new Object[0];
 		String latestFilter = "name IS NOT NULL";
 		if (limit != null) {
@@ -263,12 +272,7 @@ public class HSQLDBArbitraryRepository implements ArbitraryRepository {
 			bindParams = signatures.toArray();
 		}
 
-		String sql = "SELECT type, reference, signature, creator, Transactions.created_when, fee, " +
-				"tx_group_id, block_height, approval_status, approval_height, " +
-				"version, nonce, service, size, is_data_raw, data, metadata_hash, " +
-				"name, identifier, update_method, secret, compression FROM ArbitraryTransactions " +
-				"JOIN Transactions USING (signature) " +
-				"WHERE " + latestFilter + " " +
+		String sql = ARBITRARY_TRANSACTION_SELECT + "WHERE " + latestFilter + " " +
 				"ORDER BY ArbitraryTransactions.created_when DESC";
 		List<ArbitraryTransactionData> arbitraryTransactionData = new ArrayList<>();
 
@@ -277,48 +281,7 @@ public class HSQLDBArbitraryRepository implements ArbitraryRepository {
 				return new ArrayList<>(0);
 
 			do {
-				byte[] reference = resultSet.getBytes(2);
-				byte[] signature = resultSet.getBytes(3);
-				byte[] creatorPublicKey = resultSet.getBytes(4);
-				long timestamp = resultSet.getLong(5);
-
-				Long fee = resultSet.getLong(6);
-				if (fee == 0 && resultSet.wasNull())
-					fee = null;
-
-				int txGroupId = resultSet.getInt(7);
-
-				Integer blockHeight = resultSet.getInt(8);
-				if (blockHeight == 0 && resultSet.wasNull())
-					blockHeight = null;
-
-				ApprovalStatus approvalStatus = ApprovalStatus.valueOf(resultSet.getInt(9));
-				Integer approvalHeight = resultSet.getInt(10);
-				if (approvalHeight == 0 && resultSet.wasNull())
-					approvalHeight = null;
-
-				BaseTransactionData baseTransactionData = new BaseTransactionData(timestamp, txGroupId, reference, creatorPublicKey, fee, approvalStatus, blockHeight, approvalHeight, signature);
-
-				int version = resultSet.getInt(11);
-				int nonce = resultSet.getInt(12);
-				int serviceInt = resultSet.getInt(13);
-				int size = resultSet.getInt(14);
-				boolean isDataRaw = resultSet.getBoolean(15); // NOT NULL, so no null to false
-				DataType dataType = isDataRaw ? DataType.RAW_DATA : DataType.DATA_HASH;
-				byte[] data = resultSet.getBytes(16);
-				byte[] metadataHash = resultSet.getBytes(17);
-				String nameResult = resultSet.getString(18);
-				String identifierResult = resultSet.getString(19);
-				Method method = Method.valueOf(resultSet.getInt(20));
-				byte[] secret = resultSet.getBytes(21);
-				Compression compression = Compression.valueOf(resultSet.getInt(22));
-				// FUTURE: get payments from signature if needed. Avoiding for now to reduce database calls.
-
-				ArbitraryTransactionData transactionData = new ArbitraryTransactionData(baseTransactionData,
-						version, serviceInt, nonce, size, nameResult, identifierResult, method, secret,
-						compression, data, dataType, metadataHash, null);
-
-				arbitraryTransactionData.add(transactionData);
+				arbitraryTransactionData.add(readArbitraryTransaction(resultSet));
 			} while (resultSet.next());
 
 			return arbitraryTransactionData;
@@ -328,6 +291,108 @@ public class HSQLDBArbitraryRepository implements ArbitraryRepository {
 			LOGGER.error(e.getMessage(), e);
 			return new ArrayList<>(0);
 		}
+	}
+
+	@Override
+	public List<byte[]> getArbitraryTransactionSignatures() throws DataException {
+		String sql = "SELECT signature FROM ArbitraryTransactions " +
+				"WHERE name IS NOT NULL ORDER BY created_when DESC";
+		List<byte[]> signatures = new ArrayList<>();
+		try (ResultSet resultSet = this.repository.checkedExecute(sql)) {
+			if (resultSet != null) {
+				do {
+					signatures.add(resultSet.getBytes(1));
+				} while (resultSet.next());
+			}
+		} catch (SQLException e) {
+			throw new DataException("Unable to fetch arbitrary transaction signatures", e);
+		}
+		return signatures;
+	}
+
+	@Override
+	public List<ArbitraryTransactionData> getArbitraryTransactionsBySignatures(List<byte[]> signatures) throws DataException {
+		List<ArbitraryTransactionData> results = new ArrayList<>();
+		if (signatures == null || signatures.isEmpty())
+			return results;
+
+		Map<ByteArray, ArbitraryTransactionData> bySignature = new LinkedHashMap<>();
+		for (byte[] signature : signatures) {
+			if (signature != null && signature.length > 0)
+				bySignature.put(ByteArray.wrap(signature), null);
+		}
+
+		List<ByteArray> uniqueSignatures = new ArrayList<>(bySignature.keySet());
+		for (int offset = 0; offset < uniqueSignatures.size(); offset += SIGNATURE_BATCH_SIZE) {
+			List<ByteArray> batch = uniqueSignatures.subList(offset, Math.min(offset + SIGNATURE_BATCH_SIZE, uniqueSignatures.size()));
+			Object[] bindParams = batch.stream().map(signature -> signature.value).toArray();
+			// Qualifying signature lets HSQLDB seek both primary keys instead of scanning ArbitraryTransactions.
+			String sql = ARBITRARY_TRANSACTION_SELECT + "WHERE ArbitraryTransactions.signature IN (" +
+					String.join(", ", Collections.nCopies(batch.size(), "?")) + ")";
+			try (ResultSet resultSet = this.repository.checkedExecute(sql, bindParams)) {
+				if (resultSet != null) {
+					do {
+						ArbitraryTransactionData transaction = readArbitraryTransaction(resultSet);
+						bySignature.put(ByteArray.wrap(transaction.getSignature()), transaction);
+					} while (resultSet.next());
+				}
+			} catch (SQLException e) {
+				throw new DataException("Unable to fetch arbitrary transactions by signature", e);
+			}
+		}
+
+		// SQL IN does not preserve order. Restore the snapshot order, including equal-timestamp rows.
+		for (byte[] signature : signatures) {
+			if (signature == null || signature.length == 0)
+				continue;
+			ArbitraryTransactionData transaction = bySignature.get(ByteArray.wrap(signature));
+			if (transaction != null)
+				results.add(transaction);
+		}
+		return results;
+	}
+
+	private static ArbitraryTransactionData readArbitraryTransaction(ResultSet resultSet) throws SQLException {
+		byte[] reference = resultSet.getBytes(2);
+		byte[] signature = resultSet.getBytes(3);
+		byte[] creatorPublicKey = resultSet.getBytes(4);
+		long timestamp = resultSet.getLong(5);
+
+		Long fee = resultSet.getLong(6);
+		if (fee == 0 && resultSet.wasNull())
+			fee = null;
+
+		int txGroupId = resultSet.getInt(7);
+
+		Integer blockHeight = resultSet.getInt(8);
+		if (blockHeight == 0 && resultSet.wasNull())
+			blockHeight = null;
+
+		ApprovalStatus approvalStatus = ApprovalStatus.valueOf(resultSet.getInt(9));
+		Integer approvalHeight = resultSet.getInt(10);
+		if (approvalHeight == 0 && resultSet.wasNull())
+			approvalHeight = null;
+
+		BaseTransactionData baseTransactionData = new BaseTransactionData(timestamp, txGroupId, reference, creatorPublicKey, fee, approvalStatus, blockHeight, approvalHeight, signature);
+
+		int version = resultSet.getInt(11);
+		int nonce = resultSet.getInt(12);
+		int serviceInt = resultSet.getInt(13);
+		int size = resultSet.getInt(14);
+		boolean isDataRaw = resultSet.getBoolean(15); // NOT NULL, so no null to false
+		DataType dataType = isDataRaw ? DataType.RAW_DATA : DataType.DATA_HASH;
+		byte[] data = resultSet.getBytes(16);
+		byte[] metadataHash = resultSet.getBytes(17);
+		String nameResult = resultSet.getString(18);
+		String identifierResult = resultSet.getString(19);
+		Method method = Method.valueOf(resultSet.getInt(20));
+		byte[] secret = resultSet.getBytes(21);
+		Compression compression = Compression.valueOf(resultSet.getInt(22));
+		// FUTURE: get payments from signature if needed. Avoiding for now to reduce database calls.
+
+		return new ArbitraryTransactionData(baseTransactionData,
+				version, serviceInt, nonce, size, nameResult, identifierResult, method, secret,
+				compression, data, dataType, metadataHash, null);
 	}
 
 	@Override
