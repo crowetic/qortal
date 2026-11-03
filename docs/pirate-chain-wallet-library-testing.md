@@ -15,6 +15,34 @@ There are two intentionally separate publication paths:
 The scripts reject a host-specific bundle in the release path and reject the
 cross-platform bundle in the test path.
 
+## Build and verify the packaged Core API
+
+Build in a checkout whose `target/` directory is not also being written by an
+IDE or another build. A clean detached worktree is suitable; include the intended
+Pirate changes in that checkout. Use a clean build and exercise the resulting
+JAR, rather than relying only on unit tests run from compiled class directories:
+
+```bash
+mvn -Dmaven.gitcommitid.nativegit=true -DskipJUnitTests=false \
+  -Dtest=PirateChainWalletControllerTests,PirateWalletSessionTests,PirateSpendResponseTests,PirateChainACCTv3TradeBotTests \
+  clean package
+tools/test-packaged-api.sh target/qortal-6.1.9.jar
+```
+
+The native Git option lets the Git metadata plugin resolve linked worktree
+history correctly. The smoke test requires a JDK (11+). It rejects packaged
+compiler error stubs, then starts the actual JAR's API on an ephemeral loopback
+port in a temporary working directory. It checks the admin endpoint, ARRR
+address validation, documentation and OpenAPI, repeats the requests after an
+API restart, and stops the server. It does not open the operator's database or
+initialize a wallet.
+
+The earlier incremental 0.3.9 test JAR accidentally included IDE compiler error
+stubs in `ApiService` and `AnnotationPostProcessor`. API startup threw an
+`Unresolved compilation problems` error while other Core threads kept running.
+A clean isolated build replaces those classes; the packaged smoke test rejects
+that original artifact. Keep this check in the test-JAR delivery procedure.
+
 ## One-command publication
 
 Run from the Core source checkout:
