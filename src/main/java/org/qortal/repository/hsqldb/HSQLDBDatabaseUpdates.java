@@ -1086,6 +1086,13 @@ public class HSQLDBDatabaseUpdates {
 					stmt.execute("CREATE INDEX ArbitraryResourcesServiceCreatedIndex ON ArbitraryResourcesCache (service, created_when)");
 					break;
 
+				case 54:
+					// Global recent-transaction queries cannot use the name-leading index
+					// to read timestamps in order and stop after the requested limit.
+					LOGGER.info("Indexing arbitrary transaction timestamps - please wait...");
+					stmt.execute("CREATE INDEX IF NOT EXISTS ArbitraryCreatedIndex ON ArbitraryTransactions (created_when DESC)");
+					break;
+
 				default:
 					// nothing to do
 					return false;

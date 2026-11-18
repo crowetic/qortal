@@ -244,17 +244,22 @@ public class HSQLDBArbitraryRepository implements ArbitraryRepository {
 		return getLatestArbitraryTransactions(null);
 	}
 
+	static String latestTransactionSignaturesSql(int limit) {
+		return "SELECT signature FROM ArbitraryTransactions " +
+				"WHERE name IS NOT NULL ORDER BY created_when DESC LIMIT " + limit + " USING INDEX";
+	}
+
 	@Override
 	public List<ArbitraryTransactionData> getLatestArbitraryTransactions(Integer limit) throws DataException {
-		// When limited, pick the newest N signatures from ArbitraryTransactions, then
-		// constrain the join to just those N rows. Turns a 325k-row PK-probe join into N probes.
+		// First select only the newest N signatures, then hydrate those transactions.
+		// USING INDEX is HSQLDB's slicing hint: prefer the timestamp ordering index
+		// over the name index, which otherwise scans/sorts all named transactions.
 		// Full-history callers should prefer a signature snapshot and bounded hydration.
 		Object[] bindParams = new Object[0];
 		String latestFilter = "name IS NOT NULL";
 		if (limit != null) {
 			List<byte[]> signatures = new ArrayList<>(limit);
-			String idSql = "SELECT signature FROM ArbitraryTransactions " +
-					"WHERE name IS NOT NULL ORDER BY created_when DESC LIMIT " + limit;
+			String idSql = latestTransactionSignaturesSql(limit);
 			try (ResultSet idResultSet = this.repository.checkedExecute(idSql)) {
 				if (idResultSet == null)
 					return new ArrayList<>(0);
