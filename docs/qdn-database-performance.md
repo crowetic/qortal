@@ -61,6 +61,15 @@ latest grouping, cached-search work reduction and indexed zero-balance cleanup
 from the parent branches. Both parent histories remain reachable; the retired
 branch names can be removed after the combined remote tip is verified.
 
+The combined branch also includes the signature-coalesced cache notification queue
+and bounded, interruptible download polling from `qdn-performance` commit
+`e20b82a13`. Normal queue passes process at most 128 entries per repository
+session. Raw-download queued-build waits poll every 200 ms with a 60-second
+retry/wait budget; active synchronous loads keep their existing I/O timeouts.
+These changes do not add another migration. Only the separate cache-testing
+branch retains the current XMR/ARRR base; consolidating the two older performance
+branches does not merge newer wallet development into them.
+
 ## Rollout boundary
 
 No production rollout or database migration is performed by this task. This
