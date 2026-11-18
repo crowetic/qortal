@@ -13,6 +13,8 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Arrays;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Supplier;
 
 public class HSQLDBCacheUtilsTests {
@@ -716,6 +718,93 @@ public class HSQLDBCacheUtilsTests {
         Assert.assertTrue( result.get(0).created == 2L);
 
     }
+    @Test
+    public void testFollowedAndBlockedListsAreLoadedOnceBeforePagination() {
+        ArbitraryResourceData joe = resource("Joe", "one", 1L);
+        ArbitraryResourceData bob = resource("Bob", "two", 2L);
+        ArbitraryResourceData eve = resource("Eve", "three", 3L);
+        AtomicInteger followedCalls = new AtomicInteger();
+        AtomicInteger blockedCalls = new AtomicInteger();
+        Supplier<List<String>> followed = () -> {
+            followedCalls.incrementAndGet();
+            return List.of("Joe", "Bob", "Eve", "Joe");
+        };
+        Supplier<List<String>> blocked = () -> {
+            blockedCalls.incrementAndGet();
+            return List.of("Eve");
+        };
+        List<ArbitraryResourceData> results = filterListByMap(List.of(joe, bob, eve), NAME_LEVEL,
+                new HashMap<>(Map.of(FOLLOWED_ONLY, followed, EXCLUDE_BLOCKED, blocked,
+                        REVERSE, true, LIMIT, 1, OFFSET, 1)), 1);
+        Assert.assertEquals("Joe", results.get(0).name);
+        Assert.assertEquals(1, followedCalls.get());
+        Assert.assertEquals(1, blockedCalls.get());
+    }
+
+    @Test
+    public void testExactNamesKeepIdentifiersAndOverridePartialNames() {
+        List<ArbitraryResourceData> results = filterListByMap(List.of(
+                resource("Joe", "one", 1L), resource("Other", "two", 2L), resource("Joe", "three", 3L)),
+                NAME_LEVEL, new HashMap<>(Map.of(EXACT_MATCH_NAMES, List.of("JOE", "joe", "missing"),
+                        NAMES, List.of("no-match"))), 2);
+        Assert.assertEquals("one", results.get(0).identifier);
+        Assert.assertEquals("three", results.get(1).identifier);
+    }
+
+    @Test
+    public void testKeywordsMatchAnyTermAndHandleMissingMetadata() {
+        ArbitraryResourceData matching = resource("Joe", "one", 1L);
+        matching.metadata = new ArbitraryResourceMetadata();
+        matching.metadata.setDescription("A description with KEYWORD");
+        ArbitraryResourceData other = resource("Other", "two", 2L);
+        other.metadata = new ArbitraryResourceMetadata();
+        other.metadata.setDescription("Something else");
+        List<ArbitraryResourceData> results = filterListByMap(
+                List.of(matching, other, resource("No metadata", "three", 3L)), NAME_LEVEL,
+                new HashMap<>(Map.of(KEYWORDS, List.of("absent", "keyword"))), 1);
+        Assert.assertEquals("Joe", results.get(0).name);
+    }
+
+    @Test
+    public void testOptionalFieldsPreserveCacheAndResourceProperties() {
+        ArbitraryResourceData cached = resource("Joe", "one", 1L);
+        cached.metadata = new ArbitraryResourceMetadata();
+        cached.metadata.setTitle("Cached title");
+        cached.status = new ArbitraryResourceStatus(ArbitraryResourceStatus.Status.READY);
+        cached.size = 123;
+        cached.updated = 2L;
+        cached.latestSignature = new byte[]{1, 2, 3};
+
+        for (Boolean metadata : Arrays.asList(null, false, true)) {
+            for (Boolean status : Arrays.asList(null, false, true)) {
+                HashMap<String, Object> options = new HashMap<>();
+                options.put(INCLUDE_METADATA, metadata);
+                options.put(INCLUDE_STATUS, status);
+                ArbitraryResourceData result = filterListByMap(List.of(cached), NAME_LEVEL, options, 1).get(0);
+                Assert.assertEquals(cached.name, result.name);
+                Assert.assertEquals(cached.service, result.service);
+                Assert.assertEquals(cached.identifier, result.identifier);
+                Assert.assertEquals(cached.size, result.size);
+                Assert.assertEquals(cached.created, result.created);
+                Assert.assertEquals(cached.updated, result.updated);
+                Assert.assertArrayEquals(cached.latestSignature, result.latestSignature);
+                Assert.assertSame(Boolean.TRUE.equals(metadata) ? cached.metadata : null, result.metadata);
+                Assert.assertSame(Boolean.TRUE.equals(status) ? cached.status : null, result.status);
+                Assert.assertNotNull(cached.metadata);
+                Assert.assertNotNull(cached.status);
+            }
+        }
+    }
+
+    private static ArbitraryResourceData resource(String name, String identifier, long created) {
+        ArbitraryResourceData data = new ArbitraryResourceData();
+        data.name = name;
+        data.identifier = identifier;
+        data.service = Service.WEBSITE;
+        data.created = created;
+        return data;
+    }
+
     public static List<ArbitraryResourceData> filterListByMap(
             List<ArbitraryResourceData> candidates,
             Map<String, Integer> levelByName,

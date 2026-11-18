@@ -1083,13 +1083,16 @@ public class HSQLDBDatabaseUpdates {
 				case 53:
 					// Restrict paginated QDN searches to a service while reading in creation order.
 					LOGGER.info("Adding service/creation-date index to arbitrary resources cache - please wait...");
-					stmt.execute("CREATE INDEX ArbitraryResourcesServiceCreatedIndex ON ArbitraryResourcesCache (service, created_when)");
+					stmt.execute("CREATE INDEX IF NOT EXISTS ArbitraryResourcesServiceCreatedIndex ON ArbitraryResourcesCache (service, created_when)");
 					break;
 
 				case 54:
-					// Global recent-transaction queries cannot use the name-leading index
-					// to read timestamps in order and stop after the requested limit.
-					LOGGER.info("Indexing arbitrary transaction timestamps - please wait...");
+					// Both parent branches used version 54 for different indexes. Ensure both
+					// are present when upgrading either parent, or retrying interrupted DDL.
+					LOGGER.info("Adding combined performance indexes - please wait...");
+					stmt.execute("CREATE INDEX IF NOT EXISTS ArbitraryResourcesServiceCreatedIndex ON ArbitraryResourcesCache (service, created_when)");
+					stmt.execute("CREATE INDEX IF NOT EXISTS AccountBalancesBalanceIndex ON AccountBalances (balance)");
+					// Global recent-transaction queries need timestamp ordering without a leading name.
 					stmt.execute("CREATE INDEX IF NOT EXISTS ArbitraryCreatedIndex ON ArbitraryTransactions (created_when DESC)");
 					break;
 

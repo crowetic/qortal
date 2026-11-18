@@ -97,6 +97,45 @@ public class ArbitraryLatestTransactionsTests extends Common {
         }
     }
 
+    @Test
+    public void upgradesEitherVersion54ParentAndPartialIndexRetriesWithoutLosingRows() throws Exception {
+        try (Repository repository = RepositoryManager.getRepository()) {
+            ArbitraryTransactionData original = save(repository, 1, "Alpha", 100);
+            String alice = Common.getTestAccount(repository, "alice").getAddress();
+            repository.getAccountRepository().save(new org.qortal.data.account.AccountBalanceData(alice, 999L, 17L));
+            repository.saveChanges();
+            // DB parent has only the service index; performance parent has only the
+            // balance index. Neither/both also cover retries after partially committed DDL.
+            for (int indexes = 0; indexes < 4; indexes++) {
+                try (Statement statement = repository.getConnection().createStatement()) {
+                    statement.execute("DROP INDEX ArbitraryCreatedIndex");
+                    statement.execute("DROP INDEX ArbitraryResourcesServiceCreatedIndex");
+                    statement.execute("DROP INDEX AccountBalancesBalanceIndex");
+                    if ((indexes & 1) != 0) statement.execute("CREATE INDEX ArbitraryResourcesServiceCreatedIndex ON ArbitraryResourcesCache (service, created_when)");
+                    if ((indexes & 2) != 0) statement.execute("CREATE INDEX AccountBalancesBalanceIndex ON AccountBalances (balance)");
+                    statement.execute("UPDATE DatabaseInfo SET version = 54");
+                }
+                repository.saveChanges();
+                HSQLDBDatabaseUpdates.updateDatabase(repository.getConnection());
+                assertEquals(55, HSQLDBDatabaseUpdates.fetchDatabaseVersion(repository.getConnection()));
+                assertTimestampPlan(repository);
+                for (String[] index : new String[][]{
+                        {"ARBITRARYRESOURCESCACHE", "ARBITRARYRESOURCESSERVICECREATEDINDEX"},
+                        {"ACCOUNTBALANCES", "ACCOUNTBALANCESBALANCEINDEX"}}) {
+                    boolean found = false;
+                    try (ResultSet rows = repository.getConnection().getMetaData()
+                            .getIndexInfo(null, "PUBLIC", index[0], false, false)) {
+                        while (rows.next()) found |= index[1].equals(rows.getString("INDEX_NAME"));
+                    }
+                    assertTrue(index[1], found);
+                }
+                assertEquals(17L, repository.getAccountRepository().getBalance(alice, 999L).getBalance());
+                assertArrayEquals(original.getSignature(), repository.getArbitraryRepository()
+                        .getLatestArbitraryTransactions(100).get(0).getSignature());
+            }
+        }
+    }
+
     private static void assertTimestampPlan(Repository repository) throws Exception {
         StringBuilder plan = new StringBuilder();
         try (Statement statement = repository.getConnection().createStatement()) {

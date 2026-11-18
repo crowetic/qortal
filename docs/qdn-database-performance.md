@@ -1,14 +1,21 @@
 # Recent QDN transaction query optimization
 
-This change belongs to `db-query-improvements`, based on
-`a5d20f639db3e5472d1bd0e29cce77c6c81f9dcd`. It is separate from the
+`performance-db-improvements` consolidates `db-query-improvements` at
+`a5d20f639db3e5472d1bd0e29cce77c6c81f9dcd` and `performance-fixes` at
+`b9d8816a7d0ae1cc062eed8355211f2b5d768949`, with the new timestamp query
+optimization. It is separate from the
 migration-free `qdn-performance` XMR/ARRR testing JAR. Do not transfer this
 migration alone between branches: their earlier schema histories differ.
 
 ## Database change
 
-Schema 54 upgrades to 55 by adding `ArbitraryCreatedIndex` on
-`ArbitraryTransactions(created_when DESC)`. Index creation happens once at
+Both parent branches used schema 54 for different indexes: the database branch
+added `ArbitraryResourcesServiceCreatedIndex(service, created_when)` and the
+performance branch added `AccountBalancesBalanceIndex(balance)`. The combined
+migration from 54 to 55 ensures both indexes exist, then adds
+`ArbitraryCreatedIndex` on `ArbitraryTransactions(created_when DESC)`. The earlier
+service-index migration also accepts an existing index so interrupted DDL can be
+retried. Tests cover each parent layout and neither/both indexes already present. Index creation happens once at
 startup and can extend startup on large repositories. Existing transactions,
 resource caches, wallets and trade records are preserved by this migration.
 
@@ -29,7 +36,7 @@ Use JDK 11; enable tests explicitly:
 
 ```sh
 mvn -Dmaven.gitcommitid.nativegit=true -DskipJUnitTests=false \
-  -Dtest=ArbitraryLatestTransactionsTests,ArbitraryResourceSearchTests,PirateChainACCTv3TradeBotTests test
+  -Dtest=ArbitraryLatestTransactionsTests,ArbitraryResourceSearchTests,HSQLDBCacheUtilsTests,AccountBalanceCleanupTests,PirateChainACCTv3TradeBotTests test
 java -Xmx512m --class-path lib/org/hsqldb/hsqldb/2.7.4/hsqldb.jar \
   tools/QdnLatestQueryBenchmark.java 100000
 ```
@@ -48,6 +55,11 @@ scrambled timestamps and 10% unnamed rows. Local JDK 11 warm medians:
 Both fixtures returned identical ordered signatures before/after. These are
 synthetic local measurements, not gateway timings or production speedup promises.
 The command prints plans and timings for reproduction.
+
+The combined branch retains candidate filtering before metadata joins, service-scoped
+latest grouping, cached-search work reduction and indexed zero-balance cleanup
+from the parent branches. Both parent histories remain reachable; the retired
+branch names can be removed after the combined remote tip is verified.
 
 ## Rollout boundary
 
