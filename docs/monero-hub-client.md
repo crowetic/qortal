@@ -1,6 +1,19 @@
 # XMR client: Hub ownership and unified recovery
 
-Decision date: 2026-11-17. Status: owner-approved custody/network requirements; selected engine feasibility candidate. Hub's account/backup foundation is now implemented on its separate `xmr-support` branch (`a3731b9c`, `cd894052`); this Core branch does not contain the Hub sources. Scanning and sending remain disabled. See [the combined build and manual XMR test guide](arrr-xmr-testing.md).
+Decision date: 2026-11-17; status reviewed 2026-11-20. Hub's `xmr-support` branch
+now implements account/backup recovery and a desktop stagenet wallet with local
+scanning, balances/history and approved sends. The owner has reported a successful
+stagenet payment. Core supplies network metadata and contains no Hub wallet
+engine. See [Hub's current wallet guide](https://github.com/crowetic/Qortal-Hub/blob/xmr-support/docs/monero-stagenet-wallet.md)
+and [the combined manual test guide](arrr-xmr-testing.md).
+
+The standalone [`tools/xmr-hub-client`](../tools/xmr-hub-client/README.md) directory
+is a **legacy, optional browser feasibility probe**. It is not loaded by Core,
+Hub, or Hub's Q-App bridge. The manual `tools/xmr-account-test` page remains useful
+for fresh-profile backup checks; its automated mock-bridge runner currently lives
+in the probe. See [the dependency audit](../tools/xmr-hub-client/README.md#dependency-and-retirement-audit)
+before retiring that test harness. The browser findings below are historical
+measurements, separate from the integrated desktop worker.
 
 ## Responsibilities
 
@@ -34,9 +47,12 @@ Reviewed canonical source: `/home/crowetic/git-repos/gitea/crowetic/Qortal-Hub`.
 | `src/qortal/get.ts` | `getUserWallet` is the permissioned Q-App entry point. XMR responses must be an explicit public projection, never a serialized account object. |
 | `src/components/Auth/{BackupWalletModal,DownloadWallet}.tsx`, `src/App.tsx` | Backup/export and phrase-restore paths also rebuild `PhraseWallet`. Test all of them against the same XMR derivation contract. |
 
-Consequently, creating a fresh unrelated random XMR key would break the backup promise. A fixed deterministic derivation from the recoverable account seed can make older Qortal backups recover the new XMR wallet too. This is an integration requirement, not a claim that old backups currently contain an implemented XMR wallet.
+Creating an unrelated random XMR key would break the backup promise. Hub's fixed,
+versioned derivation reconstructs XMR keys from the recoverable account seed, so
+older Qortal backups can recover the new wallet without extra private fields.
+The engine's scan cache and pending-operation state have their own lifecycle.
 
-The first Hub increment must:
+The account foundation's implemented contract is:
 
 1. Define and freeze `xmrDerivationVersion = 1`: input bytes, domain label, account/address index, Qortal wallet version, network separation, hash/KDF, scalar reduction, byte order and zero-scalar handling. Use maintained cryptographic primitives and the reference wallet for independent vectors. Do not reinterpret an Ed25519 signing key, Bitcoin HD key or mnemonic as a Monero spend key. Do not bump the Qortal wallet version to add one coin.
 2. Derive/create the same XMR wallet on new-account creation, phrase login and encrypted-backup recovery. Route secret material only to trusted Hub code. Review the Hub key-storage guard and logout/account-switch cleanup before adding any secret field.
@@ -48,23 +64,49 @@ The exact derivation algorithm is deliberately not invented in the browser probe
 
 ## Engine choice and measured feasibility
 
-Use [`monero-ts` 0.11.22](https://github.com/woodser/monero-ts/releases/tag/v0.11.22) as the candidate for the next Hub increment. Its full wallet runs the local Monero engine in WASM with a worker. The [previous release](https://github.com/woodser/monero-ts/releases/tag/v0.11.21) updated the underlying Monero code to 0.18.5.4. Pin the package lock, worker bytes and license notices; reproducible native/WASM source builds and a dependency/license review remain release work.
+Hub now pins `monero-ts` 0.11.22 in its own `electron/package.json`. Its
+`electron/src/monero-wallet-service.ts` starts the bundled
+`monero-wallet.worker`, resolving that SDK locally. The worker owns scanning,
+encrypted cache/pending-payment journals and payment preparation/relay. Hub's
+request handlers provide permissions, account/network binding and signing
+approval. Keep these product files and dependencies when cleaning up the probe.
+
+The original browser experiment selected
+[`monero-ts` 0.11.22](https://github.com/woodser/monero-ts/releases/tag/v0.11.22).
+The [previous release](https://github.com/woodser/monero-ts/releases/tag/v0.11.21)
+updated the underlying Monero code to 0.18.5.4. Pin the package lock, worker bytes
+and license notices; reproducible native/WASM source builds and a dependency/license
+review remain release work.
 
 The isolated [`tools/xmr-hub-client`](../tools/xmr-hub-client/README.md) probe uses only a published synthetic scalar and loopback daemon fixtures. It tests ordinary Chromium and a cross-origin sandboxed iframe, each on mainnet and stagenet. Results cover local wallet/message signing, wrong-password rejection, encrypted wallet/cache persistence and reopen after worker restart, deterministic reconstruction without cache files, view-only creation and native daemon-height transport. The iframe is a compatibility stress test; the product's secrets belong in Hub.
 
 No cross-origin isolation or `SharedArrayBuffer` was required. The engine reported a 23,658,496-byte WASM heap in this probe; that is not total browser/process memory or evidence of practical full-chain scanning performance. The copied worker is about 3.7 MB and embeds its WASM. The SDK also requires browser shims, including a working `memfs` implementation to reopen wallet bytes. The main application bundle is also several MB. Bundle sizes and performance must be reassessed inside Hub's actual Vite 7/Electron/mobile builds; the standalone probe uses its own Vite toolchain.
 
-There is no live daemon, blockchain scan, payment signature/broadcast, funded wallet, actual Hub permission bridge, independent cryptographic audit or supported-platform acceptance in these results. An npm advisory check is a limited dependency check, not a security audit.
+The browser probe establishes no real scan, payment, Hub permission behavior or
+funded acceptance. Product verification lives in Hub: account/backup and request
+tests, worker lifecycle tests, plus `scripts/verify-xmr-wallet-worker.mjs` using
+the actual worker against a local Monero development chain. An npm advisory check
+is a limited dependency check, not a security audit. Supported-platform and
+independent security acceptance remain separate release gates.
 
 ## Network and transport contract
 
 | Qortal `/admin/info` / `GET_NODE_INFO` result | Monero network |
 | --- | --- |
-| `isTestNet: false` | `mainnet` |
-| `isTestNet: true` | `stagenet` |
-| Missing or non-boolean flag | Unavailable; fail closed |
+| Explicit `moneroNetwork: "mainnet"` or `"stagenet"` with valid node mode | Explicit network wins |
+| No explicit hint, `isTestNet: false` | `mainnet` |
+| No explicit hint, `isTestNet: true` | `stagenet` |
+| Invalid explicit hint, or missing/non-boolean node mode | Unavailable; fail closed |
 
-Monero's separate `testnet` is not used for Qortal test mode. Hub checks daemon `get_info.nettype` against the selected network before scanning or preparing a payment and distinguishes the local wallet's scan state from daemon synchronization. Cache, permissions and wallet operations must be scoped to account, derivation version and network. Cancel active operations on account/node-mode changes; never reuse a previous mode's balance or prepared transaction.
+Core's `moneroNetwork` settings names are case-insensitive and `/admin/info`
+reports lowercase. Explicit stagenet on a Qortal-mainnet node is supported without
+changing Qortal consensus. The current functional desktop wallet permits stagenet
+only; mainnet account derivation does not enable mainnet spending. Monero's
+separate `testnet` is not used. Hub checks daemon `get_info.nettype` before
+scanning/preparing, distinguishes local scan from daemon synchronization, and
+scopes cache and operations to the account/network. Account/Core changes invalidate
+pending approvals and terminate the old session. The historical browser probe
+retains the earlier `isTestNet`-only selector; it is not a product policy test.
 
 Two transport details were found in the pinned engine:
 
@@ -73,14 +115,18 @@ Two transport details were found in the pinned engine:
 
 Prefer Hub-owned networking to an open server proxy. Direct browser transports require suitable HTTPS/CORS; Electron/mobile adapters must preserve endpoint policy and cancellation. A Core relay, if required, needs a fixed daemon pool per network and a small allowlist of required JSON and binary daemon routes, bounded payloads/deadlines and exact integer handling. Do not accept arbitrary user-supplied upstream URLs. Full scan binary endpoints, broadcast error semantics, node switching and mainnet-scale performance are not established by the height fixture.
 
-## Next deliverables
+## Delivery status and remaining acceptance
 
 | Order | Component | Completion evidence |
 | --- | --- | --- |
 | 1 | Hub derivation and unified-backup integration | Implemented on Hub `xmr-support`; independent/Monero-engine vectors and real encrypted-backup tests pass. Run the fresh-profile manual acceptance in the combined test guide. |
-| 2 | Trusted Hub worker and vault lifecycle | Pinned local assets; account lock/switch/restart tests; safe cache encryption/storage; no secrets in app IPC or logs |
-| 3 | Read-only Q-App wallet interface | Permission checks; public address/balance/history models with atomic amounts as strings; explicit unavailable/syncing states |
-| 4 | Daemon pool and scan transport | Approved mainnet/stagenet targets; network/version checks; real scan and restart/reorg evidence; actual Hub platform tests |
-| 5 | Hub-confirmed local sends | Independent amount/destination/fee review; durable intent; ambiguous-broadcast recovery; authorized unfunded then funded acceptance |
+| 2 | Trusted Hub worker and vault lifecycle | Desktop stagenet implementation and process-lock tests exist; encrypted cache/journal, account lock/switch cleanup; broader platform acceptance remains. |
+| 3 | Public Q-App wallet interface | Address/balance/info/history and send bridge implemented; exact atomic strings, permission and approval tests; Q-Wallets testing consumes it. |
+| 4 | Daemon pool and scan transport | Stagenet scanning and network checks implemented with one fixed daemon; multi-daemon failover and broader reorg/platform acceptance remain. |
+| 5 | Hub-confirmed local sends | Approval, fee cap, local signing and durable pending journal implemented; real-worker local-chain regression exists and owner reports a stagenet payment; full release matrix remains. |
 
-Use the task's `xmr-support` isolation when starting Hub implementation after inspecting its current history and local work. This Core increment changes no Hub runtime files and requires no restart or rollout. Reverting this documentation/probe commit removes the experiment without altering existing wallets. Direct QORT/XMR trades remain separately gated by the protocol work in the roadmap.
+Hub work remains on `xmr-support`. The Core research branch `feat/xmr-trading`
+changes no Hub runtime files and requires no restart or rollout. Its protocol and
+AT work is [tracked separately](monero-crosschain-trades.md). The optional browser
+probe can be retired independently after retaining/moving any useful tests;
+removing Hub's own worker or SDK would break the integrated wallet.

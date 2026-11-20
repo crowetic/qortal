@@ -167,7 +167,14 @@ npx vitest run src/lib/monero src/utils/generateWallet/monero-backup.test.ts \
 
 Those tests exercise the real backup KDF/bcrypt/AES/HMAC while adapting only the test Worker boundary. [Hub's account documentation](https://github.com/crowetic/Qortal-Hub/blob/xmr-support/docs/monero-accounts.md) includes the independent Python and full Monero WASM interoperability checks.
 
-The optional browser engine/page probes run from `tools/xmr-hub-client`:
+The legacy, optional browser engine/page probes run from `tools/xmr-hub-client`.
+They are not a Core/Hub build or wallet prerequisite. The browser experiment
+predates `moneroNetwork`; its historical `isTestNet`-only selector is not the
+current Hub network contract. See [the dependency and retirement audit](../tools/xmr-hub-client/README.md#dependency-and-retirement-audit).
+For current desktop engine coverage use Hub's
+[native wallet verification](https://github.com/crowetic/Qortal-Hub/blob/xmr-support/docs/monero-stagenet-wallet.md#repeatable-native-verification).
+
+To reproduce the historical probes:
 
 ```sh
 npm ci --ignore-scripts
