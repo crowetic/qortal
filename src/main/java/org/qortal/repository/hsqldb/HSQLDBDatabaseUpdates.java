@@ -1134,6 +1134,16 @@ public class HSQLDBDatabaseUpdates {
 					ensureTradeBotRecoveryColumns(connection);
 					break;
 
+				case 55:
+					// Versions 53-55 belong to the current wallet/recovery testing branch.
+					// Also accept either older performance parent layout and interrupted DDL.
+					LOGGER.info("Adding combined performance indexes - please wait...");
+					stmt.execute("CREATE INDEX IF NOT EXISTS ArbitraryResourcesServiceCreatedIndex ON ArbitraryResourcesCache (service, created_when)");
+					stmt.execute("CREATE INDEX IF NOT EXISTS AccountBalancesBalanceIndex ON AccountBalances (balance)");
+					stmt.execute("CREATE INDEX IF NOT EXISTS ArbitraryCreatedIndex ON ArbitraryTransactions (created_when DESC)");
+
+					break;
+
 				default:
 					// nothing to do
 					return false;

@@ -24,6 +24,7 @@ import org.qortal.settings.Settings;
 import org.qortal.transaction.ArbitraryTransaction;
 import org.qortal.transaction.Transaction.ApprovalStatus;
 import org.qortal.utils.Base58;
+import org.qortal.utils.ByteArray;
 import org.qortal.utils.ListUtils;
 
 import java.sql.ResultSet;
@@ -32,12 +33,21 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 
 public class HSQLDBArbitraryRepository implements ArbitraryRepository {
 
 	private static final Logger LOGGER = LogManager.getLogger(HSQLDBArbitraryRepository.class);
+
+	private static final int SIGNATURE_BATCH_SIZE = 500;
+	private static final String ARBITRARY_TRANSACTION_SELECT = "SELECT type, reference, signature, creator, Transactions.created_when, fee, " +
+			"tx_group_id, block_height, approval_status, approval_height, " +
+			"version, nonce, service, size, is_data_raw, data, metadata_hash, " +
+			"name, identifier, update_method, secret, compression FROM ArbitraryTransactions " +
+			"JOIN Transactions USING (signature) ";
 
 	protected HSQLDBRepository repository;
 	
@@ -234,18 +244,22 @@ public class HSQLDBArbitraryRepository implements ArbitraryRepository {
 		return getLatestArbitraryTransactions(null);
 	}
 
+	static String latestTransactionSignaturesSql(int limit) {
+		return "SELECT signature FROM ArbitraryTransactions " +
+				"WHERE name IS NOT NULL ORDER BY created_when DESC LIMIT " + limit + " USING INDEX";
+	}
+
 	@Override
 	public List<ArbitraryTransactionData> getLatestArbitraryTransactions(Integer limit) throws DataException {
-		// ponytail: when limited, pick the newest N signatures via an index-only scan on
-		// ArbitraryTransactions (no join, no sort pass — same plan as the "Lite" query), then
-		// constrain the join to just those N rows. Turns a 325k-row PK-probe join into N probes.
-		// No limit => we'd read every row anyway, so the join is unavoidable; keep it as-is.
+		// First select only the newest N signatures, then hydrate those transactions.
+		// USING INDEX is HSQLDB's slicing hint: prefer the timestamp ordering index
+		// over the name index, which otherwise scans/sorts all named transactions.
+		// Full-history callers should prefer a signature snapshot and bounded hydration.
 		Object[] bindParams = new Object[0];
 		String latestFilter = "name IS NOT NULL";
 		if (limit != null) {
 			List<byte[]> signatures = new ArrayList<>(limit);
-			String idSql = "SELECT signature FROM ArbitraryTransactions " +
-					"WHERE name IS NOT NULL ORDER BY created_when DESC LIMIT " + limit;
+			String idSql = latestTransactionSignaturesSql(limit);
 			try (ResultSet idResultSet = this.repository.checkedExecute(idSql)) {
 				if (idResultSet == null)
 					return new ArrayList<>(0);
@@ -263,12 +277,7 @@ public class HSQLDBArbitraryRepository implements ArbitraryRepository {
 			bindParams = signatures.toArray();
 		}
 
-		String sql = "SELECT type, reference, signature, creator, Transactions.created_when, fee, " +
-				"tx_group_id, block_height, approval_status, approval_height, " +
-				"version, nonce, service, size, is_data_raw, data, metadata_hash, " +
-				"name, identifier, update_method, secret, compression FROM ArbitraryTransactions " +
-				"JOIN Transactions USING (signature) " +
-				"WHERE " + latestFilter + " " +
+		String sql = ARBITRARY_TRANSACTION_SELECT + "WHERE " + latestFilter + " " +
 				"ORDER BY ArbitraryTransactions.created_when DESC";
 		List<ArbitraryTransactionData> arbitraryTransactionData = new ArrayList<>();
 
@@ -277,48 +286,7 @@ public class HSQLDBArbitraryRepository implements ArbitraryRepository {
 				return new ArrayList<>(0);
 
 			do {
-				byte[] reference = resultSet.getBytes(2);
-				byte[] signature = resultSet.getBytes(3);
-				byte[] creatorPublicKey = resultSet.getBytes(4);
-				long timestamp = resultSet.getLong(5);
-
-				Long fee = resultSet.getLong(6);
-				if (fee == 0 && resultSet.wasNull())
-					fee = null;
-
-				int txGroupId = resultSet.getInt(7);
-
-				Integer blockHeight = resultSet.getInt(8);
-				if (blockHeight == 0 && resultSet.wasNull())
-					blockHeight = null;
-
-				ApprovalStatus approvalStatus = ApprovalStatus.valueOf(resultSet.getInt(9));
-				Integer approvalHeight = resultSet.getInt(10);
-				if (approvalHeight == 0 && resultSet.wasNull())
-					approvalHeight = null;
-
-				BaseTransactionData baseTransactionData = new BaseTransactionData(timestamp, txGroupId, reference, creatorPublicKey, fee, approvalStatus, blockHeight, approvalHeight, signature);
-
-				int version = resultSet.getInt(11);
-				int nonce = resultSet.getInt(12);
-				int serviceInt = resultSet.getInt(13);
-				int size = resultSet.getInt(14);
-				boolean isDataRaw = resultSet.getBoolean(15); // NOT NULL, so no null to false
-				DataType dataType = isDataRaw ? DataType.RAW_DATA : DataType.DATA_HASH;
-				byte[] data = resultSet.getBytes(16);
-				byte[] metadataHash = resultSet.getBytes(17);
-				String nameResult = resultSet.getString(18);
-				String identifierResult = resultSet.getString(19);
-				Method method = Method.valueOf(resultSet.getInt(20));
-				byte[] secret = resultSet.getBytes(21);
-				Compression compression = Compression.valueOf(resultSet.getInt(22));
-				// FUTURE: get payments from signature if needed. Avoiding for now to reduce database calls.
-
-				ArbitraryTransactionData transactionData = new ArbitraryTransactionData(baseTransactionData,
-						version, serviceInt, nonce, size, nameResult, identifierResult, method, secret,
-						compression, data, dataType, metadataHash, null);
-
-				arbitraryTransactionData.add(transactionData);
+				arbitraryTransactionData.add(readArbitraryTransaction(resultSet));
 			} while (resultSet.next());
 
 			return arbitraryTransactionData;
@@ -328,6 +296,108 @@ public class HSQLDBArbitraryRepository implements ArbitraryRepository {
 			LOGGER.error(e.getMessage(), e);
 			return new ArrayList<>(0);
 		}
+	}
+
+	@Override
+	public List<byte[]> getArbitraryTransactionSignatures() throws DataException {
+		String sql = "SELECT signature FROM ArbitraryTransactions " +
+				"WHERE name IS NOT NULL ORDER BY created_when DESC";
+		List<byte[]> signatures = new ArrayList<>();
+		try (ResultSet resultSet = this.repository.checkedExecute(sql)) {
+			if (resultSet != null) {
+				do {
+					signatures.add(resultSet.getBytes(1));
+				} while (resultSet.next());
+			}
+		} catch (SQLException e) {
+			throw new DataException("Unable to fetch arbitrary transaction signatures", e);
+		}
+		return signatures;
+	}
+
+	@Override
+	public List<ArbitraryTransactionData> getArbitraryTransactionsBySignatures(List<byte[]> signatures) throws DataException {
+		List<ArbitraryTransactionData> results = new ArrayList<>();
+		if (signatures == null || signatures.isEmpty())
+			return results;
+
+		Map<ByteArray, ArbitraryTransactionData> bySignature = new LinkedHashMap<>();
+		for (byte[] signature : signatures) {
+			if (signature != null && signature.length > 0)
+				bySignature.put(ByteArray.wrap(signature), null);
+		}
+
+		List<ByteArray> uniqueSignatures = new ArrayList<>(bySignature.keySet());
+		for (int offset = 0; offset < uniqueSignatures.size(); offset += SIGNATURE_BATCH_SIZE) {
+			List<ByteArray> batch = uniqueSignatures.subList(offset, Math.min(offset + SIGNATURE_BATCH_SIZE, uniqueSignatures.size()));
+			Object[] bindParams = batch.stream().map(signature -> signature.value).toArray();
+			// Qualifying signature lets HSQLDB seek both primary keys instead of scanning ArbitraryTransactions.
+			String sql = ARBITRARY_TRANSACTION_SELECT + "WHERE ArbitraryTransactions.signature IN (" +
+					String.join(", ", Collections.nCopies(batch.size(), "?")) + ")";
+			try (ResultSet resultSet = this.repository.checkedExecute(sql, bindParams)) {
+				if (resultSet != null) {
+					do {
+						ArbitraryTransactionData transaction = readArbitraryTransaction(resultSet);
+						bySignature.put(ByteArray.wrap(transaction.getSignature()), transaction);
+					} while (resultSet.next());
+				}
+			} catch (SQLException e) {
+				throw new DataException("Unable to fetch arbitrary transactions by signature", e);
+			}
+		}
+
+		// SQL IN does not preserve order. Restore the snapshot order, including equal-timestamp rows.
+		for (byte[] signature : signatures) {
+			if (signature == null || signature.length == 0)
+				continue;
+			ArbitraryTransactionData transaction = bySignature.get(ByteArray.wrap(signature));
+			if (transaction != null)
+				results.add(transaction);
+		}
+		return results;
+	}
+
+	private static ArbitraryTransactionData readArbitraryTransaction(ResultSet resultSet) throws SQLException {
+		byte[] reference = resultSet.getBytes(2);
+		byte[] signature = resultSet.getBytes(3);
+		byte[] creatorPublicKey = resultSet.getBytes(4);
+		long timestamp = resultSet.getLong(5);
+
+		Long fee = resultSet.getLong(6);
+		if (fee == 0 && resultSet.wasNull())
+			fee = null;
+
+		int txGroupId = resultSet.getInt(7);
+
+		Integer blockHeight = resultSet.getInt(8);
+		if (blockHeight == 0 && resultSet.wasNull())
+			blockHeight = null;
+
+		ApprovalStatus approvalStatus = ApprovalStatus.valueOf(resultSet.getInt(9));
+		Integer approvalHeight = resultSet.getInt(10);
+		if (approvalHeight == 0 && resultSet.wasNull())
+			approvalHeight = null;
+
+		BaseTransactionData baseTransactionData = new BaseTransactionData(timestamp, txGroupId, reference, creatorPublicKey, fee, approvalStatus, blockHeight, approvalHeight, signature);
+
+		int version = resultSet.getInt(11);
+		int nonce = resultSet.getInt(12);
+		int serviceInt = resultSet.getInt(13);
+		int size = resultSet.getInt(14);
+		boolean isDataRaw = resultSet.getBoolean(15); // NOT NULL, so no null to false
+		DataType dataType = isDataRaw ? DataType.RAW_DATA : DataType.DATA_HASH;
+		byte[] data = resultSet.getBytes(16);
+		byte[] metadataHash = resultSet.getBytes(17);
+		String nameResult = resultSet.getString(18);
+		String identifierResult = resultSet.getString(19);
+		Method method = Method.valueOf(resultSet.getInt(20));
+		byte[] secret = resultSet.getBytes(21);
+		Compression compression = Compression.valueOf(resultSet.getInt(22));
+		// FUTURE: get payments from signature if needed. Avoiding for now to reduce database calls.
+
+		return new ArbitraryTransactionData(baseTransactionData,
+				version, serviceInt, nonce, size, nameResult, identifierResult, method, secret,
+				compression, data, dataType, metadataHash, null);
 	}
 
 	@Override
@@ -1093,11 +1163,13 @@ public class HSQLDBArbitraryRepository implements ArbitraryRepository {
 		boolean searchMetadata = (query != null && !defaultResource) || title != null || description != null
 				|| (keywords != null && !keywords.isEmpty());
 
-		sql.append("SELECT name, service, identifier, size, status, created_when, updated_when, latest_signature");
+		// Use explicit resource columns, not merged USING columns. HSQLDB otherwise evaluates
+		// resource-only predicates after the LEFT JOIN, causing unnecessary metadata reads.
+		sql.append("SELECT r.name, r.service, r.identifier, r.size, r.status, r.created_when, r.updated_when, r.latest_signature");
 		if (returnMetadata) {
-			sql.append(", title, description, category, tag1, tag2, tag3, tag4, tag5");
+			sql.append(", m.title, m.description, m.category, m.tag1, m.tag2, m.tag3, m.tag4, m.tag5");
 		}
-		sql.append(" FROM ArbitraryResourcesCache");
+		sql.append(" FROM ArbitraryResourcesCache r");
 
 		// Default to "latest" mode
 		if (mode == null) {
@@ -1108,9 +1180,16 @@ public class HSQLDBArbitraryRepository implements ArbitraryRepository {
 			case LATEST:
 				// Include latest item only for a name/service combination
 				sql.append(" JOIN (SELECT name, service, MAX(created_when) AS latest " +
-						"FROM ArbitraryResourcesCache GROUP BY name, service) LatestResources " +
-						"ON name=LatestResources.name AND service=LatestResources.service " +
-						"AND created_when=LatestResources.latest");
+						"FROM ArbitraryResourcesCache");
+				// Service is a grouping key, so restricting it here preserves the latest row
+				// for each name while avoiding aggregation of every other service's resources.
+				if (service != null) {
+					sql.append(" WHERE service = ?");
+					bindParams.add(service.value);
+				}
+				sql.append(" GROUP BY name, service) LatestResources " +
+						"ON r.name=LatestResources.name AND r.service=LatestResources.service " +
+						"AND r.created_when=LatestResources.latest");
 				break;
 
 			case ALL:
@@ -1119,13 +1198,13 @@ public class HSQLDBArbitraryRepository implements ArbitraryRepository {
 
 		if (minLevel != null) {
 			// Join tables necessary for level filter
-			sql.append(" JOIN Names USING (name) JOIN Accounts ON Accounts.account=Names.owner");
+			sql.append(" JOIN Names ON Names.name=r.name JOIN Accounts ON Accounts.account=Names.owner");
 		}
 
 		if (returnMetadata || searchMetadata) {
-			sql.append(" LEFT JOIN ArbitraryMetadataCache USING (service, name, identifier)");
+			sql.append(" LEFT JOIN ArbitraryMetadataCache m ON m.service=r.service AND m.name=r.name AND m.identifier=r.identifier");
 		}
-		sql.append(" WHERE name IS NOT NULL");
+		sql.append(" WHERE r.name IS NOT NULL");
 
 		if (minLevel != null) {
 			// Add level filter
@@ -1134,12 +1213,12 @@ public class HSQLDBArbitraryRepository implements ArbitraryRepository {
 		}
 
 		if (service != null) {
-			sql.append(" AND service = ?");
+			sql.append(" AND r.service = ?");
 			bindParams.add(service.value);
 		}
 
 		if (defaultResource) {
-			sql.append(" AND identifier='default'");
+			sql.append(" AND r.identifier='default'");
 		}
 
 		// Handle general query matches
@@ -1151,12 +1230,12 @@ public class HSQLDBArbitraryRepository implements ArbitraryRepository {
 
 			if (defaultResource) {
 				// Default resource requested - search name only
-				sql.append(" AND LCASE(name) LIKE ?");
+				sql.append(" AND LCASE(r.name) LIKE ?");
 				bindParams.add(queryWildcard);
 			} else {
 				// Non-default resource requested
 				// In this case we search the identifier as well as the name
-				sql.append(" AND (LCASE(name) LIKE ? OR LCASE(identifier) LIKE ? OR LCASE(title) LIKE ? OR LCASE(description) LIKE ?)");
+				sql.append(" AND (LCASE(r.name) LIKE ? OR LCASE(r.identifier) LIKE ? OR LCASE(m.title) LIKE ? OR LCASE(m.description) LIKE ?)");
 				bindParams.add(queryWildcard); bindParams.add(queryWildcard); bindParams.add(queryWildcard); bindParams.add(queryWildcard);
 			}
 		}
@@ -1165,7 +1244,7 @@ public class HSQLDBArbitraryRepository implements ArbitraryRepository {
 		if (identifier != null) {
 			// Search anywhere in the identifier, unless "prefixOnly" has been requested
 			String queryWildcard = prefixOnly ? String.format("%s%%", identifier.toLowerCase()) : String.format("%%%s%%", identifier.toLowerCase());
-			sql.append(" AND LCASE(identifier) LIKE ?");
+			sql.append(" AND LCASE(r.identifier) LIKE ?");
 			bindParams.add(queryWildcard);
 		}
 
@@ -1173,7 +1252,7 @@ public class HSQLDBArbitraryRepository implements ArbitraryRepository {
 		if (title != null) {
 			// Search anywhere in the title, unless "prefixOnly" has been requested
 			String queryWildcard = prefixOnly ? String.format("%s%%", title.toLowerCase()) : String.format("%%%s%%", title.toLowerCase());
-			sql.append(" AND LCASE(title) LIKE ?");
+			sql.append(" AND LCASE(m.title) LIKE ?");
 			bindParams.add(queryWildcard);
 		}
 
@@ -1181,7 +1260,7 @@ public class HSQLDBArbitraryRepository implements ArbitraryRepository {
 		if (description != null) {
 			// Search anywhere in the description, unless "prefixOnly" has been requested
 			String queryWildcard = prefixOnly ? String.format("%s%%", description.toLowerCase()) : String.format("%%%s%%", description.toLowerCase());
-			sql.append(" AND LCASE(description) LIKE ?");
+			sql.append(" AND LCASE(m.description) LIKE ?");
 			bindParams.add(queryWildcard);
 		}
 
@@ -1192,7 +1271,7 @@ public class HSQLDBArbitraryRepository implements ArbitraryRepository {
 			List<String> bindValues = new ArrayList<>();
 		
 			for (int i = 0; i < searchKeywords.size(); i++) {
-				conditions.add("LOWER(description) LIKE ?"); 
+				conditions.add("LOWER(m.description) LIKE ?");
 				bindValues.add("%" + searchKeywords.get(i).trim().toLowerCase() + "%"); 
 			}
 		
@@ -1213,7 +1292,7 @@ public class HSQLDBArbitraryRepository implements ArbitraryRepository {
 				// Search anywhere in the name, unless "prefixOnly" has been requested
 				String queryWildcard = prefixOnly ? String.format("%s%%", names.get(i).toLowerCase()) : String.format("%%%s%%", names.get(i).toLowerCase());
 				if (i > 0) sql.append(" OR ");
-				sql.append("LCASE(name) LIKE ?");
+				sql.append("LCASE(r.name) LIKE ?");
 				bindParams.add(queryWildcard);
 			}
 			sql.append(")");
@@ -1221,7 +1300,7 @@ public class HSQLDBArbitraryRepository implements ArbitraryRepository {
 
 		// Handle name exact matches
 		if (exactMatchNames != null && !exactMatchNames.isEmpty()) {
-			sql.append(" AND LCASE(name) IN (?");
+			sql.append(" AND LCASE(r.name) IN (?");
 			bindParams.add(exactMatchNames.get(0).toLowerCase());
 
 			for (int i = 1; i < exactMatchNames.size(); ++i) {
@@ -1233,11 +1312,11 @@ public class HSQLDBArbitraryRepository implements ArbitraryRepository {
 
 		// Timestamp range
 		if (before != null) {
-			sql.append(" AND created_when < ?");
+			sql.append(" AND r.created_when < ?");
 			bindParams.add(before);
 		}
 		if (after != null) {
-			sql.append(" AND created_when > ?");
+			sql.append(" AND r.created_when > ?");
 			bindParams.add(after);
 		}
 
@@ -1245,7 +1324,7 @@ public class HSQLDBArbitraryRepository implements ArbitraryRepository {
 		if (followedOnly != null && followedOnly) {
 			List<String> followedNames = ListUtils.followedNames();
 			if (followedNames != null && !followedNames.isEmpty()) {
-				sql.append(" AND LCASE(name) IN (?");
+				sql.append(" AND LCASE(r.name) IN (?");
 				bindParams.add(followedNames.get(0).toLowerCase());
 
 				for (int i = 1; i < followedNames.size(); ++i) {
@@ -1260,7 +1339,7 @@ public class HSQLDBArbitraryRepository implements ArbitraryRepository {
 		if (excludeBlocked != null && excludeBlocked) {
 			List<String> blockedNames = ListUtils.blockedNames();
 			if (blockedNames != null && !blockedNames.isEmpty()) {
-				sql.append(" AND LCASE(name) NOT IN (?");
+				sql.append(" AND LCASE(r.name) NOT IN (?");
 				bindParams.add(blockedNames.get(0).toLowerCase());
 
 				for (int i = 1; i < blockedNames.size(); ++i) {
@@ -1271,13 +1350,20 @@ public class HSQLDBArbitraryRepository implements ArbitraryRepository {
 			}
 		}
 
-		sql.append(" ORDER BY created_when");
-
-		if (reverse != null && reverse) {
-			sql.append(" DESC");
-		}
+		String direction = Boolean.TRUE.equals(reverse) ? " DESC" : "";
+		sql.append(" ORDER BY ");
+		// service is constant when supplied. Include it in ORDER BY so HSQLDB can use
+		// (service, created_when) for both the service range and chronological pagination.
+		if (service != null)
+			sql.append("r.service").append(direction).append(", ");
+		sql.append("r.created_when").append(direction);
 
 		HSQLDBRepository.limitOffsetSql(sql, limit, offset);
+		if (limit != null && limit > 0) {
+			// Keep the ordered scan after qualifying resource filters. Otherwise HSQLDB can
+			// choose a service-only index and sort every match before applying LIMIT.
+			sql.append(" USING INDEX");
+		}
 
 		List<ArbitraryResourceData> arbitraryResources = new ArrayList<>();
 
