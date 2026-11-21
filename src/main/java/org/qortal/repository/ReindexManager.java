@@ -109,9 +109,7 @@ public class ReindexManager {
                 int startHeight = Math.max(height - pruneAndTrimBlockInterval*2, 2);
                 int endHeight = height - pruneAndTrimBlockInterval;
                 LOGGER.info("Pruning and trimming blocks {} to {}...", startHeight, endHeight);
-                this.repository.getATRepository().rebuildLatestAtStates(height - 250);
-                this.repository.saveChanges();
-                this.prune(startHeight, endHeight);
+				this.prune(startHeight, endHeight);
                 this.trim(startHeight, endHeight);
             }
 

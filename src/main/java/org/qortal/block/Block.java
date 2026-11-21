@@ -124,6 +124,7 @@ public class Block {
 	protected byte[] atStatesHash;
 	/** Locally-generated AT states */
 	protected List<ATStateData> ourAtStates;
+	private org.qortal.at.ATBlockResult ourAtResult;
 	/** Locally-generated AT fees */
 	protected long ourAtFees; // Generated locally
 
@@ -590,6 +591,7 @@ public class Block {
 
 		// Copy AT state data
 		newBlock.ourAtStates = this.ourAtStates;
+		newBlock.ourAtResult = this.ourAtResult;
 		newBlock.atStates = newBlock.ourAtStates;
 		newBlock.ourAtFees = this.ourAtFees;
 
@@ -746,7 +748,10 @@ public class Block {
 		// We exclude initial AT states created by processing DEPLOY_AT transactions as they are never serialized and so not included in block's AT count.
 		int nonInitialCount = (int) atStateData.stream().filter(atState -> !atState.isInitial()).count();
 		if (nonInitialCount != this.blockData.getATCount())
-			throw new IllegalStateException("Block's AT states from repository do not match block's AT count");
+			// Pruned blocks imported from a V2 archive can lack individual AT summaries.
+			// Report unavailable or inconsistent repository data through the checked error path.
+			throw new DataException(String.format("AT state summary count mismatch at block %d: expected %d, found %d",
+					this.blockData.getHeight(), this.blockData.getATCount(), nonInitialCount));
 
 		this.atStates = atStateData;
 
@@ -1591,15 +1596,23 @@ public class Block {
 		List<AtTransaction> allAtTransactions = new ArrayList<>();
 
 		this.ourAtStates = new ArrayList<>();
+		List<ATData> updatedHeads = new ArrayList<>();
 		this.ourAtFees = 0;
 
 		// Find all executable ATs, ordered by earliest creation date first
-		List<ATData> executableATs = this.repository.getATRepository().getAllExecutableATs();
+        List<ATData> executableATs = this.repository.getATRepository().getATsForExecution(this.blockData.getHeight());
+        org.qortal.at.ATExecutionContext atContext = new org.qortal.at.ATExecutionContext(repository, executableATs);
 
 		// Run each AT, appends AT-Transactions and corresponding AT states, to our lists
+		List<org.qortal.at.ATBlockResult.Entry> entries = new ArrayList<>();
 		for (ATData atData : executableATs) {
+			// willExecute()/preExecute() can clear the sleep-until-message cursor.
+			// Orphan receipts must contain the metadata from the parent, not the
+			// mutated values left behind by candidate execution.
+			org.qortal.at.ATBlockResult.ParentMetadata parentMetadata =
+					new org.qortal.at.ATBlockResult.ParentMetadata(atData);
 			AT at = new AT(this.repository, atData);
-			List<AtTransaction> atTransactions = at.run(this.blockData.getHeight(), this.blockData.getTimestamp());
+			List<AtTransaction> atTransactions = at.run(this.blockData.getHeight(), this.blockData.getTimestamp(), atContext);
 			ATStateData atStateData = at.getATStateData();
 			// Didn't execute? (e.g. sleeping)
 			if (atStateData == null)
@@ -1607,8 +1620,15 @@ public class Block {
 
 			allAtTransactions.addAll(atTransactions);
 			this.ourAtStates.add(atStateData);
+			org.qortal.data.at.ATExecutionState parentState = atContext.state(atData.getATAddress());
+			// Capture the parent metadata before prepareUpdate() mutates atData.
+			entries.add(new org.qortal.at.ATBlockResult.Entry(atStateData, parentMetadata, parentState));
+			ATData updatedHead = at.prepareUpdate();
+			if (at.hasChangedMetadata()) updatedHeads.add(updatedHead);
 			this.ourAtFees += atStateData.getFees();
 		}
+
+        this.ourAtResult = new org.qortal.at.ATBlockResult(atContext.parentSignature(), this.blockData.getHeight(), entries, updatedHeads);
 
 		// AT Transactions never need approval
 		allAtTransactions.forEach(transaction -> transaction.getTransactionData().setApprovalStatus(ApprovalStatus.NOT_REQUIRED));
@@ -1658,6 +1678,7 @@ public class Block {
 	public void process() throws DataException {
 		// Set our block's height
 		int blockchainHeight = this.repository.getBlockRepository().getBlockchainHeight();
+        if (this.ourAtResult != null) this.ourAtResult.requireParent(repository, blockchainHeight + 1);
 		this.blockData.setHeight(blockchainHeight + 1);
 
 		LOGGER.trace(() -> String.format("Processing block %d", this.blockData.getHeight()));
@@ -1706,9 +1727,7 @@ public class Block {
 			processGroupApprovalTransactions();
 
 			// Process AT fees and save AT states into repository
-			processAtFeesAndStates();
-
-			// Commit new accounts' last-reference changes
+            processAtFeesAndStates();
 			accountRefCache.commit();
 		}
 
@@ -1722,7 +1741,7 @@ public class Block {
 
 		// Link transactions to this block, thus removing them from unconfirmed transactions list.
 		// Also update "transaction participants" in repository for "transactions involving X" support in API
-		linkTransactionsToBlock();
+        linkTransactionsToBlock();
 
         if(blockchainHeight % 100 == 0) // Only sweep the balance table once every 100 blocks for 0 balances
 		    postBlockTidy();
@@ -1928,27 +1947,26 @@ public class Block {
 		}
 	}
 
-	protected void processAtFeesAndStates() throws DataException {
-		ATRepository atRepository = this.repository.getATRepository();
+    /** Conservative execution workspace estimate for fast-sync transaction boundaries. */
+    public long getATWorkspaceBytes() {
+        long bytes = 0;
+        if (ourAtStates != null) for (ATStateData state : ourAtStates)
+            bytes += 2048L + (state.getStateData() == null ? 0 : state.getStateData().length);
+        if (transactions != null) for (Transaction transaction : transactions)
+            if (transaction.getTransactionData().getType() == TransactionType.AT) bytes += 2048L;
+        return bytes;
+    }
 
-		// Safety check: ourAtStates should have been populated during validation
-		if (this.ourAtStates == null) {
-			throw new IllegalStateException("Cannot process AT fees and states: ourAtStates is null. Block validation may have failed.");
-		}
-
-		for (ATStateData atStateData : this.ourAtStates) {
-			Account atAccount = new Account(this.repository, atStateData.getATAddress());
-
-			// Subtract AT-generated fees from AT accounts
-			atAccount.modifyAssetBalance(Asset.QORT, - atStateData.getFees());
-
-			// Update AT info with latest state
-			ATData atData = atRepository.fromATAddress(atStateData.getATAddress());
-
-			AT at = new AT(repository, atData, atStateData);
-			at.update(this.blockData.getHeight(), this.blockData.getTimestamp());
-		}
-	}
+    protected void processAtFeesAndStates() throws DataException {
+        if (this.ourAtStates == null) throw new IllegalStateException("AT block result is missing");
+        if (this.ourAtStates.isEmpty()) return;
+        if (this.ourAtResult == null) throw new IllegalStateException("AT execution result is missing");
+        List<AccountBalanceData> fees = new ArrayList<>(ourAtStates.size());
+        for (ATStateData state : ourAtStates)
+            if (state.getFees() != 0L) fees.add(new AccountBalanceData(state.getATAddress(),Asset.QORT,-state.getFees()));
+        repository.getAccountRepository().modifyExistingAssetBalances(fees);
+        this.ourAtResult.save(repository, this.ourAtStates);
+    }
 
 	protected void linkTransactionsToBlock() throws DataException {
 		TransactionRepository transactionRepository = this.repository.getTransactionRepository();
@@ -1963,11 +1981,10 @@ public class Block {
 			this.repository.getBlockRepository().save(blockTransactionData);
 
 			// Update transaction's height in repository and local transactionData
-			transactionRepository.updateBlockHeight(transactionData.getSignature(), this.blockData.getHeight());
+			// Position and recipient updates are flushed together after all block links.
 			transaction.getTransactionData().setBlockHeight(this.blockData.getHeight());
 
 			// Update transaction's sequence in repository and local transactionData
-			transactionRepository.updateBlockSequence(transactionData.getSignature(), sequence);
 			transaction.getTransactionData().setBlockSequence(sequence);
 
 			// No longer unconfirmed
@@ -1976,6 +1993,7 @@ public class Block {
 			List<String> participantAddresses = transaction.getInvolvedAddresses();
 			transactionRepository.saveParticipants(transactionData, participantAddresses);
 		}
+        transactionRepository.updateBlockPositions(transactions.stream().map(Transaction::getTransactionData).collect(Collectors.toList()), this.blockData.getHeight());
 	}
 
 	/**
@@ -2142,18 +2160,32 @@ public class Block {
 
 	protected void orphanAtFeesAndStates() throws DataException {
 		ATRepository atRepository = this.repository.getATRepository();
-		for (ATStateData atStateData : this.getATStates()) {
-			Account atAccount = new Account(this.repository, atStateData.getATAddress());
+        List<ATStateData> receipts = this.getATStates();
+        if (receipts.isEmpty()) return;
+        List<AccountBalanceData> refunds = new ArrayList<>();
+        List<String> addresses = new ArrayList<>();
+        for (ATStateData receipt : receipts) {
+            if (receipt.getFees() != 0L)
+                refunds.add(new AccountBalanceData(receipt.getATAddress(), Asset.QORT, receipt.getFees()));
+            if (!receipt.isInitial()) addresses.add(receipt.getATAddress());
+        }
+        repository.getAccountRepository().modifyAssetBalances(refunds);
+        // This restores every affected head before reading its parent payload. Initial deployment
+        // heads can be empty temporarily; orphaning their deployment removes them before commit.
+		boolean metadataRestored = atRepository.deleteATStates(this.blockData.getHeight());
+		if (metadataRestored) return;
 
-			// Return AT-generated fees to AT accounts
-			atAccount.modifyAssetBalance(Asset.QORT, atStateData.getFees());
-
-			// Revert AT info to prior values
-			ATData atData = atRepository.fromATAddress(atStateData.getATAddress());
-
-			AT at = new AT(repository, atData, atStateData);
-			at.revert(this.blockData.getHeight(), this.blockData.getTimestamp());
-		}
+		// Legacy blocks do not contain the parent metadata captured by versioned block
+		// results, so only they need to reconstruct flags from parent payloads.
+        for (int start = 0; start < addresses.size(); start += 256) {
+            List<String> chunk = addresses.subList(start, Math.min(start + 256, addresses.size()));
+            Map<String, ATStateData> parents = new HashMap<>();
+            for (ATStateData parent : atRepository.getLatestATStates(chunk)) parents.put(parent.getATAddress(), parent);
+            List<ATData> ats = atRepository.fromATAddresses(chunk);
+            if (ats.size() != chunk.size()) throw new DataException("Missing AT metadata while orphaning block");
+            for (ATData at : ats) AT.restoreMetadata(at, parents.get(at.getATAddress()));
+            atRepository.saveATMetadata(ats);
+        }
 	}
 
 	protected void decreaseAccountLevels() throws DataException {

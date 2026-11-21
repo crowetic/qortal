@@ -986,8 +986,10 @@ public class ArbitraryDataFileManager extends Thread {
             // This avoids loading from cache multiple times (one load per forward)
             // The byte[] will be held by all MessageFactory instances until they're processed
             final byte[] sharedChunkData = chunkData;
-            
-            // Clear fileContent now - we have sharedChunkData reference and cache file
+
+            // Relay factories retain this array asynchronously, so it must not be returned
+            // to the incoming pool while any factory can still reference it.
+            adf.abandonFileContentRelease();
             adf.clearFileContent();
             
             // Get current connected peers snapshot for resolving Peer objects

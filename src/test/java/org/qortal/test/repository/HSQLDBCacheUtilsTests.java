@@ -155,6 +155,28 @@ public class HSQLDBCacheUtilsTests {
     }
 
     @Test
+    public void testQueryIsCaseInsensitive() {
+        ArbitraryResourceData data = new ArbitraryResourceData();
+        data.metadata = new ArbitraryResourceMetadata();
+        data.metadata.setDescription("Mixed CASE Description");
+        data.name = "Joe";
+
+        filterListByMap(List.of(data), NAME_LEVEL,
+                new HashMap<>(Map.of(QUERY, "case description")), 1);
+    }
+
+    @Test
+    public void testKeywordsAreCaseInsensitiveAndUseAnyMatch() {
+        ArbitraryResourceData data = new ArbitraryResourceData();
+        data.metadata = new ArbitraryResourceMetadata();
+        data.metadata.setDescription("A Mixed CASE Description");
+        data.name = "Joe";
+
+        filterListByMap(List.of(data), NAME_LEVEL,
+                new HashMap<>(Map.of(KEYWORDS, List.of("missing", "case description"))), 1);
+    }
+
+    @Test
     public void testQueryNegativeDescriptionPrefix() {
         ArbitraryResourceData data = new ArbitraryResourceData();
         data.metadata = new ArbitraryResourceMetadata();

@@ -78,7 +78,15 @@ public class HSQLDBRepositoryFactory implements RepositoryFactory {
 
 		// Perform DB updates?
 		try (final Connection connection = this.connectionPool.getConnection()) {
-			this.wasPristine = HSQLDBDatabaseUpdates.updateDatabase(connection);
+			// Apply cache bounds before migration because table rebuilds use the same cache.
+            try (Statement statement = connection.createStatement()) {
+                statement.execute("SET FILES LOG SIZE " + Settings.getInstance().getHsqldbLogSize());
+                statement.execute("SET FILES CACHE SIZE " + Settings.getInstance().getHsqldbCacheSize());
+                statement.execute("SET FILES CACHE ROWS " + Settings.getInstance().getHsqldbCacheRows());
+            }
+            this.wasPristine = HSQLDBDatabaseUpdates.updateDatabase(connection);
+            LOGGER.info("Repository row cache: {} KiB, {} rows (Java memory overhead is additional)",
+                    Settings.getInstance().getHsqldbCacheSize(), Settings.getInstance().getHsqldbCacheRows());
 		} catch (SQLException e) {
 			throw new DataException("Repository initialization error", e);
 		}

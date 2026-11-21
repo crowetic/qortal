@@ -36,6 +36,9 @@ public interface Repository extends AutoCloseable {
 
 	public void saveChanges() throws DataException;
 
+	/** Run only after a successful commit; discarded with its enclosing savepoint/transaction. */
+	public void afterCommit(Runnable action);
+
 	public void discardChanges() throws DataException;
 
 	/**
@@ -59,6 +62,12 @@ public interface Repository extends AutoCloseable {
 	public void setDebug(boolean debugState);
 
 	public void backup(boolean quick, String name, Long timeout) throws DataException, TimeoutException;
+
+	/**
+	 * Create a distributable bootstrap backup. Implementations must remove node-local,
+	 * transient state from the backup copy without changing the live repository.
+	 */
+	public void backupForBootstrap(String name, Long timeout) throws DataException, TimeoutException;
 
 	public void performPeriodicMaintenance(Long timeout) throws DataException, TimeoutException;
 

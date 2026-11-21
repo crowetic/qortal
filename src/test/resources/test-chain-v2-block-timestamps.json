@@ -68,6 +68,7 @@
 	"featureTriggers": {
 		"messageHeight": 0,
 		"atHeight": 0,
+		"atValidateHeight": 9999999999999,
 		"assetsTimestamp": 0,
 		"votingTimestamp": 0,
 		"arbitraryTimestamp": 0,

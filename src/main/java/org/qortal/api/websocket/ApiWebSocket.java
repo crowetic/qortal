@@ -18,9 +18,13 @@ import java.io.IOException;
 import java.io.StringWriter;
 import java.io.Writer;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
 @SuppressWarnings("serial")
 public abstract class ApiWebSocket extends JettyWebSocketServlet {
+
+	// Contexts hold binding metadata; each message still gets its own marshaller.
+	private static final Map<Class<?>, JAXBContext> JAXB_CONTEXTS = new ConcurrentHashMap<>();
 
 	private static final Map<Class<? extends ApiWebSocket>, List<Session>> SESSIONS_BY_CLASS = new HashMap<>();
 
@@ -94,7 +98,13 @@ public abstract class ApiWebSocket extends JettyWebSocketServlet {
 	private static Marshaller createMarshaller(Class<?> objectClass) {
 		try {
 			// Create JAXB context aware of object's class
-			JAXBContext jc = JAXBContextFactory.createContext(new Class[] { objectClass }, null);
+			JAXBContext jc = JAXB_CONTEXTS.computeIfAbsent(objectClass, type -> {
+				try {
+					return JAXBContextFactory.createContext(new Class[] { type }, null);
+				} catch (JAXBException e) {
+					throw new RuntimeException("Unable to create websocket marshaller", e);
+				}
+			});
 			Marshaller marshaller = jc.createMarshaller();
 			marshaller.setProperty(MarshallerProperties.MEDIA_TYPE, "application/json");
 			marshaller.setProperty(MarshallerProperties.JSON_INCLUDE_ROOT, false);

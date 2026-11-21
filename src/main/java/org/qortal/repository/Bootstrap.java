@@ -85,12 +85,6 @@ public class Bootstrap {
             throw new DataException("Unable to create bootstrap because the block archive isn't fully built yet.");
         }
 
-        // Ensure that this database contains the ATStatesHeightIndex which was missing in some cases
-        boolean hasAtStatesHeightIndex = repository.getATRepository().hasAtStatesHeightIndex();
-        if (!hasAtStatesHeightIndex) {
-            throw new DataException("Unable to create bootstrap due to missing ATStatesHeightIndex. A re-sync from genesis is needed.");
-        }
-
         // Ensure we have synced NTP time
         if (NTP.getTime() == null) {
             throw new DataException("Unable to create bootstrap because the node hasn't synced its time yet.");
@@ -119,15 +113,19 @@ public class Bootstrap {
                         "then try again. Blocks remaining (online accounts signatures): %d", accountsBlocksRemaining));
             }
 
-            // Ensure that the AT states data has been fully trimmed
-            final int atTrimStartHeight = repository.getATRepository().getAtTrimHeight();
-            final long atUpperTrimmableTimestamp = chainTip.getTimestamp() - Settings.getInstance().getAtStatesMaxLifetime();
-            final int atUpperTrimmableHeight = repository.getBlockRepository().getHeightFromTimestamp(atUpperTrimmableTimestamp);
-            final int atBlocksRemaining = atUpperTrimmableHeight - atTrimStartHeight;
-            if (atBlocksRemaining > MAXIMUM_UNTRIMMED_BLOCKS) {
-                throw new DataException(String.format("Blockchain is not fully trimmed. Please allow the node to run " +
-                        "for longer, then try again. Blocks remaining (AT states): %d", atBlocksRemaining));
-            }
+			// Ensure AT block payload trimming has caught up to the same retention
+			// boundary used by AtStatesTrimmer.
+			final long atLifetime = Settings.getInstance().getAtStatesMaxLifetime();
+			final long atUpperTrimmableTimestamp = Math.min(NTP.getTime() - atLifetime,
+					chainTip.getTimestamp() - atLifetime);
+			final int atUpperTrimmableHeight = Math.min(
+					repository.getBlockRepository().getHeightFromTimestamp(atUpperTrimmableTimestamp),
+					chainTip.getHeight() - Settings.getInstance().getPruneBlockLimit());
+			final int atTrimRemaining = atUpperTrimmableHeight - repository.getATRepository().getAtTrimHeight();
+			if (atTrimRemaining > MAXIMUM_UNTRIMMED_BLOCKS) {
+				throw new DataException(String.format("Blockchain is not fully trimmed. Please allow the node to run " +
+						"for longer, then try again. Blocks remaining (AT block payloads): %d", atTrimRemaining));
+			}
         }
 
         // Ensure that blocks have been fully pruned
@@ -137,22 +135,26 @@ public class Bootstrap {
             blockUpperPrunableHeight = repository.getBlockArchiveRepository().getBlockArchiveHeight() - 1;
         }
         final int blocksPruneRemaining = blockUpperPrunableHeight - blockPruneStartHeight;
-        if (blocksPruneRemaining > MAXIMUM_UNPRUNED_BLOCKS) {
+		if (blocksPruneRemaining > MAXIMUM_UNPRUNED_BLOCKS) {
             throw new DataException(String.format("Blockchain is not fully pruned. Please allow the node to run " +
                     "for longer, then try again. Blocks remaining: %d", blocksPruneRemaining));
-        }
+		}
 
-        // Ensure that AT states have been fully pruned
-        final int atPruneStartHeight = repository.getATRepository().getAtPruneHeight();
-        int atUpperPrunableHeight = chainTip.getHeight() - Settings.getInstance().getPruneBlockLimit();
-        if (archiveEnabled) {
-            atUpperPrunableHeight = repository.getBlockArchiveRepository().getBlockArchiveHeight() - 1;
-        }
-        final int atPruneRemaining = atUpperPrunableHeight - atPruneStartHeight;
-        if (atPruneRemaining > MAXIMUM_UNPRUNED_BLOCKS) {
-            throw new DataException(String.format("Blockchain is not fully pruned. Please allow the node to run " +
-                    "for longer, then try again. Blocks remaining (AT states): %d", atPruneRemaining));
-        }
+		// Ensure obsolete AT block results have been pruned to the same block-count,
+		// chain-time and archive boundaries used by AtStatesPruner.
+		final long atRetainedTimestamp = chainTip.getTimestamp() - Settings.getInstance().getAtStatesMaxLifetime();
+		int atUpperPrunableHeight = Math.min(
+				chainTip.getHeight() - Settings.getInstance().getPruneBlockLimit(),
+				repository.getBlockRepository().getHeightFromTimestamp(atRetainedTimestamp));
+		if (archiveEnabled) {
+			atUpperPrunableHeight = Math.min(atUpperPrunableHeight,
+					repository.getBlockArchiveRepository().getBlockArchiveHeight() - 1);
+		}
+		final int atPruneRemaining = atUpperPrunableHeight - repository.getATRepository().getAtPruneHeight();
+		if (atPruneRemaining > MAXIMUM_UNPRUNED_BLOCKS) {
+			throw new DataException(String.format("Blockchain is not fully pruned. Please allow the node to run " +
+					"for longer, then try again. Blocks remaining (AT block results): %d", atPruneRemaining));
+		}
 
         LOGGER.info("Repository state checks passed");
         return true;
@@ -248,7 +250,7 @@ public class Bootstrap {
             LOGGER.info("Creating bootstrap...");
             // Timeout if the database isn't ready for backing up after 10 seconds
             long timeout = 10 * 1000L;
-            repository.backup(false, "bootstrap", timeout);
+            repository.backupForBootstrap("bootstrap", timeout);
 
             LOGGER.info("Moving files to output directory...");
             inputPath = Paths.get(Settings.getInstance().getRepositoryPath(), "bootstrap");
@@ -444,6 +446,7 @@ public class Bootstrap {
         ReentrantLock blockchainLock = Controller.getInstance().getBlockchainLock();
         blockchainLock.lockInterruptibly();
 
+        boolean bootstrapInstalled = false;
         try {
             this.updateStatus("Stopping repository...");
             // Close the repository while we are still able to
@@ -470,14 +473,31 @@ public class Bootstrap {
             // Move the "bootstrap" folder in place of the "db" folder
             this.updateStatus("Moving files to output directory...");
             Files.move(inputPath, outputPath);
+			bootstrapInstalled = true;
 
             this.updateStatus("Starting repository from bootstrap...");
         }
-        finally {
-            RepositoryFactory repositoryFactory = new HSQLDBRepositoryFactory(Controller.getRepositoryUrl());
-            RepositoryManager.setRepositoryFactory(repositoryFactory);
-
-            blockchainLock.unlock();
+		finally {
+			try {
+				RepositoryFactory newRepositoryFactory = new HSQLDBRepositoryFactory(Controller.getRepositoryUrl());
+				boolean factoryInstalled = false;
+				try {
+					if (bootstrapInstalled) {
+						LOGGER.info("Removing inherited node-local work from imported bootstrap...");
+						try (Repository importedRepository = newRepositoryFactory.getRepository()) {
+							importedRepository.getArbitraryRepository().sanitizeDirtyResourcesForBootstrap();
+							importedRepository.saveChanges();
+						}
+					}
+					RepositoryManager.setRepositoryFactory(newRepositoryFactory);
+					factoryInstalled = true;
+				} finally {
+					if (!factoryInstalled)
+						newRepositoryFactory.close();
+				}
+			} finally {
+				blockchainLock.unlock();
+			}
         }
     }
 

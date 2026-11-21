@@ -254,12 +254,4 @@ public abstract class RepositoryManager {
 		return SQLException.class.isInstance(cause) && repositoryFactory.isDeadlockException((SQLException) cause);
 	}
 
-	public static boolean canArchiveOrPrune() {
-		try (final Repository repository = getRepository()) {
-			return repository.getATRepository().hasAtStatesHeightIndex();
-		} catch (DataException e) {
-			return false;
-		}
-	}
-
 }

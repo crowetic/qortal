@@ -31,13 +31,14 @@ import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Timer;
 import java.util.TimerTask;
+import java.util.function.Function;
 import java.util.stream.Collectors;
-import java.util.stream.Stream;
 
 public class ArbitraryIndexUtils {
 
@@ -151,16 +152,7 @@ public class ArbitraryIndexUtils {
 
             LOGGER.debug("processing indices by term ...");
             Map<String, List<ArbitraryDataIndexDetail>> indicesByTerm
-                = indexDetails.stream().collect(
-                    Collectors.toMap(
-                        detail -> detail.term,          // map by term
-                        detail -> List.of(detail),      // create list for term
-                        (list1, list2)                  // merge lists for same term
-                            -> Stream.of(list1, list2)
-                                .flatMap(List::stream)
-                                .collect(Collectors.toList())
-                    )
-            );
+                = groupIndexDetails(indexDetails, detail -> detail.term);
 
             // lock, clear old, load new
             synchronized( IndexCache.getInstance().getIndicesByTerm() ) {
@@ -170,16 +162,7 @@ public class ArbitraryIndexUtils {
 
             LOGGER.debug("processing indices by issuer ...");
             Map<String, List<ArbitraryDataIndexDetail>> indicesByIssuer
-                = indexDetails.stream().collect(
-                    Collectors.toMap(
-                        detail -> detail.issuer,        // map by issuer
-                        detail -> List.of(detail),      // create list for issuer
-                        (list1, list2)                  // merge lists for same issuer
-                                -> Stream.of(list1, list2)
-                                .flatMap(List::stream)
-                                .collect(Collectors.toList())
-                    )
-            );
+                = groupIndexDetails(indexDetails, detail -> detail.issuer);
 
             // lock, clear old, load new
             synchronized( IndexCache.getInstance().getIndicesByIssuer() ) {
@@ -187,6 +170,20 @@ public class ArbitraryIndexUtils {
                 IndexCache.getInstance().getIndicesByIssuer().putAll(indicesByIssuer);
             }
         }
+    }
+
+    /**
+     * Preserve entry order within each group without repeatedly copying accumulated entries.
+     * Like the previous toMap collector, this permits null keys in the temporary map;
+     * validation when publishing to the cache is unchanged.
+     */
+    static Map<String, List<ArbitraryDataIndexDetail>> groupIndexDetails(
+            List<ArbitraryDataIndexDetail> details, Function<ArbitraryDataIndexDetail, String> keyExtractor) {
+        Map<String, List<ArbitraryDataIndexDetail>> groups = new HashMap<>();
+        for (ArbitraryDataIndexDetail detail : details) {
+            groups.computeIfAbsent(keyExtractor.apply(detail), key -> new ArrayList<>()).add(detail);
+        }
+        return groups;
     }
 
     /**

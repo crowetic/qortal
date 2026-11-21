@@ -65,7 +65,7 @@ public class AccountBalanceCleanupTests extends Common {
                 }
                 repository.saveChanges();
                 HSQLDBDatabaseUpdates.updateDatabase(repository.getConnection());
-                assertEquals(55, HSQLDBDatabaseUpdates.fetchDatabaseVersion(repository.getConnection()));
+                assertEquals(57, HSQLDBDatabaseUpdates.fetchDatabaseVersion(repository.getConnection()));
                 assertEquals(17L, repository.getAccountRepository().getBalance(alice, 999L).getBalance());
                 assertIndexedCleanup(repository);
             }

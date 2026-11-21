@@ -6,6 +6,7 @@ import org.qortal.crypto.Crypto;
 import org.qortal.globalization.Translator;
 import org.qortal.gui.SysTray;
 import org.qortal.controller.Controller;
+import org.qortal.data.arbitrary.ArbitraryResourceDirtyData;
 import org.qortal.repository.*;
 import org.qortal.repository.hsqldb.transaction.HSQLDBTransactionRepository;
 import org.qortal.settings.Settings;
@@ -48,6 +49,16 @@ public class HSQLDBRepository implements Repository {
 
 	protected Connection connection;
 	protected final Deque<Savepoint> savepoints = new ArrayDeque<>(3);
+    private final List<Runnable> commitActions = new ArrayList<>();
+    private final Deque<Integer> commitActionSavepoints = new ArrayDeque<>();
+    private boolean chainChanged;
+    private boolean commitFailed;
+
+    void markChainChanged() { this.chainChanged = true; }
+
+    @Override
+    public void afterCommit(Runnable action) { commitActions.add(java.util.Objects.requireNonNull(action)); }
+
 	protected boolean debugState = false;
 	protected Long slowQueryThreshold = null;
 	protected List<String> sqlStatements;
@@ -204,10 +215,14 @@ public class HSQLDBRepository implements Repository {
 
 	@Override
 	public void saveChanges() throws DataException {
+        if (commitFailed) throw new DataException("Repository cannot be reused after a failed commit");
+        List<Runnable> actions = new ArrayList<>();
 		long beforeQuery = this.slowQueryThreshold == null ? 0 : System.currentTimeMillis();
 
 		try {
-			this.connection.commit();
+			if (chainChanged) executeCheckedUpdate("UPDATE ATStoreInfo SET tip_signature=(SELECT signature FROM Blocks ORDER BY height DESC LIMIT 1) WHERE id=1");
+            this.connection.commit();
+            actions.addAll(commitActions);
 
 			if (this.slowQueryThreshold != null) {
 				long queryTime = System.currentTimeMillis() - beforeQuery;
@@ -219,10 +234,15 @@ public class HSQLDBRepository implements Repository {
 				}
 			}
 		} catch (SQLException e) {
-			throw new DataException("commit error", e);
+			commitFailed = true;
+            try { this.connection.rollback(); } catch (SQLException rollbackFailure) { e.addSuppressed(rollbackFailure); }
+            throw new DataException("commit error; discard this repository session", e);
 		} finally {
 			this.inTransaction = false;
 			this.savepoints.clear();
+            this.commitActions.clear();
+            this.commitActionSavepoints.clear();
+            this.chainChanged = false;
 
 			// Before clearing statements so we can log what led to assertion error
 			assertEmptyTransaction("transaction commit");
@@ -230,6 +250,11 @@ public class HSQLDBRepository implements Repository {
 			if (this.sqlStatements != null)
 				this.sqlStatements.clear();
 		}
+        for (Runnable action : actions) {
+            try { action.run(); }
+            catch (RuntimeException e) { LOGGER.error("Post-commit notification failed",e); }
+        }
+
 	}
 
 	@Override
@@ -241,6 +266,9 @@ public class HSQLDBRepository implements Repository {
 		} finally {
 			this.inTransaction = false;
 			this.savepoints.clear();
+            this.commitActions.clear();
+            this.commitActionSavepoints.clear();
+            this.chainChanged = false;
 
 			// Before clearing statements so we can log what led to assertion error
 			assertEmptyTransaction("transaction rollback");
@@ -347,6 +375,7 @@ public class HSQLDBRepository implements Repository {
 
 			Savepoint savepoint = this.connection.setSavepoint();
 			this.savepoints.push(savepoint);
+            this.commitActionSavepoints.push(this.commitActions.size());
 
 			// Update query log with savepoint ID
 			if (this.sqlStatements != null)
@@ -362,6 +391,8 @@ public class HSQLDBRepository implements Repository {
 			throw new DataException("no savepoint to rollback");
 
 		Savepoint savepoint = this.savepoints.pop();
+        int actions = this.commitActionSavepoints.pop();
+        this.commitActions.subList(actions, this.commitActions.size()).clear();
 
 		try {
 			if (this.sqlStatements != null)
@@ -419,6 +450,8 @@ public class HSQLDBRepository implements Repository {
 
 			// Assume we are not going to be GC'd for a while
 			this.preparedStatementCache.clear();
+            this.commitActions.clear();
+            this.commitActionSavepoints.clear();
 			this.sqlStatements = null;
 			this.savepoints.clear();
 
@@ -656,6 +689,42 @@ public class HSQLDBRepository implements Repository {
 	}
 
 	@Override
+	public void backupForBootstrap(String name, Long timeout) throws DataException, TimeoutException {
+		this.backup(false, name, timeout);
+
+		String connectionUrl;
+		try {
+			connectionUrl = this.connection.getMetaData().getURL();
+		} catch (SQLException e) {
+			throw new DataException("Unable to locate bootstrap repository copy", e);
+		}
+
+		String dbPathname = getDbPathname(connectionUrl);
+		if (dbPathname == null || dbPathname.equals("mem"))
+			return;
+
+		String bootstrapUrl = buildBackupUrl(dbPathname, name);
+		try (Connection bootstrapConnection = DriverManager.getConnection(bootstrapUrl)) {
+			bootstrapConnection.setAutoCommit(false);
+			try (PreparedStatement deleteLocalWork = bootstrapConnection.prepareStatement(
+					"DELETE FROM ArbitraryResourceDirty WHERE BITAND(flags, ?) = 0");
+				 PreparedStatement normalizeChainWork = bootstrapConnection.prepareStatement(
+						 "UPDATE ArbitraryResourceDirty SET flags = ?, triggering_signature = NULL, " +
+								 "retry_count = 0, next_attempt = 0, updated_when = 0");
+				 Statement stmt = bootstrapConnection.createStatement()) {
+				deleteLocalWork.setInt(1, ArbitraryResourceDirtyData.HEAD_DIRTY);
+				deleteLocalWork.executeUpdate();
+				normalizeChainWork.setInt(1, ArbitraryResourceDirtyData.HEAD_DIRTY);
+				normalizeChainWork.executeUpdate();
+				bootstrapConnection.commit();
+				stmt.execute("SHUTDOWN");
+			}
+		} catch (SQLException e) {
+			throw new DataException("Unable to sanitize node-local work in bootstrap repository copy", e);
+		}
+	}
+
+	@Override
 	public void performPeriodicMaintenance(Long timeout) throws DataException, TimeoutException {
 		// Wait for other transactions to drain without holding write lock, so they can commit/rollback
 		this.blockUntilNoOtherTransactions(timeout);
@@ -773,6 +842,7 @@ public class HSQLDBRepository implements Repository {
 	 * Returns prepared statement using passed SQL, logging query if necessary.
 	 */
 	public PreparedStatement prepareStatement(String sql) throws SQLException {
+        if (commitFailed) throw new SQLException("Repository cannot be reused after a failed commit");
 		if (this.debugState)
 			LOGGER.debug(() -> String.format("[%d] %s", this.sessionId, sql));
 
@@ -939,7 +1009,7 @@ public class HSQLDBRepository implements Repository {
 	 * @return number of changed rows
 	 * @throws SQLException
 	 */
-	/* package */ int executeCheckedBatchUpdate(String sql, List<Object[]> batchedObjects) throws SQLException {
+	public int executeCheckedBatchUpdate(String sql, List<Object[]> batchedObjects) throws SQLException {
 		// Nothing to do?
 		if (batchedObjects == null || batchedObjects.isEmpty())
 			return 0;

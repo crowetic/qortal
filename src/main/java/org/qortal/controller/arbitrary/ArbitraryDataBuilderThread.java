@@ -8,11 +8,8 @@ import org.qortal.controller.Controller;
 import org.qortal.data.arbitrary.ArbitraryResourceStatus;
 import org.qortal.repository.DataException;
 import org.qortal.utils.ArbitraryTransactionUtils;
-import org.qortal.utils.NTP;
 
 import java.io.IOException;
-import java.util.Comparator;
-import java.util.Map;
 
 import static java.lang.Thread.NORM_PRIORITY;
 import static org.qortal.data.arbitrary.ArbitraryResourceStatus.Status.NOT_PUBLISHED;
@@ -42,85 +39,33 @@ public class ArbitraryDataBuilderThread implements Runnable {
 
         while (!Controller.isStopping()) {
             try {
-                Thread.sleep(100);
-
-                if (buildManager.arbitraryDataBuildQueue == null) {
-                    continue;
-                }
-                if (buildManager.arbitraryDataBuildQueue.isEmpty()) {
-                    continue;
-                }
-
-                Long now = NTP.getTime();
-                if (now == null) {
-                    continue;
-                }
-
-                ArbitraryDataBuildQueueItem queueItem = null;
-
-                // Find resources that are queued for building
-                // Large file thread only processes large files, other threads use priority with aging
-                synchronized (buildManager.arbitraryDataBuildQueue) {
-                    Map.Entry<String, ArbitraryDataBuildQueueItem> next;
-                    
-                    if (isLargeFileThread) {
-                        // Reserved thread: only process large files
-                        next = buildManager.arbitraryDataBuildQueue
-                                .entrySet().stream()
-                                .filter(e -> e.getValue().isQueued())
-                                .filter(e -> e.getValue().isLargeFile())
-                                .sorted(Comparator.comparing(item -> item.getValue().getEffectivePriority()))
-                                .reduce((first, second) -> second).orElse(null);
-                    } else {
-                        // Regular threads: process all files using effective priority (with aging)
-                        // This prevents starvation while still prioritizing small files
-                        next = buildManager.arbitraryDataBuildQueue
-                            .entrySet().stream()
-                            .filter(e -> e.getValue().isQueued())
-                                .sorted(Comparator.comparing(item -> item.getValue().getEffectivePriority()))
-                            .reduce((first, second) -> second).orElse(null);
-                    }
-
-                    if (next == null) {
-                        continue;
-                    }
-
-                    queueItem = next.getValue();
-
-                    if (queueItem == null) {
-                        this.removeFromQueue(queueItem);
-                        continue;
-                    }
-
-                    // Ignore builds that have failed recently
-                    if (buildManager.isInFailedBuildsList(queueItem)) {
-                        this.removeFromQueue(queueItem);
-                        continue;
-                    }
-
-                    // Get status before build
-                    ArbitraryResourceStatus arbitraryResourceStatus = ArbitraryTransactionUtils.getStatus(queueItem.getService(), queueItem.getResourceId(), queueItem.getIdentifier(), false, true);
-                    if (arbitraryResourceStatus.getStatus() == NOT_PUBLISHED) {
-                        // No point in building a non-existent resource
-                        this.removeFromQueue(queueItem);
-                        continue;
-                    }
-
-                    // Set the start timestamp, to prevent other threads from building it at the same time
-                    queueItem.prepareForBuild();
-                }
+                ArbitraryDataBuildQueueItem queueItem = buildManager.takeNextBuild(this.isLargeFileThread);
+                if (queueItem == null)
+                    return;
 
                 try {
+                    if (buildManager.isInFailedBuildsList(queueItem))
+                        continue;
+
+                    // Status reconciliation can wait on repository and resource-state work. Never do it
+                    // while holding the queue lock: status requests can also inspect this queue.
+                    ArbitraryResourceStatus arbitraryResourceStatus = ArbitraryTransactionUtils.getStatus(
+                            queueItem.getService(), queueItem.getResourceId(), queueItem.getIdentifier(), false, true);
+                    if (arbitraryResourceStatus == null) {
+                        throw new DataException("Unable to determine resource status before build");
+                    }
+                    if (arbitraryResourceStatus.getStatus() == NOT_PUBLISHED) {
+                        continue;
+                    }
+
                     // Perform the build
  
                     queueItem.build();
-                    this.removeFromQueue(queueItem);
                     log(queueItem, String.format("Finished building %s", queueItem));
 
                 } catch (MissingDataException e) {
                     log(queueItem, String.format("Missing data for %s: %s", queueItem, e.getMessage()));
                     queueItem.setFailed(true);
-                    this.removeFromQueue(queueItem);
                     // Don't add to the failed builds list, as we may want to retry sooner
 
                 } catch (IOException | DataException | RuntimeException e) {
@@ -128,20 +73,16 @@ public class ArbitraryDataBuilderThread implements Runnable {
                     // Something went wrong - so remove it from the queue, and add to failed builds list
                     queueItem.setFailed(true);
                     buildManager.addToFailedBuildsList(queueItem);
-                    this.removeFromQueue(queueItem);
+                } finally {
+                    // Release only this claim, including after status errors or interrupted builds.
+                    buildManager.removeFromBuildQueue(queueItem);
                 }
 
             } catch (InterruptedException e) {
-                // Time to exit
+                Thread.currentThread().interrupt();
+                return;
             }
         }
-    }
-
-    private void removeFromQueue(ArbitraryDataBuildQueueItem queueItem) {
-        if (queueItem == null || queueItem.getUniqueKey() == null) {
-            return;
-        }
-        ArbitraryDataBuildManager.getInstance().arbitraryDataBuildQueue.remove(queueItem.getUniqueKey());
     }
 
     private void log(ArbitraryDataBuildQueueItem queueItem, String message) {

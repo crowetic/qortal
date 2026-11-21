@@ -401,6 +401,11 @@ public interface TransactionRepository {
 
 	public void updateBlockSequence(byte[] signature, Integer sequence) throws DataException;
 
+    /** Update both confirmation coordinates and derived AT recipient eligibility once. */
+    void updateBlockPositions(List<TransactionData> transactions, int height) throws DataException;
+
+    void updateBlockPosition(TransactionData transactionData, Integer height, Integer sequence) throws DataException;
+
 	public void updateApprovalHeight(byte[] signature, Integer approvalHeight) throws DataException;
 
 	/**

@@ -5,8 +5,10 @@ import org.apache.logging.log4j.Logger;
 import org.qortal.controller.Controller;
 import org.qortal.controller.tradebot.BitcoinACCTv1TradeBot;
 import org.qortal.gui.SplashFrame;
+import org.qortal.settings.Settings;
 
 import java.sql.Connection;
+import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
@@ -40,11 +42,43 @@ public class HSQLDBDatabaseUpdates {
 		// the actual table even when the numeric migration has already been passed.
 		ensureTradeBotFundingColumns(connection);
 		ensureTradeBotRecoveryColumns(connection);
+		HSQLDBATStoreMigration.validateActiveStore(connection);
+		restoreCheckpointRuntimeMode(connection);
 
 		String text = String.format("Starting Qortal Core v%s...", Controller.getInstance().getVersionStringWithoutPrefix());
 		SplashFrame.getInstance().updateStatus(text);
 
 		return wasPristine;
+	}
+
+	/**
+	 * Case 53 enables the recovery log so each resumable migration cursor is durable.
+	 * Once every schema update and validation has succeeded, establish a checkpoint and
+	 * return to Qortal's established checkpoint-based runtime persistence mode. The
+	 * property check also repairs databases started by interim builds that left logging on.
+	 */
+	static void restoreCheckpointRuntimeMode(Connection connection) throws SQLException {
+		boolean loggingEnabled;
+		try (PreparedStatement statement = connection.prepareStatement(
+				"SELECT PROPERTY_VALUE FROM INFORMATION_SCHEMA.SYSTEM_PROPERTIES WHERE PROPERTY_NAME = ?")) {
+			statement.setString(1, "hsqldb.log_data");
+			try (ResultSet resultSet = statement.executeQuery()) {
+				if (!resultSet.next())
+					throw new SQLException("Unable to determine HSQLDB recovery-log mode");
+				loggingEnabled = Boolean.parseBoolean(resultSet.getString(1));
+			}
+		}
+
+		if (!loggingEnabled)
+			return;
+
+		connection.commit();
+		try (Statement statement = connection.createStatement()) {
+			statement.execute("CHECKPOINT");
+			statement.execute("SET FILES WRITE DELAY 5");
+			statement.execute("SET FILES LOG FALSE");
+		}
+		LOGGER.info("AT migration checkpoint is durable; restored checkpoint-based repository persistence");
 	}
 
 	/**
@@ -151,6 +185,11 @@ public class HSQLDBDatabaseUpdates {
 					stmt.execute("CREATE COLLATION SQL_TEXT_UCC_NO_PAD FOR SQL_TEXT FROM SQL_TEXT_UCC NO PAD");
 					stmt.execute("CREATE COLLATION SQL_TEXT_NO_PAD FOR SQL_TEXT FROM SQL_TEXT NO PAD");
 
+					// Genesis replay temporarily retains far more cached data than a bootstrap.
+					// Expand its address space before cached rows exist, while leaving the normal
+					// bootstrap path with HSQLDB's established database layout.
+					if (!Settings.getInstance().getBootstrap())
+						stmt.execute("SET FILES SCALE 128");
 					stmt.execute("SET FILES SPACE TRUE"); // Enable per-table block space within .data file, useful for CACHED table types
 					// Slow down log fsync() calls from every 500ms to reduce I/O load
 					stmt.execute("SET FILES WRITE DELAY 5"); // only fsync() every 5 seconds
@@ -1142,6 +1181,23 @@ public class HSQLDBDatabaseUpdates {
 					stmt.execute("CREATE INDEX IF NOT EXISTS AccountBalancesBalanceIndex ON AccountBalances (balance)");
 					stmt.execute("CREATE INDEX IF NOT EXISTS ArbitraryCreatedIndex ON ArbitraryTransactions (created_when DESC)");
 
+					break;
+
+				case 56:
+					// Install the irreversible AT store after all existing wallet migrations.
+					HSQLDBATStoreMigration.migrate(connection);
+					LOGGER.info("Adding indexed QDN resource keys and durable cache work queue - please wait...");
+					stmt.execute("ALTER TABLE ArbitraryTransactions ADD COLUMN IF NOT EXISTS lower_case_name RegisteredName");
+					stmt.execute("UPDATE ArbitraryTransactions SET lower_case_name = LCASE(name) "
+							+ "WHERE name IS NOT NULL AND lower_case_name IS NULL");
+					stmt.execute("CREATE INDEX IF NOT EXISTS ArbitraryServiceLowerNameIdCreatedIndex ON ArbitraryTransactions "
+							+ "(service, lower_case_name, identifier, created_when DESC)");
+					stmt.execute("CREATE MEMORY TABLE IF NOT EXISTS ArbitraryResourceDirty ("
+							+ "service SMALLINT NOT NULL, lower_case_name RegisteredName NOT NULL, name RegisteredName NOT NULL, "
+							+ "identifier VARCHAR(64) NOT NULL, flags INTEGER NOT NULL, triggering_signature Signature, "
+							+ "revision BIGINT NOT NULL, retry_count INTEGER NOT NULL, next_attempt EpochMillis NOT NULL, "
+							+ "updated_when EpochMillis NOT NULL, PRIMARY KEY (service, lower_case_name, identifier))");
+					stmt.execute("CREATE INDEX IF NOT EXISTS ArbitraryResourceDirtyAttemptIndex ON ArbitraryResourceDirty (next_attempt, updated_when)");
 					break;
 
 				default:

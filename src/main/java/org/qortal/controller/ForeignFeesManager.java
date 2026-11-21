@@ -42,11 +42,15 @@ import org.qortal.utils.NamedThreadFactory;
 import org.qortal.utils.Triple;
 
 import java.io.FileNotFoundException;
-import java.io.FileWriter;
 import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 import java.nio.file.Files;
+import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
@@ -59,6 +63,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.Collections;
+import java.util.Comparator;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -81,12 +87,21 @@ public class ForeignFeesManager implements Listener {
     public static final String REQUIRED_FOREIGN_FEES_FILE_NAME = "RequiredForeignFees.json";
     public static final String LOCKING_FOREIGN_FEES_FILE_NAME = "LockingForeignFees.json";
 
+    private static final int MAX_PENDING_FOREIGN_FEES = 8192;
+    private static final int MAX_FOREIGN_FEES_PER_MESSAGE = 8192;
+    private static final int MAX_VERIFICATIONS_PER_RUN = 128;
+    private static final int REMOTE_REQUEST_PEERS = 3;
+    private static final long MAX_FUTURE_TIMESTAMP_MILLIS = 30L * 60L * 1000L;
+    private static final long REMOTE_RECONCILIATION_INTERVAL_MILLIS = 60L * 60L * 1000L;
+
     private final ScheduledExecutorService executor
         = Executors.newScheduledThreadPool(4, new NamedThreadFactory("Foreign Fee Manager", Thread.NORM_PRIORITY));
 
     private volatile boolean isStopping = false;
+    private volatile long lastRemoteReconciliation = System.currentTimeMillis();
 
-    private final Set<ForeignFeeDecodedData> foreignFeesImportQueue = ConcurrentHashMap.newKeySet();
+    /** Newest unprocessed candidate per AT address. */
+    private final ConcurrentHashMap<String, ForeignFeeDecodedData> foreignFeesImportQueue = new ConcurrentHashMap<>();
 
     /**
      * Cache of signed foreign fees, keyed by AT address
@@ -228,7 +243,7 @@ public class ForeignFeesManager implements Listener {
             LOGGER.debug("adding to import queue: " + signedFeeEncoded);
 
             // decode the fee data and add to the queue
-            this.foreignFeesImportQueue.add(
+            enqueueForeignFee(
                 new ForeignFeeDecodedData(
                     signedFeeEncoded.getTimestamp(),
                     Base58.decode(signedFeeEncoded.getData()),
@@ -278,9 +293,15 @@ public class ForeignFeesManager implements Listener {
 
                         Optional<CrossChainTradeData> offerOptional = getTradeOfferData(repository, data.getAtAddress());
 
-                        if( offerOptional.isPresent() ) {
-                            CrossChainTradeData offer = offerOptional.get();
-                            this.offersByAddress.computeIfAbsent( offer.qortalCreator, x -> new ArrayList<>()).add(offer);
+	                        if( offerOptional.isPresent() ) {
+	                            CrossChainTradeData offer = offerOptional.get();
+	                            this.offersByAddress.compute(offer.qortalCreator, (creator, existing) -> {
+	                                List<CrossChainTradeData> updated = existing == null
+	                                        ? new ArrayList<>() : new ArrayList<>(existing);
+	                                updated.removeIf(item -> item.qortalAtAddress.equals(offer.qortalAtAddress));
+	                                updated.add(offer);
+	                                return Collections.unmodifiableList(updated);
+	                            });
 
                             if( processTradeOfferInWaiting(now, data) ) {
                                 EventBus.INSTANCE.notify(new FeeWaitingEvent(true, data.getCreatorAddress()));
@@ -318,6 +339,8 @@ public class ForeignFeesManager implements Listener {
      * Start Manager
      */
     public void start() {
+
+        CrossChainOfferIndex.getInstance().start();
 
         // import data after a 1 minute delay
         // this will get locking fees, required fees and signed data
@@ -363,6 +386,9 @@ public class ForeignFeesManager implements Listener {
                 backupSignedForeignFeeData();
             }
         } catch (DataException e) {
+	        this.needToBackupLockingForeignFees.set(true);
+	        this.needToBackupRequiredForeignFees.set(true);
+	        this.needToBackupSignedForeignFees.set(true);
             LOGGER.error(e.getMessage(), e);
         }
     }
@@ -373,6 +399,40 @@ public class ForeignFeesManager implements Listener {
     public void shutdown() {
         isStopping = true;
         executor.shutdownNow();
+        CrossChainOfferIndex.getInstance().shutdown();
+    }
+
+    private boolean enqueueForeignFee(ForeignFeeDecodedData candidate) {
+        if (candidate == null || candidate.getAtAddress() == null || candidate.getData() == null
+                || candidate.getData().length != org.qortal.transform.Transformer.SIGNATURE_LENGTH
+                || candidate.getFee() == null || candidate.getFee() < 0 || candidate.getTimestamp() <= 0)
+            return false;
+
+	    Long now = NTP.getTime();
+	    if (now != null && candidate.getTimestamp() > now + MAX_FUTURE_TIMESTAMP_MILLIS)
+	        return false;
+
+        CrossChainOfferIndex.Snapshot offerSnapshot = CrossChainOfferIndex.getInstance().getSnapshot();
+        if (offerSnapshot.isReady() && !offerSnapshot.getOffersByAT().containsKey(candidate.getAtAddress()))
+            return false;
+
+        Optional<ForeignFeeDecodedData> accepted = this.signedByAT.get(candidate.getAtAddress());
+        if (accepted != null && accepted.isPresent() && accepted.get().getTimestamp() >= candidate.getTimestamp())
+            return false;
+
+        if (!this.foreignFeesImportQueue.containsKey(candidate.getAtAddress())
+                && this.foreignFeesImportQueue.size() >= MAX_PENDING_FOREIGN_FEES)
+            return false;
+
+        final AtomicBoolean changed = new AtomicBoolean(false);
+        this.foreignFeesImportQueue.compute(candidate.getAtAddress(), (address, existing) -> {
+            if (existing == null || candidate.getTimestamp() > existing.getTimestamp()) {
+                changed.set(true);
+                return candidate;
+            }
+            return existing;
+        });
+        return changed.get();
     }
 
     /**
@@ -388,15 +448,17 @@ public class ForeignFeesManager implements Listener {
             return;
         }
 
+	    if (!CrossChainOfferIndex.getInstance().getSnapshot().isReady())
+	        return;
+
         LOGGER.debug("Processing foreign fee import queue (size: {})", this.foreignFeesImportQueue.size());
 
-        Set<ForeignFeeDecodedData> foreignFeesToRemove = new HashSet<>(this.foreignFeesImportQueue.size());
+        List<ForeignFeeDecodedData> candidates = new ArrayList<>(this.foreignFeesImportQueue.values());
+        candidates.sort(Comparator.comparingLong(ForeignFeeDecodedData::getTimestamp).reversed());
+        int verificationCount = 0;
 
-        try (final Repository repository = RepositoryManager.getRepository()) {
-
-            // for each signed foreign fee in the queue,
-            // compare timestamps to prior imports, verify signature and possibly import in
-            for (ForeignFeeDecodedData foreignFeeToImport : this.foreignFeesImportQueue) {
+        try {
+            for (ForeignFeeDecodedData foreignFeeToImport : candidates) {
                 if (isStopping)
                     return;
 
@@ -405,23 +467,27 @@ public class ForeignFeesManager implements Listener {
 
                 LOGGER.debug("foreign fee import, timestamp = " + getFormattedDateTime(foreignFeeToImport.getTimestamp()));
 
-                Optional<ForeignFeeDecodedData> validatedForeignFeeData
-                    = this.signedByAT.getOrDefault( atAddress, Optional.empty() );
+                Optional<ForeignFeeDecodedData> validatedForeignFeeData =
+                        this.signedByAT.getOrDefault(atAddress, Optional.empty());
 
                 // if there is no established, validated foreign fee for this AT address or
                 // if the import foreign fee is after the validated foreign fee,
                 // then verify the signature and map it to the AT address
                 if (validatedForeignFeeData.isEmpty() || validatedForeignFeeData.get().getTimestamp() < foreignFeeToImport.getTimestamp()) {
 
-                    ATData atData = repository.getATRepository().fromATAddress(atAddress);
+                    CrossChainOfferIndex.Offer offer = CrossChainOfferIndex.getInstance().getOffer(atAddress);
+                    if (offer == null) {
+                        this.foreignFeesImportQueue.remove(atAddress, foreignFeeToImport);
+                        continue;
+                    }
 
-                    // if AT data is not available, then continue on to the next AT
-                    if( atData == null ) continue;
+                    if (verificationCount >= MAX_VERIFICATIONS_PER_RUN)
+                        break;
 
                     LOGGER.debug("verify signer for atAddress = " + atAddress);
 
                     // determine if the creator authorized the foreign fee
-                    byte[] publicKey = atData.getCreatorPublicKey();
+                    byte[] publicKey = offer.getCreatorPublicKey();
                     byte[] signature = foreignFeeToImport.getData();
                     byte[] message
                         = ForeignFeesMessageUtils.buildForeignFeesDataMessage(
@@ -432,16 +498,28 @@ public class ForeignFeesManager implements Listener {
 
                     // if trade offer creator authorized the imported fee,
                     // then finish the import and clear it from the unsigned mapping
+                    verificationCount++;
                     if( Crypto.verify(publicKey, signature, message) ) {
                         LOGGER.debug("signer verified");
-                        this.signedByAT.put(atAddress, Optional.of(foreignFeeToImport));
+	                    AtomicBoolean acceptedNow = new AtomicBoolean(false);
+	                    this.signedByAT.compute(atAddress, (address, existing) -> {
+	                        if (existing == null || existing.isEmpty()
+	                                || existing.get().getTimestamp() < foreignFeeToImport.getTimestamp()) {
+	                            acceptedNow.set(true);
+	                            return Optional.of(foreignFeeToImport);
+	                        }
+	                        return existing;
+	                    });
+	                    if (!acceptedNow.get()) {
+	                        this.foreignFeesImportQueue.remove(atAddress, foreignFeeToImport);
+	                        continue;
+	                    }
                         this.needToBackupSignedForeignFees.compareAndSet(false, true);
                         this.unsignedByAT.remove(atAddress);
 
                         String tradeOfferCreatorAddress = Crypto.toAddress(publicKey);
-                        boolean allSignedForCreatorAddress
-                            = this.offersByAddress
-                                .getOrDefault(tradeOfferCreatorAddress, new ArrayList<>(0)).stream()
+                        boolean allSignedForCreatorAddress = CrossChainOfferIndex.getInstance().getSnapshot()
+                                .getOffersByCreator().getOrDefault(tradeOfferCreatorAddress, Collections.emptyList()).stream()
                                 .map(data -> data.qortalAtAddress)
                                 .filter(qortalAtAddress -> this.unsignedByAT.contains(qortalAtAddress))
                                 .findAny()
@@ -467,14 +545,10 @@ public class ForeignFeesManager implements Listener {
                     );
                 }
 
-                // now that this fee has been processed, remove it from the process queue
-                foreignFeesToRemove.add(foreignFeeToImport);
+                this.foreignFeesImportQueue.remove(atAddress, foreignFeeToImport);
             }
         } catch (Exception e) {
-            LOGGER.error("Repository issue while verifying foreign fees", e);
-        } finally {
-            LOGGER.debug("removing foreign fees from import queue: count = " + foreignFeesToRemove.size());
-            this.foreignFeesImportQueue.removeAll(foreignFeesToRemove);
+            LOGGER.error("Unable to verify foreign fees", e);
         }
     }
 
@@ -503,18 +577,30 @@ public class ForeignFeesManager implements Listener {
      */
     private void maintainCrossChainOffers() {
 
-        LOGGER.debug("maintaining ATs ...");
+        // This builds a derived local cache only. During bulk synchronization it can
+        // scan thousands of ATs and contend with consensus processing for HSQLDB's
+        // single shared row cache. A later scheduled run rebuilds the cache from
+        // the authoritative repository after the node catches up.
+        if (Synchronizer.getInstance().isSynchronizing()) {
+            LOGGER.debug("Deferring foreign-fee AT maintenance while blockchain synchronization is active");
+            return;
+        }
 
-        try (final Repository repository = RepositoryManager.getRepository()) {
+        CrossChainOfferIndex.Snapshot offerSnapshot = CrossChainOfferIndex.getInstance().getSnapshot();
+        if (!offerSnapshot.isReady())
+            return;
 
-            List<CrossChainTradeData> crossChainTradeOffers = resetOffersByAddress(repository);
+        LOGGER.debug("maintaining foreign fees from offer index at height {}", offerSnapshot.getHeight());
 
-            // remove failed trades, then collect AT addresses for trade offers
-            Set<String> atAddresses
-                = TradeBot.getInstance()
-                    .removeFailedTrades(repository, crossChainTradeOffers).stream()
-                    .map( data -> data.qortalAtAddress )
-                    .collect(Collectors.toSet());
+        try {
+            synchronized (this.offersByAddress) {
+                this.offersByAddress.clear();
+	            offerSnapshot.getOffersByCreator().forEach((creator, offers) ->
+	                    this.offersByAddress.put(creator,
+	                            Collections.unmodifiableList(new ArrayList<>(offers))));
+            }
+
+            Set<String> atAddresses = offerSnapshot.getOffersByAT().keySet();
 
             LOGGER.debug("foreign fees before AT removal: count = " + this.signedByAT.size() );
 
@@ -523,41 +609,13 @@ public class ForeignFeesManager implements Listener {
                 this.needToBackupSignedForeignFees.compareAndSet(false, true);
             }
 
+            this.unsignedByAT.keySet().removeIf(address -> !atAddresses.contains(address));
+            this.foreignFeesImportQueue.keySet().removeIf(address -> !atAddresses.contains(address));
+
             LOGGER.debug("foreign fees after AT removal: count = " + this.signedByAT.size() );
         } catch (Exception e) {
             LOGGER.error(e.getMessage(), e);
         }
-    }
-
-    /**
-     * Reset Offers By Address
-     *
-     * @param repository the data repository
-     *
-     * @return address -> cross chain trades
-     *
-     * @throws DataException
-     */
-    private List<CrossChainTradeData> resetOffersByAddress(Repository repository) throws DataException {
-        List<CrossChainTradeData> crossChainTradeOffers = new ArrayList<>();
-
-        // lockdown map while reseting offers by address
-        synchronized( this.offersByAddress) {
-
-            // for each supported foreign blockchaine, get AT data for trade offers
-            for ( SupportedBlockchain blockchain : SupportedBlockchain.values()) {
-                crossChainTradeOffers.addAll( getCrossTradeOffers(repository, blockchain) );
-            }
-
-            // group all trade offers by trade offer creator, then reset map
-            Map<String, List<CrossChainTradeData>> groupedOffersByAddress
-                    = crossChainTradeOffers.stream().collect(Collectors.groupingBy(data -> data.qortalCreator));
-
-            this.offersByAddress.clear();
-            this.offersByAddress.putAll(groupedOffersByAddress);
-        }
-
-        return crossChainTradeOffers;
     }
 
     /**
@@ -594,43 +652,6 @@ public class ForeignFeesManager implements Listener {
         return anyRemovals;
     }
 
-    /**
-     * Get Cross Trade Offers
-     *
-     * @param repository the data repository
-     * @param blockchain the foreign blockchain supporting the trade
-     *
-     * @return the trade offers
-     *
-     * @throws DataException
-     */
-    private static List<CrossChainTradeData> getCrossTradeOffers(Repository repository, SupportedBlockchain blockchain) throws DataException {
-
-        // get ACCT for the foreign blockchain
-        ACCT acct = blockchain.getLatestAcct();
-
-        // get AT's for foreign blockchain
-        List<ATData> ats
-            = repository.getATRepository()
-                .getATsByFunctionality(acct.getCodeBytesHash(), true, null, null, null);
-
-        // prepare the return list of cross chain data
-        List<CrossChainTradeData> crossChainTradeOffers = new ArrayList<>(ats.size());
-
-        // for each AT, get cross chain data and look for trade offer to add
-        for (ATData at : ats) {
-
-            CrossChainTradeData crossChainTrade = acct.populateTradeData(repository, at);
-
-            // if the trade is in offering mode, then add it to return list
-            if (crossChainTrade.mode == AcctMode.OFFERING) {
-                crossChainTradeOffers.add(crossChainTrade);
-            }
-        }
-
-        return crossChainTradeOffers;
-    }
-
     private static Optional<CrossChainTradeData> getTradeOfferData(Repository repository, String atAddress) throws DataException {
 
         ATData atData = repository.getATRepository().fromATAddress(atAddress);
@@ -656,16 +677,37 @@ public class ForeignFeesManager implements Listener {
 
         if (!isUpToDate()) return;
 
+	    CrossChainOfferIndex.Snapshot offerSnapshot = CrossChainOfferIndex.getInstance().getSnapshot();
+	    if (!offerSnapshot.isReady())
+	        return;
+
+	    boolean missingActiveSignature = offerSnapshot.getOffersByAT().keySet().stream().anyMatch(address -> {
+	        Optional<ForeignFeeDecodedData> signed = this.signedByAT.get(address);
+	        return signed == null || signed.isEmpty();
+	    });
+	    long now = System.currentTimeMillis();
+	    if (!missingActiveSignature && now - this.lastRemoteReconciliation < REMOTE_RECONCILIATION_INTERVAL_MILLIS)
+	        return;
+
         LOGGER.debug("Requesting foreign fees via broadcast...");
 
         Message message
             = new GetForeignFeesMessage(
-                this.signedByAT.values().stream()
-                    .filter(Optional::isPresent).map(Optional::get)
+	                this.signedByAT.entrySet().stream()
+	                    .filter(entry -> CrossChainOfferIndex.getInstance().isCurrentOffer(entry.getKey()))
+	                    .map(Map.Entry::getValue)
+	                    .filter(Optional::isPresent).map(Optional::get)
                     .collect(Collectors.toList())
             );
 
-        Network.getInstance().broadcast(peer -> message);
+        List<Peer> peers = new ArrayList<>(Network.getInstance().getImmutableHandshakedPeers());
+        peers.removeIf(peer -> peer.getPeersVersion() == null
+                || peer.getPeersVersion() < ForeignFeesMessage.MIN_PEER_VERSION);
+        Collections.shuffle(peers);
+	    if (!peers.isEmpty()) {
+	        peers.stream().limit(REMOTE_REQUEST_PEERS).forEach(peer -> peer.sendMessage(message));
+	        this.lastRemoteReconciliation = now;
+	    }
 
         LOGGER.debug("Requested foreign fees via broadcast...");
     }
@@ -903,17 +945,26 @@ public class ForeignFeesManager implements Listener {
      */
     public void onNetworkGetForeignFeesMessage(Peer peer, Message message) {
         GetForeignFeesMessage getForeignFeesMessage = (GetForeignFeesMessage) message;
+	    if (getForeignFeesMessage.getForeignFeeData().size() > MAX_FOREIGN_FEES_PER_MESSAGE) {
+	        LOGGER.debug("Ignoring oversized foreign-fee inventory from {}", peer);
+	        return;
+	    }
 
         // map the fees the peer already has
         Map<String, ForeignFeeDecodedData> inMessageDataByAT
             = getForeignFeesMessage.getForeignFeeData().stream()
-                .collect(Collectors.toMap( ForeignFeeDecodedData::getAtAddress, Function.identity()));
+	                .filter(data -> data.getAtAddress() != null)
+	                .collect(Collectors.toMap(ForeignFeeDecodedData::getAtAddress, Function.identity(),
+	                        (left, right) -> left.getTimestamp() >= right.getTimestamp() ? left : right));
 
         // start collecting fees to send to the peer
         List<ForeignFeeDecodedData> outgoingForeignFees = new ArrayList<>();
 
         // for all the signed fees locally stored, compare to what the peer currently has and send out what they need
         for(Map.Entry<String, Optional<ForeignFeeDecodedData>> entry : this.signedByAT.entrySet() ) {
+
+            if (!CrossChainOfferIndex.getInstance().isCurrentOffer(entry.getKey()))
+                continue;
 
             Optional<ForeignFeeDecodedData> signedForeignFeeData = entry.getValue();
 
@@ -969,13 +1020,17 @@ public class ForeignFeesManager implements Listener {
 
         List<ForeignFeeDecodedData> peersForeignFees = onlineAccountsMessage.getForeignFees();
         LOGGER.debug("Received {} foreign fees from {}", peersForeignFees.size(), peer);
+	    if (peersForeignFees.size() > MAX_FOREIGN_FEES_PER_MESSAGE) {
+	        LOGGER.debug("Ignoring oversized foreign-fee response from {}", peer);
+	        return;
+	    }
 
         int importCount = 0;
 
         // add any foreign fees to the queue that aren't already present
         for (ForeignFeeDecodedData peerForeignFee : peersForeignFees) {
 
-            if( foreignFeesImportQueue.add(peerForeignFee) )
+            if (enqueueForeignFee(peerForeignFee))
                 importCount++;
         }
 
@@ -1014,16 +1069,31 @@ public class ForeignFeesManager implements Listener {
 
             // write signed fee data to backup file
             String fileName = Paths.get(backupDirectory.toString(), SIGNED_FOREIGN_FEES_FILE_NAME).toString();
-            FileWriter writer = new FileWriter(fileName);
-            writer.write(currentSignedForeignFeeDataJsonWrapper.toString(2));
-            writer.close();
+            writeAtomically(Paths.get(fileName), currentSignedForeignFeeDataJsonWrapper.toString(2));
 
         }
         catch (DataException e) {
             throw new DataException("Unable to export foreign fee signatures.");
         }
         catch (Exception e) {
-            LOGGER.error(e.getMessage(), e);
+            throw new DataException("Unable to atomically export foreign fee signatures", e);
+        }
+    }
+
+    private static void writeAtomically(Path destination, String contents) throws IOException {
+        Path temporary = destination.resolveSibling(destination.getFileName().toString() + ".tmp");
+	    byte[] bytes = contents.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+	    try (FileChannel channel = FileChannel.open(temporary, StandardOpenOption.CREATE,
+	            StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE)) {
+	        ByteBuffer buffer = ByteBuffer.wrap(bytes);
+	        while (buffer.hasRemaining())
+	            channel.write(buffer);
+	        channel.force(true);
+	    }
+        try {
+            Files.move(temporary, destination, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+        } catch (AtomicMoveNotSupportedException e) {
+            Files.move(temporary, destination, StandardCopyOption.REPLACE_EXISTING);
         }
     }
 
@@ -1074,9 +1144,7 @@ public class ForeignFeesManager implements Listener {
 
             // write the JSON to the backup file
             String fileName = Paths.get(backupDirectory.toString(), filename).toString();
-            FileWriter writer = new FileWriter(fileName);
-            writer.write(currentForeignFeeDataJsonWrapper.toString(2));
-            writer.close();
+	        writeAtomically(Paths.get(fileName), currentForeignFeeDataJsonWrapper.toString(2));
 
         }
         catch (DataException e) {
@@ -1152,8 +1220,13 @@ public class ForeignFeesManager implements Listener {
     private void importSignedForeignFeeDataJSON(JSONObject signedForeignFeeDataJson) throws DataException {
 
         ForeignFeeDecodedData signedForeignFeeData = ForeignFeeDecodedData.fromJson(signedForeignFeeDataJson);
+	    CrossChainOfferIndex.Snapshot offerSnapshot = CrossChainOfferIndex.getInstance().getSnapshot();
+	    if (offerSnapshot.isReady() && !offerSnapshot.getOffersByAT().containsKey(signedForeignFeeData.getAtAddress()))
+	        return;
 
-        this.signedByAT.put(signedForeignFeeData.getAtAddress(), Optional.of(signedForeignFeeData));
+	    this.signedByAT.compute(signedForeignFeeData.getAtAddress(), (address, existing) ->
+	            existing == null || existing.isEmpty() || existing.get().getTimestamp() < signedForeignFeeData.getTimestamp()
+	                    ? Optional.of(signedForeignFeeData) : existing);
     }
 
     /**

@@ -183,7 +183,7 @@ public enum QortalFunctionCode {
 
 			if (account != null) {
 				try {
-					accountLevel = account.getLevel();
+					accountLevel = api.getAccountLevel(account);
 				} catch (DataException e) {
 					throw new RuntimeException("AT API unable to fetch account level?", e);
 				}
@@ -214,7 +214,7 @@ public enum QortalFunctionCode {
 
 			if (account != null) {
 				try {
-					blocksMinted = account.getBlocksMinted();
+					blocksMinted = ((QortalATAPI) state.getAPI()).getAccountBlocksMinted(account);
 				} catch (DataException e) {
 					throw new RuntimeException("AT API unable to fetch account's minted block count?", e);
 				}

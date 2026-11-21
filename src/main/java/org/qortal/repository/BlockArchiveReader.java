@@ -21,12 +21,53 @@ import static org.qortal.transform.Transformer.INT_LENGTH;
 public class BlockArchiveReader {
 
     private static BlockArchiveReader instance;
-    private Map<String, Triple<Integer, Integer, Integer>> fileListCache;
+    private volatile List<ArchiveFileInfo> fileListCache;
 
     private static final Logger LOGGER = LogManager.getLogger(BlockArchiveReader.class);
 
     public BlockArchiveReader() {
 
+    }
+
+    private static final class ArchiveFileInfo {
+        private final String filename;
+        private final int startHeight;
+        private final int endHeight;
+
+        private ArchiveFileInfo(String filename, int startHeight, int endHeight) {
+            this.filename = filename;
+            this.startHeight = startHeight;
+            this.endHeight = endHeight;
+        }
+    }
+
+    /** Immutable serialized block read directly from an archive file. */
+    public static final class SerializedBlock {
+        private final byte[] bytes;
+        private final int serializationVersion;
+        private final int height;
+
+        private SerializedBlock(byte[] bytes, int serializationVersion, int height) {
+            this.bytes = bytes;
+            this.serializationVersion = serializationVersion;
+            this.height = height;
+        }
+
+        public byte[] getBytes() {
+            return this.bytes;
+        }
+
+        public int getSerializationVersion() {
+            return this.serializationVersion;
+        }
+
+        public int getHeight() {
+            return this.height;
+        }
+
+        public int getWireSize() {
+            return INT_LENGTH + this.bytes.length;
+        }
     }
 
     public static synchronized BlockArchiveReader getInstance() {
@@ -37,11 +78,14 @@ public class BlockArchiveReader {
         return instance;
     }
 
-    private void fetchFileList() {
+    private synchronized void fetchFileList() {
+        if (this.fileListCache != null)
+            return;
+
         Path archivePath = Paths.get(Settings.getInstance().getRepositoryPath(), "archive").toAbsolutePath();
         File archiveDirFile = archivePath.toFile();
         String[] files = archiveDirFile.list();
-        Map<String, Triple<Integer, Integer, Integer>> map = new HashMap<>();
+        List<ArchiveFileInfo> fileInfos = new ArrayList<>();
 
         if (files != null) {
             for (String file : files) {
@@ -49,19 +93,32 @@ public class BlockArchiveReader {
                 String filename = filePath.getFileName().toString();
 
                 // Parse the filename
-                if (filename == null || !filename.contains("-") || !filename.contains(".")) {
+                if (filename == null || !filename.endsWith(".dat") || !filename.contains("-")) {
                     // Not a usable file
                     continue;
                 }
-                // Remove the extension and split into two parts
-                String[] parts = filename.substring(0, filename.lastIndexOf('.')).split("-");
-                Integer startHeight = Integer.parseInt(parts[0]);
-                Integer endHeight = Integer.parseInt(parts[1]);
-                Integer range = endHeight - startHeight;
-                map.put(filename, new Triple(startHeight, endHeight, range));
+                try {
+                    // Remove the extension and split into two parts
+                    String[] parts = filename.substring(0, filename.lastIndexOf('.')).split("-");
+                    if (parts.length != 2)
+                        continue;
+
+                    int startHeight = Integer.parseInt(parts[0]);
+                    int endHeight = Integer.parseInt(parts[1]);
+                    if (startHeight <= 0 || endHeight < startHeight)
+                        continue;
+
+                    fileInfos.add(new ArchiveFileInfo(filename, startHeight, endHeight));
+                } catch (NumberFormatException e) {
+                    LOGGER.debug("Ignoring unrecognized block archive filename {}", filename);
+                }
             }
         }
-        this.fileListCache = Map.copyOf(map);
+
+        fileInfos.sort(Comparator.comparingInt((ArchiveFileInfo info) -> info.startHeight)
+                .thenComparingInt(info -> info.endHeight)
+                .thenComparing(info -> info.filename));
+        this.fileListCache = List.copyOf(fileInfos);
     }
 
     public Integer fetchSerializationVersionForHeight(int height) {
@@ -171,29 +228,39 @@ public class BlockArchiveReader {
         }
     }
 
-    private String getFilenameForHeight(int height) {
+    private ArchiveFileInfo getFileForHeight(int height) {
         if (this.fileListCache == null) {
             this.fetchFileList();
         }
 
-        Iterator it = this.fileListCache.entrySet().iterator();
-        while (it.hasNext()) {
-            Map.Entry pair = (Map.Entry) it.next();
-            if (pair == null && pair.getKey() == null && pair.getValue() == null) {
-                continue;
-            }
-            Triple<Integer, Integer, Integer> heightInfo = (Triple<Integer, Integer, Integer>) pair.getValue();
-            Integer startHeight = heightInfo.getA();
-            Integer endHeight = heightInfo.getB();
+        List<ArchiveFileInfo> files = this.fileListCache;
+        int low = 0;
+        int high = files.size() - 1;
+        int candidate = -1;
 
-            if (height >= startHeight && height <= endHeight) {
-                // Found the correct file
-                String filename = (String) pair.getKey();
-                return filename;
+        // Select the file with the greatest start height not above the requested
+        // height. This makes old one-height boundary overlaps deterministic.
+        while (low <= high) {
+            int middle = (low + high) >>> 1;
+            ArchiveFileInfo info = files.get(middle);
+            if (info.startHeight <= height) {
+                candidate = middle;
+                low = middle + 1;
+            } else {
+                high = middle - 1;
             }
         }
 
-        return null;
+        if (candidate < 0)
+            return null;
+
+        ArchiveFileInfo info = files.get(candidate);
+        return height <= info.endHeight ? info : null;
+    }
+
+    private String getFilenameForHeight(int height) {
+        ArchiveFileInfo info = this.getFileForHeight(height);
+        return info == null ? null : info.filename;
     }
 
     public Triple<byte[], Integer, Integer> fetchSerializedBlockBytesForSignature(byte[] signature, boolean includeHeightPrefix, Repository repository) {
@@ -289,7 +356,7 @@ public class BlockArchiveReader {
 
             // Now retrieve the block's serialized bytes
             byte[] blockBytes = new byte[blockLength];
-            file.read(blockBytes);
+            file.readFully(blockBytes);
 
             return new Triple<>(blockBytes, version, height);
 
@@ -312,31 +379,123 @@ public class BlockArchiveReader {
         }
     }
 
+    /**
+     * Read a bounded, consecutive range without reopening an archive file for every block.
+     * Returned blocks retain their archive serialization version so callers can use V2 bytes
+     * directly and convert legacy V1 bytes only when necessary.
+     */
+    public List<SerializedBlock> fetchSerializedBlocksFromHeight(int startHeight, int maximumBlockCount,
+                                                                  int maximumWireBytes) {
+        if (startHeight <= 0 || maximumBlockCount <= 0 || maximumWireBytes <= INT_LENGTH)
+            return Collections.emptyList();
+
+        List<SerializedBlock> blocks = new ArrayList<>(maximumBlockCount);
+        int nextHeight = startHeight;
+        int wireBytes = INT_LENGTH; // BLOCKS message count prefix
+        boolean refreshedFileList = false;
+
+        while (blocks.size() < maximumBlockCount) {
+            ArchiveFileInfo fileInfo = this.getFileForHeight(nextHeight);
+            if (fileInfo == null && !refreshedFileList) {
+                this.invalidateFileListCache();
+                fileInfo = this.getFileForHeight(nextHeight);
+                refreshedFileList = true;
+            }
+            if (fileInfo == null)
+                break;
+
+            Path filePath = Paths.get(Settings.getInstance().getRepositoryPath(), "archive", fileInfo.filename).toAbsolutePath();
+            try (RandomAccessFile file = new RandomAccessFile(filePath.toString(), "r")) {
+                int version = file.readInt();
+                int fileStartHeight = file.readInt();
+                int fileEndHeight = file.readInt();
+                int blockCount = file.readInt();
+                int variableHeaderLength = file.readInt();
+                int fixedHeaderLength = (int) file.getFilePointer();
+
+                if ((version != 1 && version != 2)
+                        || fileStartHeight != fileInfo.startHeight
+                        || fileEndHeight != fileInfo.endHeight
+                        || blockCount <= 0
+                        || variableHeaderLength < 0
+                        || (long) variableHeaderLength < (long) blockCount * INT_LENGTH) {
+                    LOGGER.warn("Invalid block archive header in {}", fileInfo.filename);
+                    break;
+                }
+
+                long dataSegmentStart = (long) fixedHeaderLength + variableHeaderLength + INT_LENGTH;
+                long fileLength = file.length();
+                if (dataSegmentStart > fileLength) {
+                    LOGGER.warn("Invalid block archive data offset in {}", fileInfo.filename);
+                    break;
+                }
+
+                int lastHeightInFile = Math.min(fileInfo.endHeight, fileEndHeight);
+                while (nextHeight <= lastHeightInFile && blocks.size() < maximumBlockCount) {
+                    int blockIndex = nextHeight - fileStartHeight;
+                    if (blockIndex < 0 || blockIndex >= blockCount) {
+                        LOGGER.warn("Invalid block archive index for height {} in {}", nextHeight, fileInfo.filename);
+                        return blocks;
+                    }
+
+                    long indexPosition = (long) fixedHeaderLength
+                            + (long) blockIndex * INT_LENGTH;
+                    if (indexPosition < fixedHeaderLength || indexPosition + INT_LENGTH > dataSegmentStart) {
+                        LOGGER.warn("Invalid block archive index for height {} in {}", nextHeight, fileInfo.filename);
+                        return blocks;
+                    }
+
+                    file.seek(indexPosition);
+                    int blockOffset = file.readInt();
+                    long blockPosition = dataSegmentStart + blockOffset;
+                    if (blockOffset < 0 || blockPosition < dataSegmentStart || blockPosition + 2L * INT_LENGTH > fileLength) {
+                        LOGGER.warn("Invalid block archive offset for height {} in {}", nextHeight, fileInfo.filename);
+                        return blocks;
+                    }
+
+                    file.seek(blockPosition);
+                    int storedHeight = file.readInt();
+                    int blockLength = file.readInt();
+                    if (storedHeight != nextHeight || blockLength <= 0
+                            || blockPosition + 2L * INT_LENGTH + blockLength > fileLength) {
+                        LOGGER.warn("Invalid block archive record for height {} in {}", nextHeight, fileInfo.filename);
+                        return blocks;
+                    }
+
+                    long nextWireBytes = (long) INT_LENGTH + blockLength;
+                    if ((long) wireBytes + nextWireBytes > maximumWireBytes)
+                        return blocks;
+
+                    byte[] blockBytes = new byte[blockLength];
+                    file.readFully(blockBytes);
+                    blocks.add(new SerializedBlock(blockBytes, version, nextHeight));
+                    wireBytes += (int) nextWireBytes;
+                    ++nextHeight;
+                }
+            } catch (FileNotFoundException e) {
+                LOGGER.info("Archive file {} disappeared while serving blocks", fileInfo.filename);
+                this.invalidateFileListCache();
+                break;
+            } catch (IOException e) {
+                LOGGER.warn("Unable to read archive range at height {} from {}: {}",
+                        nextHeight, fileInfo.filename, e.getMessage());
+                break;
+            }
+        }
+
+        return blocks;
+    }
+
     public int getHeightOfLastArchivedBlock() {
         if (this.fileListCache == null) {
             this.fetchFileList();
         }
 
-        int maxEndHeight = 0;
-
-        Iterator it = this.fileListCache.entrySet().iterator();
-        while (it.hasNext()) {
-            Map.Entry pair = (Map.Entry) it.next();
-            if (pair == null && pair.getKey() == null && pair.getValue() == null) {
-                continue;
-            }
-            Triple<Integer, Integer, Integer> heightInfo = (Triple<Integer, Integer, Integer>) pair.getValue();
-            Integer endHeight = heightInfo.getB();
-
-            if (endHeight != null && endHeight > maxEndHeight) {
-                maxEndHeight = endHeight;
-            }
-        }
-
-        return maxEndHeight;
+        List<ArchiveFileInfo> files = this.fileListCache;
+        return files.isEmpty() ? 0 : files.get(files.size() - 1).endHeight;
     }
 
-    public void invalidateFileListCache() {
+    public synchronized void invalidateFileListCache() {
         this.fileListCache = null;
     }
 

@@ -8,6 +8,10 @@ import java.util.Set;
 import java.util.function.Function;
 
 public interface AccountRepository {
+    void setLastReferences(List<AccountData> accounts) throws DataException;
+
+    /** Batch the same UPDATE-only balance changes used for existing funded AT accounts. */
+    void modifyExistingAssetBalances(List<AccountBalanceData> deltas) throws DataException;
 
 	// General account
 

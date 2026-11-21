@@ -8,6 +8,7 @@ import org.eclipse.jetty.websocket.api.annotations.*;
 import org.eclipse.jetty.websocket.server.JettyWebSocketServletFactory;
 import org.qortal.api.model.CrossChainOfferSummary;
 import org.qortal.controller.Synchronizer;
+import org.qortal.controller.CrossChainOfferIndex;
 import org.qortal.controller.tradebot.TradeBot;
 import org.qortal.crosschain.ACCT;
 import org.qortal.crosschain.AcctMode;
@@ -63,7 +64,12 @@ public class TradeOffersWebSocket extends ApiWebSocket implements Listener {
 		factory.addMapping("/", (req, res) -> this);
 
 		try (final Repository repository = RepositoryManager.getRepository()) {
-			populateCurrentSummaries(repository);
+			CrossChainOfferIndex.getInstance().start();
+			CrossChainOfferIndex.Snapshot offerSnapshot = CrossChainOfferIndex.getInstance().getSnapshot();
+			if (offerSnapshot.isReady())
+				populateCurrentSummaries(offerSnapshot);
+			else
+				populateCurrentSummaries(repository);
 			populateHistoricSummaries(repository);
 		} catch (DataException e) {
 			// How to fail properly?
@@ -71,6 +77,17 @@ public class TradeOffersWebSocket extends ApiWebSocket implements Listener {
 		}
 
 		EventBus.INSTANCE.addListener(this);
+	}
+
+	private static void populateCurrentSummaries(CrossChainOfferIndex.Snapshot offerSnapshot) {
+		for (CrossChainOfferIndex.Offer offer : offerSnapshot.getOffersByAT().values()) {
+			CrossChainTradeData tradeData = offer.getTradeData();
+			CachedOfferInfo cachedInfo = cachedInfoByBlockchain.computeIfAbsent(
+					tradeData.foreignBlockchain, key -> new CachedOfferInfo());
+			CrossChainOfferSummary summary = new CrossChainOfferSummary(tradeData, tradeData.creationTimestamp);
+			cachedInfo.previousAtModes.put(tradeData.qortalAtAddress, AcctMode.OFFERING);
+			cachedInfo.currentSummaries.put(tradeData.qortalAtAddress, summary);
+		}
 	}
 
 	@Override

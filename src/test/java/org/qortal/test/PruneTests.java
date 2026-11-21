@@ -86,10 +86,9 @@ public class PruneTests extends Common {
             repository.getBlockRepository().setBlockPruneHeight(6);
 
             // Prune AT states for blocks 2-5
-            repository.getATRepository().rebuildLatestAtStates(5);
             repository.saveChanges();
             int numATStatesPruned = repository.getATRepository().pruneAtStates(0, 5);
-            assertEquals(3, numATStatesPruned);
+            assertEquals(4, numATStatesPruned);
             repository.getATRepository().setAtPruneHeight(6);
 
             // Make sure that blocks 2-4 are now missing block data and AT states data
@@ -100,12 +99,12 @@ public class PruneTests extends Common {
                 assertTrue(atStatesDataList.isEmpty());
             }
 
-            // Block 5 should have full AT states data even though it was pruned.
-            // This is because we identified that as the "latest" AT state in that block range
+            // Per-block receipts are pruned with the block range. The independent current
+            // head retains the payload needed to continue execution.
             BlockData blockData = repository.getBlockRepository().fromHeight(5);
             assertNull(blockData);
             List<ATStateData> atStatesDataList = repository.getATRepository().getBlockATStatesAtHeight(5);
-            assertEquals(1, atStatesDataList.size());
+            assertTrue(atStatesDataList.isEmpty());
 
             // Blocks 6-10 have block data and full AT states data
             for (Integer i=6; i <= 10; i++) {
@@ -143,10 +142,11 @@ public class PruneTests extends Common {
             BlockUtils.mintBlock(repository);
 
             // Prune AT states up to block 20
-            repository.getATRepository().rebuildLatestAtStates(20);
             repository.saveChanges();
             int numATStatesPruned = repository.getATRepository().pruneAtStates(0, 20);
-            assertEquals(1, numATStatesPruned); // deleted state at heights 2, but state at height 3 remains
+			// Both old block rows are removed after the sleeping AT's exact parent
+			// payload is copied into the bounded retained-state store.
+			assertEquals(2, numATStatesPruned);
 
             // Check AT is finished
             ATData atData = repository.getATRepository().fromATAddress(atAddress);

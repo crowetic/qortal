@@ -3,7 +3,9 @@ package org.qortal.controller.arbitrary;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.qortal.controller.Controller;
+import org.qortal.controller.Synchronizer;
 import org.qortal.data.arbitrary.ArbitraryResourceData;
+import org.qortal.data.arbitrary.ArbitraryResourceDirtyData;
 import org.qortal.data.transaction.ArbitraryTransactionData;
 import org.qortal.event.DataMonitorEvent;
 import org.qortal.event.EventBus;
@@ -15,7 +17,6 @@ import org.qortal.repository.hsqldb.HSQLDBDatabaseUpdates;
 import org.qortal.settings.Settings;
 import org.qortal.transaction.ArbitraryTransaction;
 import org.qortal.utils.Base58;
-import org.qortal.utils.ByteArray;
 
 import java.sql.Connection;
 import java.sql.PreparedStatement;
@@ -24,13 +25,14 @@ import java.sql.SQLException;
 import java.sql.Statement;
 import java.text.NumberFormat;
 import java.util.ArrayList;
-import java.util.Collections;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.Iterator;
-import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.Set;
 import java.util.stream.Collectors;
 
@@ -41,11 +43,23 @@ public class ArbitraryDataCacheManager extends Thread {
     private static ArbitraryDataCacheManager instance;
     private volatile boolean isStopping = false;
 
-    // Chunk receipts can notify us many times for the same transaction. Keep one
-    // pending refresh per signature, preserving the order of distinct transactions.
-    private final Map<ByteArray, ArbitraryTransactionData> updateQueue =
-            Collections.synchronizedMap(new LinkedHashMap<>());
-    static final int MAX_UPDATE_BATCH_SIZE = 128;
+    private static final int UPDATE_BATCH_SIZE = 100;
+    private static final long MAX_RETRY_DELAY = 3_600_000L;
+    private static final long QUEUE_HEALTH_LOG_INTERVAL = 300_000L;
+    private long lastQueueHealthLog;
+
+    /** Reconstructible local file/metadata events are coalesced in memory. */
+    private final Map<String, PendingUpdate> pendingUpdates = new ConcurrentHashMap<>();
+
+    private static final class PendingUpdate {
+        private final ArbitraryTransactionData transactionData;
+        private final int flags;
+
+        private PendingUpdate(ArbitraryTransactionData transactionData, int flags) {
+            this.transactionData = transactionData;
+            this.flags = flags;
+        }
+    }
 
     private static final NumberFormat FORMATTER = NumberFormat.getNumberInstance();
 
@@ -152,7 +166,10 @@ public class ArbitraryDataCacheManager extends Thread {
                         preparedStatement.addBatch();
                     }
 
-                    preparedStatement.executeBatch();
+                    // HSQLDB rejects executeBatch() when no statements were added. This is
+                    // expected for a new repository that only contains the genesis block.
+                    if (!signatureByData.isEmpty())
+                        preparedStatement.executeBatch();
 
                     LOGGER.info("Updated arbitrary resources with latest signatures");
 
@@ -201,33 +218,79 @@ public class ArbitraryDataCacheManager extends Thread {
         Thread.currentThread().setPriority(NORM_PRIORITY);
 
         try {
-            while (!Controller.isStopping()) {
+            while (!this.isStopping && !Controller.isStopping()) {
                 try {
                     Thread.sleep(500L);
+
+                    persistPendingUpdates();
 
                     // Process queue
                     processResourceQueue();
                 } catch (InterruptedException e) {
                     // Check if we're shutting down
-                    if (Controller.isStopping()) {
+                    if (this.isStopping || Controller.isStopping()) {
                         LOGGER.info("Arbitrary Data Cache Manager shutting down");
                         break;
                     }
                     LOGGER.warn("Arbitrary Data Cache Manager interrupted, retrying...", e);
                 } catch (Exception e) {
                     LOGGER.error(e.getMessage(), e);
-                    Thread.sleep(600_000L); // wait 10 minutes to continue
+                    Thread.sleep(5_000L);
                 }
             }
 
-            // Clear queue before terminating thread
+            // Give transient repository conflicts a few chances to clear before exit.
+            for (int attempt = 0; attempt < 3 && !this.pendingUpdates.isEmpty(); ++attempt) {
+                if (persistPendingUpdates())
+                    break;
+                Thread.sleep(100L);
+            }
             processResourceQueue();
         } catch (InterruptedException e) {
-            if (!Controller.isStopping()) {
+            if (!this.isStopping && !Controller.isStopping()) {
                 LOGGER.error("Arbitrary Data Cache Manager interrupted unexpectedly", e);
             }
         } catch (Exception e) {
             LOGGER.error(e.getMessage(), e);
+        }
+    }
+
+    private boolean persistPendingUpdates() {
+        if (this.pendingUpdates.isEmpty())
+            return true;
+
+        // Dirty markers written by block processing are part of the authoritative block
+        // transaction. Serialize this derived-cache writer with chain changes so HSQLDB
+        // never has to choose one of those transactions as a serialization victim.
+        ReentrantLock blockchainLock = Controller.getInstance().getBlockchainLock();
+        if (shouldYieldToChainWork(blockchainLock) || !blockchainLock.tryLock())
+            return false;
+
+        List<Map.Entry<String, PendingUpdate>> snapshot = new ArrayList<>(UPDATE_BATCH_SIZE);
+        try {
+            for (Map.Entry<String, PendingUpdate> entry : this.pendingUpdates.entrySet()) {
+                snapshot.add(entry);
+                if (snapshot.size() >= UPDATE_BATCH_SIZE)
+                    break;
+            }
+
+            try (Repository repository = RepositoryManager.getRepository()) {
+                for (Map.Entry<String, PendingUpdate> entry : snapshot) {
+                    PendingUpdate update = entry.getValue();
+                    repository.getArbitraryRepository().markResourceDirty(update.transactionData, update.flags);
+                }
+                repository.saveChanges();
+
+                // remove(key, value) preserves any event that arrived while this snapshot committed
+                snapshot.forEach(entry -> this.pendingUpdates.remove(entry.getKey(), entry.getValue()));
+                return this.pendingUpdates.isEmpty();
+            } catch (DataException e) {
+                LOGGER.warn("Unable to persist {} pending QDN cache updates; retaining them for retry",
+                        snapshot.size(), e);
+                return false;
+            }
+        } finally {
+            blockchainLock.unlock();
         }
     }
 
@@ -238,37 +301,62 @@ public class ArbitraryDataCacheManager extends Thread {
 
 
     private void processResourceQueue() {
-        if (this.updateQueue.isEmpty()) {
-            // Nothing to do
+        ReentrantLock blockchainLock = Controller.getInstance().getBlockchainLock();
+        if (shouldYieldToChainWork(blockchainLock))
+            return;
+
+        List<ArbitraryResourceDirtyData> dirtyResources;
+        try (final Repository repository = RepositoryManager.getRepository()) {
+            long now = System.currentTimeMillis();
+            logQueueHealthIfDue(repository, now);
+            dirtyResources = repository.getArbitraryRepository()
+                    .getDirtyResources(UPDATE_BATCH_SIZE, now);
+            repository.discardChanges();
+        } catch (DataException e) {
+            LOGGER.error("Repository issue while reading arbitrary resource cache queue", e);
             return;
         }
 
-        try (final Repository repository = RepositoryManager.getRepository()) {
-            int maxUpdates = Controller.isStopping() ? this.updateQueue.size()
-                    : Math.min(this.updateQueue.size(), MAX_UPDATE_BATCH_SIZE);
-            for (int i = 0; i < maxUpdates; i++) {
-                // Remove only the transaction about to be processed. If processing
-                // aborts, the rest remain queued; a new receipt can requeue this one.
-                List<ArbitraryTransactionData> next = drainUpdateQueue(1);
-                if (next.isEmpty()) {
+        if (dirtyResources.isEmpty())
+            return;
+
+        int completed = 0;
+        for (ArbitraryResourceDirtyData dirtyData : dirtyResources) {
+            // Commit each resource independently. Previously the first row remained write
+            // locked while the worker scanned metadata for the rest of a 100-row batch.
+            if (shouldYieldToChainWork(blockchainLock) || !blockchainLock.tryLock())
+                break;
+
+            try {
+                if (Synchronizer.getInstance().isSynchronizing()
+                        || Synchronizer.getInstance().isSyncRequested())
                     break;
-                }
-                ArbitraryTransactionData transactionData = next.get(0);
-                // Best not to return when controller is stopping, as ideally we need to finish processing
 
+                if (processDirtyResourceTransaction(dirtyData))
+                    completed++;
+                else
+                    break;
+            } finally {
+                blockchainLock.unlock();
+            }
+        }
 
-                // Update arbitrary resource caches
-                try {
-                    ArbitraryTransaction arbitraryTransaction = new ArbitraryTransaction(repository, transactionData);
-                    arbitraryTransaction.updateArbitraryResourceCacheIncludingMetadata(repository, new HashSet<>(0), new HashMap<>(0));
-                    repository.saveChanges();
+        LOGGER.debug("Processed {} of {} durable QDN cache updates using independent commits",
+                completed, dirtyResources.size());
+    }
 
-                    // Update status as separate commit, as this is more prone to failure
-                    arbitraryTransaction.updateArbitraryResourceStatus(repository);
-                    repository.saveChanges();
+    /**
+     * Process and acknowledge exactly one revision atomically. Newer revisions cannot be
+     * cleared because clearDirtyResource() includes the observed revision in its predicate.
+     */
+    private boolean processDirtyResourceTransaction(ArbitraryResourceDirtyData dirtyData) {
+        try (Repository repository = RepositoryManager.getRepository()) {
+            try {
+                ArbitraryTransactionData transactionData = processDirtyResource(repository, dirtyData);
+                repository.getArbitraryRepository().clearDirtyResource(dirtyData);
 
-
-                    EventBus.INSTANCE.notify(
+                if (transactionData != null) {
+                    repository.afterCommit(() -> EventBus.INSTANCE.notify(
                         new DataMonitorEvent(
                             System.currentTimeMillis(),
                             transactionData.getIdentifier(),
@@ -278,64 +366,171 @@ public class ArbitraryDataCacheManager extends Thread {
                             transactionData.getTimestamp(),
                             transactionData.getTimestamp()
                         )
-                    );
-
-                } catch (DataException e) {
-                    repository.discardChanges();
-                    LOGGER.error("Repository issue while updating arbitrary resource caches", e);
+                    ));
                 }
+                repository.saveChanges();
+                return true;
+            } catch (Exception e) {
+                repository.discardChanges();
+                if (RepositoryManager.isDeadlockRelated(e)) {
+                    LOGGER.debug("QDN cache update conflicted with another database writer; retained it for retry");
+                    return false;
+                }
+
+                deferDirtyResource(dirtyData, e);
+                return true;
             }
         } catch (DataException e) {
-            LOGGER.error("Repository issue while processing arbitrary resource cache updates", e);
+            LOGGER.error("Repository issue while processing arbitrary resource cache update", e);
+            return false;
         }
-        catch (Exception e) {
-            LOGGER.error(e.getMessage(), e);
+    }
+
+    private void deferDirtyResource(ArbitraryResourceDirtyData dirtyData, Exception originalException) {
+        long retryDelay = Math.min(MAX_RETRY_DELAY,
+                1_000L << Math.min(dirtyData.getRetryCount(), 12));
+        try (Repository retryRepository = RepositoryManager.getRepository()) {
+            retryRepository.getArbitraryRepository().deferDirtyResource(dirtyData,
+                    System.currentTimeMillis() + retryDelay);
+            retryRepository.saveChanges();
+        } catch (DataException deferException) {
+            originalException.addSuppressed(deferException);
+            LOGGER.warn("Unable to defer failed QDN cache update; retained it for immediate retry", originalException);
+            return;
         }
+
+        int failedAttempts = dirtyData.getRetryCount() + 1;
+        if (failedAttempts >= 10 && (failedAttempts == 10 || failedAttempts % 12 == 0)) {
+            LOGGER.error("QDN cache update for {} {} {} has failed {} times; work remains queued (retry in {} ms)",
+                    dirtyData.getService(), dirtyData.getName(), dirtyData.getIdentifier(),
+                    failedAttempts, retryDelay, originalException);
+        } else {
+            LOGGER.warn("Unable to update QDN cache for {} {} {} (retry in {} ms)",
+                    dirtyData.getService(), dirtyData.getName(), dirtyData.getIdentifier(), retryDelay, originalException);
+        }
+    }
+
+    private boolean shouldYieldToChainWork(ReentrantLock blockchainLock) {
+        Synchronizer synchronizer = Synchronizer.getInstance();
+        return synchronizer.isSynchronizing() || synchronizer.isSyncRequested()
+                || blockchainLock.hasQueuedThreads();
+    }
+
+    private void logQueueHealthIfDue(Repository repository, long now) throws DataException {
+        if (now - this.lastQueueHealthLog < QUEUE_HEALTH_LOG_INTERVAL)
+            return;
+
+        this.lastQueueHealthLog = now;
+        String sql = "SELECT COUNT(*), " +
+                "COALESCE(SUM(CASE WHEN retry_count > 0 THEN 1 ELSE 0 END), 0), " +
+                "COALESCE(MAX(retry_count), 0), COALESCE(MIN(updated_when), 0) " +
+                "FROM ArbitraryResourceDirty";
+        try (Statement statement = repository.getConnection().createStatement();
+             ResultSet resultSet = statement.executeQuery(sql)) {
+            if (!resultSet.next())
+                return;
+
+            long pending = resultSet.getLong(1);
+            long retrying = resultSet.getLong(2);
+            int maxRetries = resultSet.getInt(3);
+            long oldestUpdated = resultSet.getLong(4);
+            long oldestAge = oldestUpdated > 0 ? Math.max(0L, now - oldestUpdated) : 0L;
+            if (retrying > 0) {
+                LOGGER.warn("QDN cache queue health: {} pending, {} retrying, max retries {}, oldest age {} ms",
+                        pending, retrying, maxRetries, oldestAge);
+            } else if (pending >= 1_000) {
+                LOGGER.info("QDN cache queue backlog: {} pending, oldest age {} ms", pending, oldestAge);
+            }
+        } catch (SQLException e) {
+            throw new DataException("Unable to inspect QDN cache queue health", e);
+        }
+    }
+
+    private ArbitraryTransactionData processDirtyResource(Repository repository,
+                                                           ArbitraryResourceDirtyData dirtyData) throws DataException {
+        String identifier = "default".equals(dirtyData.getIdentifier()) ? null : dirtyData.getIdentifier();
+        ArbitraryTransactionData transactionData;
+
+        if (dirtyData.hasFlag(ArbitraryResourceDirtyData.HEAD_DIRTY)) {
+            transactionData = repository.getArbitraryRepository().getLatestTransaction(
+                    dirtyData.getName(), dirtyData.getService(), null, identifier);
+            if (transactionData == null) {
+                repository.getArbitraryRepository().delete(
+                        new ArbitraryResourceData(dirtyData.getService(), dirtyData.getName(), identifier));
+                return null;
+            }
+        } else {
+            byte[] signature = dirtyData.getTriggeringSignature();
+            byte[] latestSignature = repository.getArbitraryRepository().getLatestSignature(
+                    dirtyData.getService(), dirtyData.getName(), identifier);
+            if (signature == null || !Arrays.equals(signature, latestSignature))
+                return null; // A stale file/metadata event cannot change the current resource.
+
+            transactionData = repository.getArbitraryRepository().getSingleTransactionBySignature(signature);
+            if (transactionData == null)
+                return null;
+        }
+
+        ArbitraryTransaction arbitraryTransaction = new ArbitraryTransaction(repository, transactionData);
+        if (dirtyData.hasFlag(ArbitraryResourceDirtyData.HEAD_DIRTY)
+                || dirtyData.hasFlag(ArbitraryResourceDirtyData.METADATA_DIRTY)) {
+            arbitraryTransaction.updateArbitraryResourceCacheIncludingMetadata(repository,
+                    Set.of(new ArbitraryTransactionDataHashWrapper(transactionData)), new HashMap<>(0));
+        }
+        if (dirtyData.hasFlag(ArbitraryResourceDirtyData.STATUS_DIRTY)) {
+            arbitraryTransaction.updateArbitraryResourceStatus(repository);
+        }
+        return transactionData;
     }
 
     public void addToUpdateQueue(ArbitraryTransactionData transactionData) {
-        if (transactionData == null || transactionData.getSignature() == null) {
+        int flags = ArbitraryResourceDirtyData.METADATA_DIRTY | ArbitraryResourceDirtyData.STATUS_DIRTY;
+        mergePendingUpdate(transactionData, flags);
+    }
+
+    private void mergePendingUpdate(ArbitraryTransactionData transactionData, int flags) {
+        if (transactionData == null || transactionData.getName() == null
+                || transactionData.getService() == null || flags == 0)
+            return;
+
+        ArbitraryResourceStateRegistry.getInstance().invalidate(transactionData.getService(),
+                transactionData.getName(), transactionData.getIdentifier());
+
+        String identifier = transactionData.getIdentifier() != null ? transactionData.getIdentifier() : "default";
+        String key = transactionData.getService().value + "\u0000"
+                + transactionData.getName().toLowerCase(Locale.ROOT) + "\u0000" + identifier;
+        this.pendingUpdates.compute(key, (ignored, existing) -> new PendingUpdate(transactionData,
+                flags | (existing != null ? existing.flags : 0)));
+    }
+
+    /** Persist non-reconstructible events immediately. */
+    public void addToUpdateQueue(ArbitraryTransactionData transactionData, int flags) {
+        if (transactionData != null)
+            ArbitraryResourceStateRegistry.getInstance().invalidate(transactionData.getService(),
+                    transactionData.getName(), transactionData.getIdentifier());
+        ReentrantLock blockchainLock = Controller.getInstance().getBlockchainLock();
+        if (shouldYieldToChainWork(blockchainLock) || !blockchainLock.tryLock()) {
+            mergePendingUpdate(transactionData, flags);
             return;
         }
-        this.updateQueue.put(ByteArray.copyOf(transactionData.getSignature()), transactionData);
-    }
 
-    List<ArbitraryTransactionData> drainUpdateQueue() {
-        return drainUpdateQueue(MAX_UPDATE_BATCH_SIZE);
-    }
-
-    private List<ArbitraryTransactionData> drainUpdateQueue(int maxItems) {
-        List<ArbitraryTransactionData> batch = new ArrayList<>(Math.min(maxItems, MAX_UPDATE_BATCH_SIZE));
-        synchronized (this.updateQueue) {
-            Iterator<ArbitraryTransactionData> iterator = this.updateQueue.values().iterator();
-            while (iterator.hasNext() && batch.size() < maxItems) {
-                batch.add(iterator.next());
-                iterator.remove();
+        try {
+            try (Repository repository = RepositoryManager.getRepository()) {
+                repository.getArbitraryRepository().markResourceDirty(transactionData, flags);
+                repository.saveChanges();
+            } catch (DataException e) {
+                mergePendingUpdate(transactionData, flags);
+                LOGGER.warn("Unable to persist QDN cache update for transaction {}; retained it for retry",
+                        transactionData != null && transactionData.getSignature() != null
+                                ? Base58.encode(transactionData.getSignature()) : "unknown", e);
             }
+        } finally {
+            blockchainLock.unlock();
         }
-        return batch;
     }
 
     public boolean needsArbitraryResourcesCacheRebuild(Repository repository) throws DataException {
-        // Check if we have an entry in the cache for the oldest ARBITRARY transaction with a name
-        List<ArbitraryTransactionData> oldestCacheableTransactions = repository.getArbitraryRepository().getArbitraryTransactions(true, 1, 0, false);
-        if (oldestCacheableTransactions == null || oldestCacheableTransactions.isEmpty()) {
-            // No relevant arbitrary transactions yet on this chain
-            LOGGER.debug("No relevant arbitrary transactions exist to build cache from");
-            return false;
-        }
-        // We have an arbitrary transaction, so check if it's in the cache
-        ArbitraryTransactionData txn = oldestCacheableTransactions.get(0);
-        ArbitraryResourceData cachedResource = repository.getArbitraryRepository().getArbitraryResource(txn.getService(), txn.getName(), txn.getIdentifier());
-        if (cachedResource != null) {
-            // Earliest resource exists in the cache, so assume it has been built.
-            // We avoid checkpointing and prevent the node from starting up in the case of a rebuild failure, so
-            // we shouldn't ever be left in a partially rebuilt state.
-            LOGGER.debug("Arbitrary resources cache already built");
-            return false;
-        }
-
-        return true;
+        return repository.getArbitraryRepository().isOldestNamedResourceMissingFromCache();
     }
 
     public boolean buildArbitraryResourcesCache(Repository repository, boolean forceRebuild) throws DataException {
@@ -418,9 +613,7 @@ public class ArbitraryDataCacheManager extends Thread {
                 offset += batchSize;
             }
 
-            // Now refresh all statuses
             refreshArbitraryStatuses(repository);
-
             LOGGER.info("Completed build of arbitrary resources cache.");
             return true;
         }
@@ -445,62 +638,43 @@ public class ArbitraryDataCacheManager extends Thread {
 
             final int batchSize = Settings.getInstance().getBuildArbitraryResourcesBatchSize();
             int offset = 0;
+            List<ArbitraryTransactionData> allHostedTransactions =
+                    ArbitraryDataStorageManager.getInstance().listAllHostedTransactions(repository, null, null);
 
-            List<ArbitraryTransactionData> allHostedTransactions
-                = ArbitraryDataStorageManager.getInstance()
-                    .listAllHostedTransactions(repository, null, null);
-
-            // Loop through all ARBITRARY transactions, and determine latest state
             while (!Controller.isStopping()) {
-                LOGGER.info(
-                    "Fetching hosted transactions {} - {} / {} Total",
-                    FORMATTER.format(offset),
-                    FORMATTER.format(offset+batchSize-1),
-                    FORMATTER.format(allHostedTransactions.size())
-                );
+                LOGGER.info("Fetching hosted transactions {} - {} / {} Total",
+                        FORMATTER.format(offset), FORMATTER.format(offset + batchSize - 1),
+                        FORMATTER.format(allHostedTransactions.size()));
 
-                List<ArbitraryTransactionData> hostedTransactions
-                    = allHostedTransactions.stream()
+                List<ArbitraryTransactionData> hostedTransactions = allHostedTransactions.stream()
                         .skip(offset)
                         .limit(batchSize)
                         .collect(Collectors.toList());
-
-                if (hostedTransactions.isEmpty()) {
-                    // Complete
+                if (hostedTransactions.isEmpty())
                     break;
-                }
 
                 try {
-                    // Loop through hosted transactions
                     for (ArbitraryTransactionData transactionData : hostedTransactions) {
-
-                        // Determine status and update cache
                         ArbitraryTransaction arbitraryTransaction = new ArbitraryTransaction(repository, transactionData);
                         arbitraryTransaction.updateArbitraryResourceStatus(repository);
                     }
                     repository.saveChanges();
                 } catch (DataException e) {
                     repository.discardChanges();
-
                     LOGGER.error(e.getMessage(), e);
                 }
-
                 offset += batchSize;
             }
 
             LOGGER.info("Completed refresh of arbitrary resource statuses.");
             return true;
-        }
-        catch (DataException e) {
-            LOGGER.info("Unable to refresh arbitrary resource statuses: {}. The database may have been left in an inconsistent state.", e.getMessage());
-
-            // Throw an exception so that the node startup is halted, allowing for a retry next time.
+        } catch (DataException e) {
+            LOGGER.info("Unable to refresh arbitrary resource statuses: {}. The database may have been left in an inconsistent state.",
+                    e.getMessage());
             repository.discardChanges();
             throw new DataException("Refresh of arbitrary resource statuses failed.");
-        }
-        catch (Exception e) {
+        } catch (Exception e) {
             LOGGER.error(e.getMessage(), e);
-
             return false;
         }
     }

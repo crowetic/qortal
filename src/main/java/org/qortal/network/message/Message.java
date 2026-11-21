@@ -42,7 +42,7 @@ public abstract class Message {
 	private static final int DATA_SIZE_LENGTH = 4;
 	private static final int CHECKSUM_LENGTH = 4;
 
-	private static final int MAX_DATA_SIZE = 10 * 1024 * 1024; // 10MB
+	protected static final int MAX_DATA_SIZE = 10 * 1024 * 1024; // 10MB
 
 	protected static final byte[] EMPTY_DATA_BYTES = new byte[0];
 	private static final ByteBuffer EMPTY_READ_ONLY_BYTE_BUFFER = ByteBuffer.wrap(EMPTY_DATA_BYTES).asReadOnlyBuffer();

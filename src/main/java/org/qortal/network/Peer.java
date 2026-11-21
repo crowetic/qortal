@@ -300,6 +300,12 @@ public class Peer {
     public int getPeerType () {
         return this.peerType;
     }
+
+    /** Older QDN peers parse the source address even for replies served over the existing connection. */
+    public boolean canReceiveQdnFileList(String sourceAddress) {
+        return sourceAddress != null || Boolean.TRUE.equals(getPeerCapability(PeerCapabilities.QDN_OPTIONAL_SOURCE_ADDRESS));
+    }
+
     public Object getPeerCapability(String capName) {
         return peerCapabilities == null ? null : peerCapabilities.getCapability(capName);
     }
@@ -812,8 +818,6 @@ public class Peer {
                                 bytesRead, priorPosition, this);
                     }
                 }
-                final boolean wasByteBufferFull = !this.byteBuffer.hasRemaining();
-
                 while (true) {
                     final Message message;
 
@@ -839,15 +843,11 @@ public class Peer {
                 if (message == null && bytesRead == 0) {
                     // No complete message and no bytes available right now.
                     // Return so selector can re-arm OP_READ without busy looping.
-                    if (!wasByteBufferFull) {
-                        // If byteBuffer is completely empty, deallocate it to save memory
-                        // This helps reduce memory usage when peers are idle
-                        // The buffer will be reallocated on next read if needed
-                        if (this.byteBuffer.remaining() == this.byteBuffer.capacity()) {
-                            this.byteBuffer = null;
-                            LOGGER.trace("[{}] Deallocated empty byteBuffer for peer {}", this.peerConnectionId, this);
-                        }
-                    }
+                    // Keep the receive buffer for the lifetime of the peer. Discarding an empty
+                    // maximum-message-sized buffer here causes it to be allocated again on the
+                    // next selector wake-up. Under QDN traffic this can allocate tens of gigabytes
+                    // of short-lived arrays in minutes and force repeated old-generation GCs.
+                    // The peer itself bounds the retained memory and releases it on disconnect.
                     return;
                 }
 
@@ -1667,4 +1667,3 @@ public class Peer {
         }
     }
 }
-

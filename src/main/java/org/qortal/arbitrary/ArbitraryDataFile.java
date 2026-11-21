@@ -13,6 +13,7 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
+import java.nio.ByteBuffer;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.AbstractMap;
@@ -36,6 +37,7 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.qortal.arbitrary.metadata.ArbitraryDataTransactionMetadata;
 import org.qortal.crypto.Crypto;
+import org.qortal.controller.arbitrary.LocalQdnContentJournal;
 import org.qortal.data.transaction.ArbitraryTransactionData;
 import org.qortal.repository.DataException;
 import org.qortal.settings.Settings;
@@ -75,12 +77,14 @@ public class ArbitraryDataFile {
     private static final Logger LOGGER = LogManager.getLogger(ArbitraryDataFile.class);
 
     public static final long MAX_FILE_SIZE = 2L * 1024 * 1024 * 1024; // 2 GiB
-    protected static final int MAX_CHUNK_SIZE = 1 * 1024 * 1024; // 1MiB
+    public static final int MAX_CHUNK_SIZE = 1 * 1024 * 1024; // 1MiB
     public static final int CHUNK_SIZE = 512 * 1024; // 0.5MiB
     public static int SHORT_DIGEST_LENGTH = 8;
 
     protected Path filePath;
     protected byte[] fileContent;
+    protected int fileContentLength;
+    private Runnable fileContentRelease;
     private boolean useTemporaryFile;
 
     protected String hash58;
@@ -111,21 +115,43 @@ public class ArbitraryDataFile {
     }
 
     public ArbitraryDataFile(byte[] fileContent, byte[] signature, boolean useTemporaryFile) throws DataException {
+        this(fileContent, fileContent != null ? fileContent.length : 0, signature, useTemporaryFile, null);
+    }
+
+    private ArbitraryDataFile(byte[] fileContent, int fileContentLength, byte[] signature,
+                              boolean useTemporaryFile, Runnable fileContentRelease) throws DataException {
         if (fileContent == null) {
             LOGGER.error("fileContent is null");
             return;
         }
 
         this.chunks = new ArrayList<>();
-        this.hash58 = Base58.encode(Crypto.digest(fileContent));
+        if (fileContentLength < 0 || fileContentLength > fileContent.length)
+            throw new DataException("Invalid in-memory QDN file length");
+        this.cachedDigest = Crypto.digest(ByteBuffer.wrap(fileContent, 0, fileContentLength).slice());
+        this.hash58 = Base58.encode(this.cachedDigest);
         this.signature = signature;
-        LOGGER.trace(String.format("File digest: %s, size: %d bytes", this.hash58, fileContent.length));
+        LOGGER.trace(String.format("File digest: %s, size: %d bytes", this.hash58, fileContentLength));
 
         this.fileContent = fileContent;
+        this.fileContentLength = fileContentLength;
+        this.fileContentRelease = fileContentRelease;
         this.useTemporaryFile = useTemporaryFile;
     }
 
+    public static ArbitraryDataFile fromReceivedBytes(byte[] fileContent, int fileContentLength,
+                                                       byte[] signature, Runnable release) throws DataException {
+        return new ArbitraryDataFile(fileContent, fileContentLength, signature, false, release);
+    }
+
     public void save() throws DataException {
+        try (LocalQdnContentJournal.SignatureLease ignored =
+                     LocalQdnContentJournal.getInstance().acquireMutationLease(this.signature)) {
+            saveWithoutLease();
+        }
+    }
+
+    private void saveWithoutLease() throws DataException {
         Path outputFilePath;
         if (this.useTemporaryFile) {
             try {
@@ -141,13 +167,36 @@ public class ArbitraryDataFile {
         }
 
         File outputFile = outputFilePath.toFile();
+        if (!this.useTemporaryFile)
+            LocalQdnContentJournal.getInstance().recordFilesystemChange(this.signature);
+        long previousDiskUsage = 0L;
+        if (!this.useTemporaryFile && outputFile.exists()) {
+            previousDiskUsage = FilesystemUtils.getDiskUsage(outputFile);
+        }
         try (FileOutputStream outputStream = new FileOutputStream(outputFile)) {
-            outputStream.write(fileContent);
+            outputStream.write(fileContent, 0, fileContentLength);
             this.filePath = outputFilePath;
 
-            ArbitraryDataFolderSizeEstimator.getInstance().add(FilesystemUtils.getDiskUsage(outputFile));
+            long newDiskUsage = FilesystemUtils.getDiskUsage(outputFile);
+            ArbitraryDataFolderSizeEstimator.getInstance().add(newDiskUsage - previousDiskUsage);
+            if (!this.useTemporaryFile)
+                LocalQdnContentJournal.getInstance().recordFilesystemChange(this.signature);
         } catch (IOException e) {
-            this.delete();
+            if (this.useTemporaryFile) {
+                this.delete();
+            } else {
+                long failedDiskUsage = outputFile.exists() ? FilesystemUtils.getDiskUsage(outputFile) : 0L;
+                boolean removed = false;
+                try {
+                    removed = Files.deleteIfExists(outputFilePath);
+                    if (removed)
+                        FilesystemUtils.safeDeleteEmptyParentDirectories(outputFilePath.getParent());
+                } catch (IOException cleanupException) {
+                    LOGGER.debug("Unable to remove incomplete file {}", outputFilePath, cleanupException);
+                }
+                long retainedDiskUsage = removed || !outputFile.exists() ? 0L : failedDiskUsage;
+                ArbitraryDataFolderSizeEstimator.getInstance().add(retainedDiskUsage - previousDiskUsage);
+            }
             throw new DataException(String.format("Unable to write data with hash %s: %s", this.hash58, e.getMessage()));
         }
     }
@@ -160,7 +209,7 @@ public class ArbitraryDataFile {
         if (hash == null) {
             return null;
         }
-        return ArbitraryDataFile.fromHash58(Base58.encode(hash), signature);
+        return ArbitraryDataFile.fromHash58(QdnPathResolver.encode(hash), signature);
     }
 
     public static ArbitraryDataFile fromRawData(byte[] data, byte[] signature) throws DataException {
@@ -224,7 +273,12 @@ public class ArbitraryDataFile {
                 else if (!path.equals(arbitraryDataFile.getFilePath())) {
                     // Wrong path, so relocate (but don't cleanup, as the source folder may still be needed by the caller)
                     Path dest = arbitraryDataFile.getFilePath();
-                    FilesystemUtils.moveFile(path, dest, false);
+                    try (LocalQdnContentJournal.SignatureLease ignored =
+                                 LocalQdnContentJournal.getInstance().acquireMutationLease(signature)) {
+                        LocalQdnContentJournal.getInstance().recordFilesystemChange(signature);
+                        FilesystemUtils.moveFile(path, dest, false);
+                        LocalQdnContentJournal.getInstance().recordFilesystemChange(signature);
+                    }
                 }
                 return arbitraryDataFile;
 
@@ -246,32 +300,24 @@ public class ArbitraryDataFile {
         Path outputFilePath = getOutputFilePath(this.hash58, signature, true);
         sourcePath = sourcePath.toAbsolutePath();
         Path destPath = outputFilePath.toAbsolutePath();
-        try {
-            return Files.copy(sourcePath, destPath, StandardCopyOption.REPLACE_EXISTING);
+        try (LocalQdnContentJournal.SignatureLease ignored =
+                     LocalQdnContentJournal.getInstance().acquireMutationLease(signature)) {
+            LocalQdnContentJournal.getInstance().recordFilesystemChange(signature);
+            Path copied = Files.copy(sourcePath, destPath, StandardCopyOption.REPLACE_EXISTING);
+            LocalQdnContentJournal.getInstance().recordFilesystemChange(signature);
+            return copied;
         } catch (IOException e) {
             throw new DataException(String.format("Unable to copy file %s to data directory %s", sourcePath, destPath));
         }
     }
 
     public static Path getOutputFilePath(String hash58, byte[] signature, boolean createDirectories) throws DataException {
-        Path directory;
-
         if (hash58 == null) {
             return null;
         }
-        if (signature != null) {
-            // Key by signature
-            String signature58 = Base58.encode(signature);
-            String sig58First2Chars = signature58.substring(0, 2).toLowerCase();
-            String sig58Next2Chars = signature58.substring(2, 4).toLowerCase();
-            directory = Paths.get(Settings.getInstance().getDataPath(), sig58First2Chars, sig58Next2Chars, signature58);
-        }
-        else {
-            // Put files without signatures in a "_misc" directory, and the files will be relocated later
-            String hash58First2Chars = hash58.substring(0, 2).toLowerCase();
-            String hash58Next2Chars = hash58.substring(2, 4).toLowerCase();
-            directory = Paths.get(Settings.getInstance().getDataPath(), "_misc", hash58First2Chars, hash58Next2Chars);
-        }
+
+        Path filePath = QdnPathResolver.resolve(hash58, signature);
+        Path directory = filePath.getParent();
 
         if (createDirectories) {
             try {
@@ -280,7 +326,7 @@ public class ArbitraryDataFile {
                 throw new DataException("Unable to create data subdirectory");
             }
         }
-        return Paths.get(directory.toString(), hash58);
+        return filePath;
     }
 
     public ValidationResult isValid() {
@@ -348,6 +394,14 @@ public class ArbitraryDataFile {
     }
 
     public int split(int chunkSize) throws DataException {
+        try (LocalQdnContentJournal.SignatureLease ignored =
+                     LocalQdnContentJournal.getInstance().acquireMutationLease(this.signature)) {
+            return splitWithoutLease(chunkSize);
+        }
+    }
+
+    private int splitWithoutLease(int chunkSize) throws DataException {
+        LocalQdnContentJournal.getInstance().recordFilesystemChange(this.signature);
         try {
 
             File file = this.getFile();
@@ -389,6 +443,7 @@ public class ArbitraryDataFile {
             throw new DataException("Unable to split file into chunks");
         }
 
+        LocalQdnContentJournal.getInstance().recordFilesystemChange(this.signature);
         return this.chunks.size();
     }
 
@@ -412,9 +467,18 @@ public class ArbitraryDataFile {
      * @return true if join succeeded, false otherwise
      */
     public boolean join() {
+        try (LocalQdnContentJournal.SignatureLease ignored =
+                     LocalQdnContentJournal.getInstance().acquireMutationLease(this.signature)) {
+            return joinWithoutLease();
+        }
+    }
+
+    private boolean joinWithoutLease() {
         if (this.chunks == null || this.chunks.isEmpty()) {
             return false;
         }
+
+        LocalQdnContentJournal.getInstance().recordFilesystemChange(this.signature);
 
         Path outputPath;
         try {
@@ -424,8 +488,7 @@ public class ArbitraryDataFile {
             return false;
         }
 
-        // Initialize hash calculation for incremental hashing during write
-        // This eliminates the need for a separate full-file read for hash validation
+        // Hash while streaming so the completed file never needs a second full read.
         MessageDigest fileDigest;
         try {
             fileDigest = MessageDigest.getInstance("SHA-256");
@@ -435,113 +498,37 @@ public class ArbitraryDataFile {
             fileDigest = null;
         }
 
-        // Pi-friendly configuration:
-        // - 2 reader threads (SD cards don't benefit from more parallelism)
-        // - Smaller queue to reduce memory pressure (4 * 512KB = 2MB)
-        // - Buffer size matches chunk size for efficient reads
-        final int READER_THREADS = 2;
-        final int QUEUE_CAPACITY = 4;
-        final int BUFFER_SIZE = 512 * 1024; // 512KB
-
-        // Bounded blocking queue for pre-read chunk data (index -> data)
-        BlockingQueue<Map.Entry<Integer, byte[]>> preReadQueue = new LinkedBlockingQueue<>(QUEUE_CAPACITY);
-        AtomicBoolean errorOccurred = new AtomicBoolean(false);
-        AtomicInteger nextChunkToRead = new AtomicInteger(0);
-        int totalChunks = this.chunks.size();
-
-        // Create thread pool for parallel reading
-        ExecutorService readerPool = Executors.newFixedThreadPool(READER_THREADS, r -> {
-            Thread t = new Thread(r);
-            t.setName("ChunkReader-" + t.getId());
-            t.setDaemon(true);
-            return t;
-        });
-
-        // Submit reader tasks - each thread reads chunks and puts them in the queue
-        for (int i = 0; i < READER_THREADS; i++) {
-            readerPool.submit(() -> {
-                byte[] localBuffer = new byte[BUFFER_SIZE];
-                while (!errorOccurred.get() && !Thread.currentThread().isInterrupted()) {
-                    int chunkIndex = nextChunkToRead.getAndIncrement();
-                    if (chunkIndex >= totalChunks) {
-                        break;
-                    }
-
-                    ArbitraryDataFileChunk chunk = this.chunks.get(chunkIndex);
-                    try {
-                        // Read entire chunk into memory
-                        ByteArrayOutputStream baos = new ByteArrayOutputStream(BUFFER_SIZE);
-                        try (InputStream in = Files.newInputStream(chunk.filePath)) {
-                            int bytesRead;
-                            while ((bytesRead = in.read(localBuffer)) != -1) {
-                                baos.write(localBuffer, 0, bytesRead);
-                            }
-                        }
-                        
-                        // Put in queue (blocks if queue is full - provides backpressure)
-                        preReadQueue.put(new AbstractMap.SimpleEntry<>(chunkIndex, baos.toByteArray()));
-                    } catch (IOException | InterruptedException e) {
-                        if (!Thread.currentThread().isInterrupted()) {
-                            LOGGER.error("Error reading chunk {}: {}", chunkIndex, e.getMessage());
-                        }
-                        errorOccurred.set(true);
-                        break;
-                    }
-                }
-            });
-        }
-
-        // Writer runs on main thread - writes chunks in order and updates hash incrementally
+        boolean success = false;
+        byte[] buffer = new byte[128 * 1024];
         try (OutputStream out = Files.newOutputStream(outputPath, 
                 StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE)) {
-            
-            // TreeMap reorders chunks that may arrive out of order from parallel readers
-            TreeMap<Integer, byte[]> pendingWrites = new TreeMap<>();
-            int nextChunkToWrite = 0;
 
-            while (nextChunkToWrite < totalChunks && !errorOccurred.get()) {
-                // Poll from queue with timeout to allow checking error flag
-                Map.Entry<Integer, byte[]> entry = preReadQueue.poll(100, TimeUnit.MILLISECONDS);
-                
-                if (entry != null) {
-                    pendingWrites.put(entry.getKey(), entry.getValue());
-                }
-
-                // Write all consecutive chunks we have in order
-                while (pendingWrites.containsKey(nextChunkToWrite)) {
-                    byte[] data = pendingWrites.remove(nextChunkToWrite);
-                    // Write to file
-                    out.write(data);
-                    // Update hash incrementally (eliminates need for separate full-file read)
-                    if (fileDigest != null) {
-                        fileDigest.update(data);
+            for (ArbitraryDataFileChunk chunk : this.chunks) {
+                try (InputStream in = new BufferedInputStream(Files.newInputStream(chunk.filePath))) {
+                    int bytesRead;
+                    while ((bytesRead = in.read(buffer)) != -1) {
+                        out.write(buffer, 0, bytesRead);
+                        if (fileDigest != null)
+                            fileDigest.update(buffer, 0, bytesRead);
                     }
-                    nextChunkToWrite++;
                 }
             }
-            
+
             out.flush();
             this.filePath = outputPath;
-            
-            // Finalize hash and cache it (saves ~1200ms for large files by avoiding re-read)
-            if (fileDigest != null && !errorOccurred.get()) {
+
+            if (fileDigest != null) {
                 this.cachedDigest = fileDigest.digest();
-                LOGGER.debug("Computed file hash incrementally during join");
+                byte[] expectedDigest = Base58.decode(this.hash58);
+                if (!Arrays.equals(this.cachedDigest, expectedDigest))
+                    throw new IOException("Joined file hash does not match its transaction hash");
             }
-            
-        } catch (IOException | InterruptedException e) {
+
+            success = true;
+        } catch (IOException | NumberFormatException e) {
             LOGGER.error("Error writing joined file: {}", e.getMessage());
-            errorOccurred.set(true);
         } finally {
-            readerPool.shutdownNow();
-            try {
-                readerPool.awaitTermination(5, TimeUnit.SECONDS);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
-            
-            // Clean up incomplete file if join failed
-            if (errorOccurred.get() && outputPath != null && Files.exists(outputPath)) {
+            if (!success && outputPath != null && Files.exists(outputPath)) {
                 try {
                     Files.delete(outputPath);
                     LOGGER.debug("Cleaned up incomplete joined file after error: {}", outputPath);
@@ -551,23 +538,34 @@ public class ArbitraryDataFile {
             }
         }
 
-        return !errorOccurred.get();
+        if (success)
+            LocalQdnContentJournal.getInstance().recordFilesystemChange(this.signature);
+        return success;
     }
 
 
 
     public boolean delete() {
+        try (LocalQdnContentJournal.SignatureLease ignored =
+                     LocalQdnContentJournal.getInstance().acquireMutationLease(this.signature)) {
+            return deleteWithoutLease();
+        }
+    }
+
+    private boolean deleteWithoutLease() {
         // Delete the complete file
         // ... but only if it's inside the Qortal data or temp directory
         if (FilesystemUtils.pathInsideDataOrTempPath(this.filePath)) {
             if (Files.exists(this.filePath)) {
                 try {
+                    LocalQdnContentJournal.getInstance().recordFilesystemChange(this.signature);
                     long diskUsage = FilesystemUtils.getDiskUsage(this.filePath.toFile());
 
                     Files.delete(this.filePath);
 
                     ArbitraryDataFolderSizeEstimator.getInstance().subtract(diskUsage);
                     this.cleanupFilesystem();
+                    LocalQdnContentJournal.getInstance().recordFilesystemChange(this.signature);
                     LOGGER.debug("Deleted file {}", this.filePath);
                     return true;
                 } catch (IOException e) {
@@ -644,15 +642,19 @@ public class ArbitraryDataFile {
     }
 
     public byte[] getBytes() {
-        if (this.fileContent != null) {
-            return this.fileContent;
-        }
+        try (LocalQdnContentJournal.SignatureLease ignored =
+                     LocalQdnContentJournal.getInstance().acquireMutationLease(this.signature)) {
+            if (this.fileContent != null) {
+                return this.fileContentLength == this.fileContent.length
+                        ? this.fileContent : Arrays.copyOf(this.fileContent, this.fileContentLength);
+            }
 
-        try {
-            return Files.readAllBytes(this.filePath);
-        } catch (IOException e) {
-            LOGGER.error("Unable to read bytes for file");
-            return null;
+            try {
+                return Files.readAllBytes(this.filePath);
+            } catch (IOException e) {
+                LOGGER.error("Unable to read bytes for file");
+                return null;
+            }
         }
     }
 
@@ -664,6 +666,13 @@ public class ArbitraryDataFile {
      * @return true if the hash matches, false otherwise
      */
     public boolean validateHash(byte[] expectedHash) {
+        try (LocalQdnContentJournal.SignatureLease ignored =
+                     LocalQdnContentJournal.getInstance().acquireMutationLease(this.signature)) {
+            return validateHashWithoutLease(expectedHash);
+        }
+    }
+
+    private boolean validateHashWithoutLease(byte[] expectedHash) {
         if (expectedHash == null) {
             return false;
         }
@@ -671,8 +680,10 @@ public class ArbitraryDataFile {
         byte[] actualHash;
         
         // If data is already in memory, use it (more efficient than reading from disk)
-        if (this.fileContent != null) {
-            actualHash = Crypto.digest(this.fileContent);
+        if (this.cachedDigest != null) {
+            actualHash = this.cachedDigest;
+        } else if (this.fileContent != null) {
+            actualHash = Crypto.digest(ByteBuffer.wrap(this.fileContent, 0, this.fileContentLength).slice());
         } else if (this.filePath != null && Files.exists(this.filePath)) {
             // Use streaming hash for files on disk (memory-efficient)
             try {
@@ -693,8 +704,26 @@ public class ArbitraryDataFile {
      * Clears the in-memory file content to allow garbage collection.
      * The file can still be accessed from disk if needed.
      */
-    public void clearFileContent() {
+    public synchronized void clearFileContent() {
         this.fileContent = null;
+        this.fileContentLength = 0;
+        Runnable release = this.fileContentRelease;
+        this.fileContentRelease = null;
+        if (release != null)
+            release.run();
+    }
+
+    /** Keep externally shared bytes out of the pool until their normal garbage-collection lifetime ends. */
+    public synchronized void abandonFileContentRelease() {
+        this.fileContentRelease = null;
+    }
+
+    /**
+     * Returns whether this instance already owns the file bytes in memory.
+     * This does not touch the filesystem.
+     */
+    public boolean hasInMemoryContent() {
+        return this.fileContent != null;
     }
     
     /**

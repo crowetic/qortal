@@ -24,6 +24,7 @@ import org.qortal.arbitrary.ArbitraryDataResource;
 import org.qortal.arbitrary.metadata.ArbitraryDataTransactionMetadata;
 import org.qortal.arbitrary.misc.Service;
 import org.qortal.controller.Controller;
+import org.qortal.data.arbitrary.ArbitraryResourceDirtyData;
 import org.qortal.data.transaction.ArbitraryTransactionData;
 import org.qortal.data.transaction.TransactionData;
 import org.qortal.event.DataMonitorEvent;
@@ -545,23 +546,23 @@ public class ArbitraryDataManager extends Thread {
 		}
 
 		final long deadline = System.currentTimeMillis() + LATEST_100_WORK_MS;
-		ArbitraryDataStorageManager storageManager = ArbitraryDataStorageManager.getInstance();
 
 		// Build the candidate list once for this burst
-		List<ArbitraryTransactionData> candidates = new ArrayList<>();
+		List<ArbitraryTransactionDataHashWrapper> candidates = new ArrayList<>();
 		try (final Repository repository = RepositoryManager.getRepository()) {
-			List<ArbitraryTransactionData> recent = repository.getArbitraryRepository().getLatestArbitraryTransactions(LATEST_100_LIMIT);
+			List<ArbitraryTransactionDataHashWrapper> recent = repository.getArbitraryRepository()
+					.getLatestArbitraryMetadataCandidates(LATEST_100_LIMIT);
 			// Results are ordered by created_when DESC, so first occurrence of each resource key is the most recent
 			Set<String> seenResources = new HashSet<>();
-			for (ArbitraryTransactionData txData : recent) {
+			for (ArbitraryTransactionDataHashWrapper txData : recent) {
 				if (isStopping) break;
 				try {
 					if (txData.getMetadataHash() == null) continue;
 					// Deduplicate: only keep the most recent tx per (name, service, identifier)
 					String resourceKey = txData.getName() + "/" + txData.getService() + "/" + txData.getIdentifier();
 					if (!seenResources.add(resourceKey)) continue;
-					ArbitraryTransaction tx = new ArbitraryTransaction(repository, txData);
-					if (!storageManager.isBlocked(txData) && !hasLocalMetadata(tx)) {
+					if (!ListUtils.isNameBlocked(txData.getName())
+							&& !hasLocalMetadata(txData.getSignature(), txData.getMetadataHash())) {
 						candidates.add(txData);
 					}
 				} catch (Exception e) {
@@ -578,20 +579,21 @@ public class ArbitraryDataManager extends Thread {
 		}
 
 
-		for (ArbitraryTransactionData txData : candidates) {
+		for (ArbitraryTransactionDataHashWrapper txData : candidates) {
 			if (isStopping || System.currentTimeMillis() >= deadline) break;
 
 			Thread.sleep(200L);
 
 			fetchMetadataForBurst(txData);
 
-			if (txData.getService() != null) {
+			Service service = Service.valueOf(txData.getService());
+			if (service != null) {
 				EventBus.INSTANCE.notify(
 						new DataMonitorEvent(
 								System.currentTimeMillis(),
 								txData.getIdentifier(),
 								txData.getName(),
-								txData.getService().name(),
+								service.name(),
 								"fetched metadata (latest-100)",
 								txData.getTimestamp(),
 								txData.getTimestamp()
@@ -769,6 +771,20 @@ public class ArbitraryDataManager extends Thread {
 		return ArbitraryMetadataManager.getInstance().fetchMetadataForBurst(resource);
 	}
 
+	private ArbitraryDataTransactionMetadata fetchMetadataForBurst(ArbitraryTransactionDataHashWrapper transactionData) {
+		Service service = Service.valueOf(transactionData.getService());
+		if (service == null)
+			return null;
+
+		ArbitraryDataResource resource = new ArbitraryDataResource(
+				transactionData.getName(),
+				ArbitraryDataFile.ResourceIdType.NAME,
+				service,
+				transactionData.getIdentifier()
+		);
+		return ArbitraryMetadataManager.getInstance().fetchMetadataForBurst(resource);
+	}
+
 
 	// Useful methods used by other parts of the app
 
@@ -908,7 +924,8 @@ public class ArbitraryDataManager extends Thread {
 		}
 
 		// Add to queue for update/deletion
-		ArbitraryDataCacheManager.getInstance().addToUpdateQueue(arbitraryTransactionData);
+		ArbitraryDataCacheManager.getInstance().addToUpdateQueue(arbitraryTransactionData,
+				ArbitraryResourceDirtyData.ALL_DIRTY | ArbitraryResourceDirtyData.RESOURCE_EXPIRED);
 
 	}
 

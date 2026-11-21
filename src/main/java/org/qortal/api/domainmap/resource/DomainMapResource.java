@@ -26,14 +26,16 @@ public class DomainMapResource {
 
 
     @GET
-    public HttpServletResponse getIndexByDomainMap() {
-        return this.getDomainMap("/");
+    public void getIndexByDomainMap() throws java.io.IOException {
+        this.getDomainMap("/");
+        response.flushBuffer();
     }
 
     @GET
     @Path("{path:.*}")
-    public HttpServletResponse getPathByDomainMap(@PathParam("path") String inPath) {
-        return this.getDomainMap(inPath);
+    public void getPathByDomainMap(@PathParam("path") String inPath) throws java.io.IOException {
+        this.getDomainMap(inPath);
+        response.flushBuffer();
     }
 
     private HttpServletResponse getDomainMap(String inPath) {

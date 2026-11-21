@@ -3,21 +3,23 @@ package org.qortal.arbitrary;
 import java.io.File;
 import java.io.IOException;
 import java.io.InvalidObjectException;
+import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.DirectoryNotEmptyException;
-import java.nio.file.FileVisitResult;
+import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
 import java.nio.file.InvalidPathException;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.nio.file.SimpleFileVisitor;
-import java.nio.file.attribute.BasicFileAttributes;
+import java.nio.file.StandardCopyOption;
 import java.security.InvalidAlgorithmParameterException;
 import java.security.InvalidKeyException;
 import java.security.NoSuchAlgorithmException;
 import java.util.Arrays;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 import javax.crypto.BadPaddingException;
 import javax.crypto.IllegalBlockSizeException;
@@ -29,10 +31,10 @@ import org.apache.commons.io.FileUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.qortal.arbitrary.ArbitraryDataFile.ResourceIdType;
-import org.qortal.arbitrary.exception.DataNotPublishedException;
 import org.qortal.arbitrary.exception.MissingDataException;
 import org.qortal.arbitrary.misc.Service;
 import org.qortal.controller.arbitrary.ArbitraryDataBuildManager;
+import org.qortal.controller.arbitrary.ArbitraryResourceStateRegistry;
 import org.qortal.controller.arbitrary.ArbitraryDataManager;
 import org.qortal.crypto.AES;
 import org.qortal.data.transaction.ArbitraryTransactionData;
@@ -47,7 +49,6 @@ import org.qortal.utils.ArbitraryTransactionUtils;
 import org.qortal.utils.Base58;
 import org.qortal.utils.FilesystemUtils;
 import org.qortal.utils.ListUtils;
-import org.qortal.utils.NTP;
 import org.qortal.utils.StringUtils;
 import org.qortal.utils.ZipUtils;
 
@@ -78,9 +79,33 @@ public class ArbitraryDataReader {
     // Track if decrypt+unzip was combined in a single pass (optimization)
     private boolean decryptAndUnzipCombined = false;
 
-    // Track resources that are currently being loaded, to avoid duplicate concurrent builds
-    // TODO: all builds could be handled by the build queue (even synchronous ones), to avoid the need for this
-    private static Map<String, Long> inProgress = Collections.synchronizedMap(new HashMap<>());
+    // Ownership covers cache checks, preparation, extraction and validation. Key by the actual
+    // working path so different callers that address the same output cannot build it concurrently.
+    private static final ConcurrentHashMap<Path, CompletableFuture<LoadResult>> inProgress = new ConcurrentHashMap<>();
+
+    private static final class LoadResult {
+        private final Path path;
+        private final int layers;
+        private final byte[] signature;
+        private final boolean rebuilt;
+
+        private LoadResult(ArbitraryDataReader reader, boolean rebuilt) {
+            this.path = reader.filePath;
+            this.layers = reader.layerCount;
+            this.signature = reader.latestSignature != null ? reader.latestSignature.clone() : null;
+            this.rebuilt = rebuilt;
+        }
+
+        private void applyTo(ArbitraryDataReader reader) {
+            reader.filePath = this.path;
+            reader.layerCount = this.layers;
+            reader.latestSignature = this.signature != null ? this.signature.clone() : null;
+        }
+    }
+
+    private Path loadKey() {
+        return this.workingPath.toAbsolutePath().normalize();
+    }
 
     public ArbitraryDataReader(String resourceId, ResourceIdType resourceIdType, Service service, String identifier) throws DataException {
         // Ensure names are always lowercase
@@ -121,7 +146,7 @@ public class ArbitraryDataReader {
     public boolean isCachedDataAvailable() {
         // If this resource is in the build queue then we shouldn't attempt to serve
         // cached data, as it may not be fully built
-        if (ArbitraryDataBuildManager.getInstance().isInBuildQueue(this.createQueueItem())) {
+        if (this.isBuilding()) {
             return false;
         }
 
@@ -136,7 +161,8 @@ public class ArbitraryDataReader {
     }
 
     public boolean isBuilding() {
-        return ArbitraryDataBuildManager.getInstance().isInBuildQueue(this.createQueueItem());
+        return inProgress.containsKey(this.loadKey()) || ArbitraryDataBuildManager.getInstance()
+                .isInBuildQueue(this.resourceId, this.resourceIdType, this.service, this.identifier);
     }
 
     private ArbitraryDataBuildQueueItem createQueueItem() {
@@ -160,6 +186,8 @@ public class ArbitraryDataReader {
      * @return true if added or already present in queue; false if not
      */
     public boolean loadAsynchronously(boolean overwrite, int priority) {
+        if (inProgress.containsKey(this.loadKey()))
+            return true;
         ArbitraryDataCache cache = new ArbitraryDataCache(this.uncompressedPath, overwrite,
                 this.resourceId, this.resourceIdType, this.service, this.identifier);
         if (cache.isCachedDataAvailable()) {
@@ -183,126 +211,206 @@ public class ArbitraryDataReader {
      * @param overwrite - set to true to force rebuild an existing cache
      */
     public void loadSynchronously(boolean overwrite) throws DataException, IOException, MissingDataException {
-        try {
-            ArbitraryDataCache cache = new ArbitraryDataCache(this.uncompressedPath, overwrite,
-                    this.resourceId, this.resourceIdType, this.service, this.identifier);
-            if (cache.isCachedDataAvailable()) {
-                // Use cached data
-                this.filePath = this.uncompressedPath;
+        this.loadSynchronously(overwrite, this.loadWaitTimeoutMillis());
+    }
+
+    /**
+     * API callers must respect builds already queued by the scheduler. Once a build
+     * starts, join its future; do not spin or start a second build outside the queue.
+     * Preserve the synchronous API's wait-for-completion behavior without imposing
+     * a new deadline. Both queue and active-build waits remain interruptible.
+     */
+    public void loadSynchronouslyWhenReady(boolean overwrite, java.util.function.BooleanSupplier stopping)
+            throws DataException, IOException, MissingDataException {
+        this.loadSynchronously(overwrite, 0, stopping);
+    }
+
+    /** Bound a request's queue/join wait without cancelling the owning build. */
+    public void loadSynchronouslyWhenReady(boolean overwrite, java.util.function.BooleanSupplier stopping,
+            long timeoutMillis) throws DataException, IOException, MissingDataException {
+        if (timeoutMillis <= 0)
+            throw new IllegalArgumentException("Wait timeout must be positive");
+        long started = System.nanoTime();
+        long timeoutNanos = TimeUnit.MILLISECONDS.toNanos(timeoutMillis);
+        java.util.concurrent.atomic.AtomicBoolean timedOut = new java.util.concurrent.atomic.AtomicBoolean();
+        java.util.function.BooleanSupplier expired = () -> {
+            boolean elapsed = System.nanoTime() - started >= timeoutNanos;
+            if (elapsed) timedOut.set(true);
+            return elapsed;
+        };
+        this.loadSynchronously(overwrite, timeoutMillis, () -> stopping.getAsBoolean() || expired.getAsBoolean());
+        if (stopping.getAsBoolean())
+            throw new DataException("Node is stopping");
+        if (timedOut.get())
+            throw new DataException("Timed out waiting for QDN data", new TimeoutException("QDN request wait expired"));
+    }
+
+    private void waitForQueuedBuild(java.util.function.BooleanSupplier stopping) throws DataException {
+        while (!stopping.getAsBoolean() && !inProgress.containsKey(this.loadKey()) && this.isQueuedForBuild()) {
+            try {
+                Thread.sleep(50);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new DataException("Interrupted while waiting for queued load", e);
+            }
+        }
+    }
+
+    boolean isQueuedForBuild() {
+        return ArbitraryDataBuildManager.getInstance().isInBuildQueue(
+                this.resourceId, this.resourceIdType, this.service, this.identifier);
+    }
+
+    /**
+     * Load with a timeout for joining an existing build. Zero waits until that build finishes
+     * (still interruptibly), so a queue worker does not report a healthy long build as failed.
+     */
+    public void loadSynchronously(boolean overwrite, long waitTimeoutMillis) throws DataException, IOException, MissingDataException {
+        this.loadSynchronously(overwrite, waitTimeoutMillis, null);
+    }
+
+    private void loadSynchronously(boolean overwrite, long waitTimeoutMillis,
+            java.util.function.BooleanSupplier stopping) throws DataException, IOException, MissingDataException {
+        if (waitTimeoutMillis < 0)
+            throw new IllegalArgumentException("Wait timeout must not be negative");
+        Path key = this.loadKey();
+        CompletableFuture<LoadResult> started = new CompletableFuture<>();
+        while (true) {
+            if (stopping != null) {
+                // Recheck the queue after joining a cache hit that did not satisfy
+                // a forced rebuild, as well as before the initial attempt.
+                this.waitForQueuedBuild(stopping);
+                if (stopping.getAsBoolean())
+                    return;
+            }
+            CompletableFuture<LoadResult> existing = inProgress.putIfAbsent(key, started);
+            if (existing == null)
+                break;
+            LoadResult result = this.awaitLoad(existing, waitTimeoutMillis, stopping);
+            if (result == null) // This waiter stopped; the owning build is unaffected.
+                return;
+            if (!overwrite || result.rebuilt) {
+                result.applyTo(this);
                 return;
             }
+            // A concurrent cache check does not satisfy a forced rebuild. Its work has
+            // completed, so release only that completed claim and compete for the next one.
+            inProgress.remove(key, existing);
+        }
 
-            this.arbitraryDataResource = this.createArbitraryDataResource();
+        boolean building = false;
+        try {
+            if (!this.loadFromCache(overwrite)) {
+                building = true;
+                this.invalidateResourceStatus();
+                this.loadOwned();
+            }
+            started.complete(new LoadResult(this, building));
+        } catch (DataException | IOException | MissingDataException | RuntimeException | Error e) {
+            started.completeExceptionally(e);
+            throw e;
+        } finally {
+            inProgress.remove(key, started);
+            if (building)
+                this.invalidateResourceStatus();
+        }
+    }
 
-            // Don't allow duplicate loads
-            if (!this.canStartLoading()) {
-                LOGGER.debug("Skipping duplicate load of {} - waiting for other thread to complete", this.arbitraryDataResource);
-                
-                // Another thread is loading this resource
-                // Wait for it to complete (up to 60 seconds)
-                int maxWaitMs = 60000;
-                int waitedMs = 0;
-                int sleepMs = 200;
-                
-                while (waitedMs < maxWaitMs) {
-                    try {
-                        Thread.sleep(sleepMs);
-                        waitedMs += sleepMs;
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                        throw new DataException("Interrupted while waiting for concurrent load");
-                    }
-                    
-                    // Check if data is now available
-                    ArbitraryDataCache updatedCache = new ArbitraryDataCache(this.uncompressedPath, false,
-                            this.resourceId, this.resourceIdType, this.service, this.identifier);
-                    if (updatedCache.isCachedDataAvailable()) {
-                        this.filePath = this.uncompressedPath;
-                        return;
-                    }
-                    
-                    // Check if the other thread finished (no longer in progress)
-                    if (!ArbitraryDataReader.inProgress.containsKey(this.arbitraryDataResource.getUniqueKey())) {
-                        // Other thread finished but data isn't cached - proceed to load ourselves
-                        break;
-                    }
-                }
-                
-                // If we waited max time and data still isn't available, throw exception
-                if (waitedMs >= maxWaitMs) {
-                    throw new DataException("Timeout waiting for concurrent load to complete");
-                }
-                
-                // If we get here, the other thread finished but data isn't available
-                // Fall through to try loading ourselves
-                LOGGER.debug("Other thread finished but data not available for {} - attempting load", this.arbitraryDataResource);
-                
-                // Try to acquire the lock again
-                if (!this.canStartLoading()) {
-                    throw new DataException("Unable to acquire load lock after waiting");
+    private LoadResult awaitLoad(CompletableFuture<LoadResult> existing, long timeoutMillis,
+            java.util.function.BooleanSupplier stopping) throws DataException, IOException, MissingDataException {
+        try {
+            if (stopping == null)
+                return timeoutMillis == 0 ? existing.get() : existing.get(timeoutMillis, TimeUnit.MILLISECONDS);
+            long started = System.nanoTime();
+            while (!stopping.getAsBoolean()) {
+                long elapsed = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
+                if (timeoutMillis > 0 && elapsed >= timeoutMillis)
+                    throw new TimeoutException();
+                long wait = timeoutMillis == 0 ? 50 : Math.min(50, timeoutMillis - elapsed);
+                try {
+                    return existing.get(wait, TimeUnit.MILLISECONDS);
+                } catch (TimeoutException stillBuilding) {
+                    // Observe shutdown without cancelling or releasing another caller's build.
                 }
             }
+            return null;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new DataException("Interrupted while waiting for concurrent load", e);
+        } catch (TimeoutException e) {
+            // This caller owns no files and must not cancel or clean up the active build.
+            throw new DataException("Timeout waiting for concurrent load to complete", e);
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof DataException)
+                throw (DataException) cause;
+            if (cause instanceof IOException)
+                throw (IOException) cause;
+            if (cause instanceof MissingDataException)
+                throw (MissingDataException) cause;
+            if (cause instanceof RuntimeException)
+                throw (RuntimeException) cause;
+            if (cause instanceof Error)
+                throw (Error) cause;
+            throw new DataException("Concurrent load failed", cause);
+        }
+    }
 
+    long loadWaitTimeoutMillis() {
+        return 60_000L;
+    }
+
+    boolean loadFromCache(boolean overwrite) {
+        ArbitraryDataCache cache = new ArbitraryDataCache(this.uncompressedPath, overwrite,
+                this.resourceId, this.resourceIdType, this.service, this.identifier);
+        if (!cache.isCachedDataAvailable())
+            return false;
+        this.filePath = this.uncompressedPath;
+        return true;
+    }
+
+    private void invalidateResourceStatus() {
+        if (this.resourceIdType == ResourceIdType.NAME)
+            ArbitraryResourceStateRegistry.getInstance().invalidate(this.service, this.resourceId, this.identifier);
+    }
+
+    private void loadOwned() throws DataException, IOException, MissingDataException {
+        boolean buildStarted = false;
+        try {
+            this.arbitraryDataResource = this.createArbitraryDataResource();
+            this.checkEnabled();
+            ArbitraryDataBuildManager.getInstance().setBuildInProgress(true);
+            buildStarted = true;
             this.preExecute();
-            this.deleteExistingFiles();
+            this.decryptAndUnzipCombined = false;
             this.fetch();
             this.decrypt();
-            
-            // Only uncompress if we haven't already done it during decrypt
-            if (!this.decryptAndUnzipCombined) {
+            if (!this.decryptAndUnzipCombined)
                 this.uncompress();
-            }
-            
             this.validate();
-
-        } catch (DataNotPublishedException e) {
-            if (e.getMessage() != null) {
-                // Log the message only, to avoid spamming the logs with a full stack trace
-                LOGGER.debug("DataNotPublishedException when trying to load QDN resource: {}", e.getMessage());
-            }
-            this.deleteWorkingDirectory();
+        } catch (DataException | IOException | MissingDataException | RuntimeException | Error e) {
+            if (buildStarted)
+                this.deleteWorkingDirectory();
             throw e;
-
-        } catch (DataException e) {
-            LOGGER.debug("DataException when trying to load QDN resource", e);
-            this.deleteWorkingDirectory();
-            throw e;
-
         } finally {
-            this.postExecute();
+            if (buildStarted)
+                this.postExecute();
         }
     }
 
     private void preExecute() throws DataException {
-        ArbitraryDataBuildManager.getInstance().setBuildInProgress(true);
-
-        this.checkEnabled();
         this.createWorkingDirectory();
         this.createUncompressedDirectory();
     }
 
     private void postExecute() {
         ArbitraryDataBuildManager.getInstance().setBuildInProgress(false);
-
-        this.arbitraryDataResource = this.createArbitraryDataResource();
-        ArbitraryDataReader.inProgress.remove(this.arbitraryDataResource.getUniqueKey());
     }
 
     private void checkEnabled() throws DataException {
         if (!Settings.getInstance().isQdnEnabled()) {
             throw new DataException("QDN is disabled in settings");
         }
-    }
-
-    private boolean canStartLoading() {
-        // Avoid duplicate builds if we're already loading this resource
-        String uniqueKey = this.arbitraryDataResource.getUniqueKey();
-        if (ArbitraryDataReader.inProgress.containsKey(uniqueKey)) {
-            return false;
-        }
-        ArbitraryDataReader.inProgress.put(uniqueKey, NTP.getTime());
-
-        return true;
     }
 
     private void createWorkingDirectory() throws DataException {
@@ -319,8 +427,9 @@ public class ArbitraryDataReader {
      */
     private void deleteWorkingDirectory() {
         try {
-            FilesystemUtils.safeDeleteDirectory(this.workingPath, true);
-        } catch (IOException e) {
+            if (Files.isDirectory(this.workingPath))
+                FilesystemUtils.safeDeleteDirectory(this.workingPath, true);
+        } catch (IOException | IllegalArgumentException e) {
             // Ignore failures as this isn't an essential step
             LOGGER.info("Unable to delete working path {}: {}", this.workingPath, e.getMessage());
         }
@@ -338,44 +447,7 @@ public class ArbitraryDataReader {
         }
     }
 
-    private void deleteExistingFiles() {
-        final Path uncompressedPath = this.uncompressedPath;
-        if (FilesystemUtils.pathInsideDataOrTempPath(uncompressedPath)) {
-            if (Files.exists(uncompressedPath)) {
-                LOGGER.trace("Attempting to delete path {}", this.uncompressedPath);
-                try {
-                    Files.walkFileTree(uncompressedPath, new SimpleFileVisitor<>() {
-
-                        @Override
-                        public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
-                            Files.delete(file);
-                            return FileVisitResult.CONTINUE;
-                        }
-
-                        @Override
-                        public FileVisitResult postVisitDirectory(Path dir, IOException e) throws IOException {
-                            // Don't delete the parent directory, as we want to leave an empty folder
-                            if (dir.compareTo(uncompressedPath) == 0) {
-                                return FileVisitResult.CONTINUE;
-                            }
-
-                            if (e == null) {
-                                Files.delete(dir);
-                                return FileVisitResult.CONTINUE;
-                            } else {
-                                throw e;
-                            }
-                        }
-
-                    });
-                } catch (IOException e) {
-                    LOGGER.debug("Unable to delete file or directory: {}", e.getMessage());
-                }
-            }
-        }
-    }
-
-    private void fetch() throws DataException, IOException, MissingDataException {
+    void fetch() throws DataException, IOException, MissingDataException {
         switch (resourceIdType) {
 
             case FILE_HASH:
@@ -709,16 +781,16 @@ public class ArbitraryDataReader {
             }
             // Ensure destination directory doesn't exist
             FileUtils.deleteDirectory(dest);
-            // Move files to destination
-            FilesystemUtils.copyAndReplaceDirectory(source.toString(), dest.toString());
+            // These are completed temporary builds. Rename on the same filesystem so large
+            // resources do not incur another full read/write pass before they can be served.
+            if (FilesystemUtils.pathInsideDataOrTempPath(this.filePath)) {
+                moveBuiltDirectory(source.toPath(), dest.toPath());
+            } else {
+                // Preserve externally supplied sources. Unlike the old helper, copy errors propagate.
+                FileUtils.copyDirectory(source, dest);
+            }
 
             try {
-                // Delete existing
-                if (FilesystemUtils.pathInsideDataOrTempPath(this.filePath)) {
-                    File directory = new File(this.filePath.toString());
-                    FileUtils.deleteDirectory(directory);
-                }
-
                 // ... and its parent directory if empty
                 Path parentDirectory = this.filePath.getParent();
                 if (FilesystemUtils.pathInsideDataOrTempPath(parentDirectory)) {
@@ -734,6 +806,41 @@ public class ArbitraryDataReader {
 
             // Finally, update filePath to point to uncompressedPath
             this.filePath = this.uncompressedPath;
+        }
+    }
+
+    /** Publish a completed directory; a failed fallback copy must leave the source intact. */
+    static void moveBuiltDirectory(Path source, Path destination) throws IOException {
+        if (Files.exists(destination))
+            throw new FileAlreadyExistsException(destination.toString());
+        Files.createDirectories(destination.getParent());
+        try {
+            Files.move(source, destination, StandardCopyOption.ATOMIC_MOVE);
+            return;
+        } catch (AtomicMoveNotSupportedException e) {
+            // Different filesystems (or a provider without atomic renames): copy to a private
+            // staging directory first so an incomplete tree is never published as the result.
+        }
+
+        Path staging = Files.createTempDirectory(destination.getParent(), ".qdn-build-");
+        try {
+            FileUtils.copyDirectory(source.toFile(), staging.toFile());
+            try {
+                Files.move(staging, destination, StandardCopyOption.ATOMIC_MOVE);
+            } catch (AtomicMoveNotSupportedException e) {
+                Files.move(staging, destination);
+            }
+        } finally {
+            if (Files.exists(staging))
+                FileUtils.deleteDirectory(staging.toFile());
+        }
+
+        // Publication succeeded. A leftover source can be cleaned later without discarding
+        // the successfully built destination.
+        try {
+            FileUtils.deleteDirectory(source.toFile());
+        } catch (IOException e) {
+            LOGGER.debug("Unable to remove source directory after publishing build: {}", e.getMessage());
         }
     }
 

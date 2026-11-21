@@ -57,6 +57,7 @@ public class ArbitraryDataStorageManager extends Thread {
     private long lastDirectorySizeCheck = 0;
 
     private List<ArbitraryTransactionData> hostedTransactions;
+    private long hostedTransactionsGeneration = -1L;
 
     private String searchQuery;
 
@@ -298,6 +299,22 @@ public class ArbitraryDataStorageManager extends Thread {
         
         List<ArbitraryTransactionData> arbitraryTransactionDataList = new ArrayList<>();
 
+        LocalQdnContentJournal contentJournal = LocalQdnContentJournal.getInstance();
+        if (contentJournal.isDiscoveryComplete()) {
+            try {
+                List<TransactionData> transactions = repository.getTransactionRepository()
+                        .fromSignatures(contentJournal.snapshotSignatures());
+                arbitraryTransactionDataList = transactions.stream()
+                        .filter(transaction -> transaction instanceof ArbitraryTransactionData)
+                        .map(transaction -> (ArbitraryTransactionData) transaction)
+                        .sorted(Comparator.comparingLong(ArbitraryTransactionData::getTimestamp).reversed())
+                        .collect(Collectors.toList());
+                return arbitraryTransactionDataList;
+            } catch (DataException e) {
+                LOGGER.warn("Unable to resolve QDN local-content journal; using legacy hosted-data scan", e);
+            }
+        }
+
         // Find all hosted paths
         List<Path> allPaths = this.findAllHostedPaths();
 
@@ -346,11 +363,16 @@ public class ArbitraryDataStorageManager extends Thread {
     public List<ArbitraryTransactionData> listAllHostedTransactions(Repository repository, Integer limit, Integer offset) {
         // Load from cache if we can, to avoid disk reads
 
-        if (this.hostedTransactions != null) {
+        LocalQdnContentJournal contentJournal = LocalQdnContentJournal.getInstance();
+
+        if (this.hostedTransactions != null
+                && (!contentJournal.isDiscoveryComplete()
+                || this.hostedTransactionsGeneration == contentJournal.getGeneration())) {
             return ArbitraryTransactionUtils.limitOffsetTransactions(this.hostedTransactions, limit, offset);
         }
 
         this.hostedTransactions = this.loadAllHostedTransactions(repository);
+        this.hostedTransactionsGeneration = contentJournal.getGeneration();
 
         return ArbitraryTransactionUtils.limitOffsetTransactions(this.hostedTransactions, limit, offset);
     }
@@ -367,8 +389,12 @@ public class ArbitraryDataStorageManager extends Thread {
 
     public List<ArbitraryTransactionData> searchHostedTransactions(Repository repository, String query, Integer limit, Integer offset) {
         // Using cache if we can, to avoid disk reads
-        if (this.hostedTransactions == null) {
+        LocalQdnContentJournal contentJournal = LocalQdnContentJournal.getInstance();
+        if (this.hostedTransactions == null
+                || (contentJournal.isDiscoveryComplete()
+                && this.hostedTransactionsGeneration != contentJournal.getGeneration())) {
             this.hostedTransactions = this.loadAllHostedTransactions(repository);
+            this.hostedTransactionsGeneration = contentJournal.getGeneration();
         }
 
         this.searchQuery = query.toLowerCase(); //set the searchQuery so that it can be checked on the next call
@@ -425,6 +451,7 @@ public class ArbitraryDataStorageManager extends Thread {
 
     public void invalidateHostedTransactionsCache() {
         this.hostedTransactions = null;
+        this.hostedTransactionsGeneration = -1L;
     }
 
 

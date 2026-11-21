@@ -7,6 +7,7 @@ import org.qortal.controller.Controller;
 import org.qortal.crypto.Crypto;
 import org.qortal.crypto.MemoryPoW;
 import org.qortal.network.message.*;
+import org.qortal.network.helper.PeerCapabilities;
 import org.qortal.settings.Settings;
 import org.qortal.utils.DaemonThreadFactory;
 import org.qortal.utils.NTP;
@@ -610,6 +611,8 @@ public enum Handshake {
 			capabilities = new HashMap<>();
 			if (Settings.getInstance().isQdnEnabled()) {
 				capabilities.put("QDN", Settings.getInstance().getQDNListenPort());
+				if (peer.getPeerType() == Peer.NETWORKDATA)
+					capabilities.put(PeerCapabilities.QDN_OPTIONAL_SOURCE_ADDRESS, true);
 			} else {
 				capabilities.put("QDN", 0);
 			}

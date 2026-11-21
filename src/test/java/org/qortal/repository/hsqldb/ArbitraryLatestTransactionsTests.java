@@ -77,7 +77,7 @@ public class ArbitraryLatestTransactionsTests extends Common {
             }
             repository.saveChanges();
             HSQLDBDatabaseUpdates.updateDatabase(repository.getConnection());
-            assertEquals(55, HSQLDBDatabaseUpdates.fetchDatabaseVersion(repository.getConnection()));
+            assertEquals(57, HSQLDBDatabaseUpdates.fetchDatabaseVersion(repository.getConnection()));
             HSQLDBDatabaseUpdates.updateDatabase(repository.getConnection());
             assertTimestampPlan(repository);
             assertArrayEquals(original.getSignature(), repository.getArbitraryRepository()
@@ -117,7 +117,7 @@ public class ArbitraryLatestTransactionsTests extends Common {
                 }
                 repository.saveChanges();
                 HSQLDBDatabaseUpdates.updateDatabase(repository.getConnection());
-                assertEquals(55, HSQLDBDatabaseUpdates.fetchDatabaseVersion(repository.getConnection()));
+                assertEquals(57, HSQLDBDatabaseUpdates.fetchDatabaseVersion(repository.getConnection()));
                 assertTimestampPlan(repository);
                 for (String[] index : new String[][]{
                         {"ARBITRARYRESOURCESCACHE", "ARBITRARYRESOURCESSERVICECREATEDINDEX"},

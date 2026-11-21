@@ -10,6 +10,7 @@ import org.qortal.controller.BlockMinter;
 import org.qortal.data.at.ATStateData;
 import org.qortal.data.block.BlockData;
 import org.qortal.data.transaction.TransactionData;
+import org.qortal.network.message.BlocksMessage;
 import org.qortal.repository.*;
 import org.qortal.repository.hsqldb.HSQLDBRepository;
 import org.qortal.settings.Settings;
@@ -25,6 +26,7 @@ import org.qortal.utils.NTP;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.sql.SQLException;
@@ -49,6 +51,85 @@ public class BlockArchiveV2Tests extends Common {
 		this.deleteArchiveDirectory();
 	}
 
+
+	@Test
+	public void testSequentialBatchReaderAndMessage() throws Exception {
+		try (final Repository repository = RepositoryManager.getRepository()) {
+			for (int i = 0; i < 12; ++i)
+				BlockMinter.mintTestingBlock(repository, Common.getTestAccount(repository, "alice-reward-share"));
+
+			BlockArchiveWriter firstWriter = new BlockArchiveWriter(2, 6, 2,
+					Paths.get(Settings.getInstance().getRepositoryPath(), "archive"), repository);
+			firstWriter.setShouldEnforceFileSizeTarget(false);
+			assertEquals(BlockArchiveWriter.BlockArchiveWriteResult.OK, firstWriter.write());
+
+			BlockArchiveWriter secondWriter = new BlockArchiveWriter(7, 12, 2,
+					Paths.get(Settings.getInstance().getRepositoryPath(), "archive"), repository);
+			secondWriter.setShouldEnforceFileSizeTarget(false);
+			assertEquals(BlockArchiveWriter.BlockArchiveWriteResult.OK, secondWriter.write());
+
+			BlockArchiveReader reader = BlockArchiveReader.getInstance();
+			List<BlockArchiveReader.SerializedBlock> archivedBlocks = reader.fetchSerializedBlocksFromHeight(
+					2, 10, BlocksMessage.getMaximumPayloadSize());
+			assertEquals(10, archivedBlocks.size());
+			assertEquals(2, archivedBlocks.get(0).getHeight());
+			assertEquals(11, archivedBlocks.get(9).getHeight());
+
+			BlockData genesis = repository.getBlockRepository().fromHeight(1);
+			BlocksMessage outgoing = new BlocksMessage(genesis.getSignature(), archivedBlocks);
+			byte[] payload = (byte[]) FieldUtils.readField(outgoing, "dataBytes", true);
+			BlocksMessage decoded = (BlocksMessage) BlocksMessage.fromByteBuffer(123, ByteBuffer.wrap(payload));
+			assertNotNull(decoded);
+			assertEquals(10, decoded.getBlocks().size());
+
+			for (int i = 0; i < decoded.getBlocks().size(); ++i) {
+				BlockData expected = repository.getBlockRepository().fromHeight(i + 2);
+				BlockData actual = decoded.getBlocks().get(i).getBlockData();
+				assertEquals(i + 2, actual.getHeight().intValue());
+				assertArrayEquals(expected.getSignature(), actual.getSignature());
+			}
+
+			int oneBlockLimit = Integer.BYTES + archivedBlocks.get(0).getWireSize();
+			assertEquals(1, reader.fetchSerializedBlocksFromHeight(2, 10, oneBlockLimit).size());
+			assertTrue(reader.fetchSerializedBlocksFromHeight(13, 10,
+					BlocksMessage.getMaximumPayloadSize()).isEmpty());
+
+			byte[] firstBytes = archivedBlocks.get(0).getBytes();
+			int referenceOffset = Integer.BYTES + Long.BYTES;
+			firstBytes[referenceOffset] ^= 1;
+			try {
+				new BlocksMessage(genesis.getSignature(), archivedBlocks);
+				fail("Expected a broken archive parent link to be rejected");
+			} catch (TransformationException expected) {
+				// Expected
+			} finally {
+				firstBytes[referenceOffset] ^= 1;
+			}
+		}
+	}
+
+	@Test
+	public void testIncompleteArchiveDoesNotPublishIndexRows() throws Exception {
+		try (final Repository repository = RepositoryManager.getRepository()) {
+			for (int i = 0; i < 5; ++i)
+				BlockMinter.mintTestingBlock(repository, Common.getTestAccount(repository, "alice-reward-share"));
+
+			BlockData block2 = repository.getBlockRepository().fromHeight(2);
+			assertNotNull(block2);
+
+			BlockArchiveWriter writer = new BlockArchiveWriter(2, 6, 2,
+					Paths.get(Settings.getInstance().getRepositoryPath(), "archive"), repository);
+			writer.setFileSizeTarget(Long.MAX_VALUE);
+			assertEquals(BlockArchiveWriter.BlockArchiveWriteResult.NOT_ENOUGH_BLOCKS, writer.write());
+
+			assertNull(repository.getBlockArchiveRepository()
+					.getBlockArchiveDataForSignature(block2.getSignature()));
+			File archiveDirectory = Paths.get(Settings.getInstance().getRepositoryPath(), "archive").toFile();
+			File[] temporaryFiles = archiveDirectory.listFiles((directory, name) -> name.endsWith(".tmp"));
+			assertNotNull(temporaryFiles);
+			assertEquals(0, temporaryFiles.length);
+		}
+	}
 
 	@Test
 	public void testWriter() throws DataException, InterruptedException, TransformationException, IOException {
@@ -389,11 +470,10 @@ public class BlockArchiveV2Tests extends Common {
 
 			// Prune the AT states for the archived blocks
 			System.out.println("Pruning AT states up to height 900...");
-			repository.getATRepository().rebuildLatestAtStates(900);
 			repository.saveChanges();
 			int numATStatesPruned = repository.getATRepository().pruneAtStates(0, 900);
-			System.out.println("Number of AT states pruned (Expected 898): " + numATStatesPruned);
-			assertEquals(900-2, numATStatesPruned); // Minus 1 for genesis block, and another for the latest AT state
+				System.out.println("Number of AT block results pruned (Expected 899): " + numATStatesPruned);
+				assertEquals(900-1, numATStatesPruned);
 			repository.getATRepository().setAtPruneHeight(901);
 
 			// Now ensure the SQL repository is missing blocks 2 and 900...
@@ -454,18 +534,18 @@ public class BlockArchiveV2Tests extends Common {
 			System.out.println("Trimming first 500 blocks...");
 			repository.getBlockRepository().trimOldOnlineAccountsSignatures(0, 500);
 			repository.getBlockRepository().setOnlineAccountsSignaturesTrimHeight(501);
-			repository.getATRepository().rebuildLatestAtStates(500);
 			repository.getATRepository().trimAtStates(0, 500, 1000);
 			repository.getATRepository().setAtTrimHeight(501);
 			System.out.println("Trimming completed.");
 
-			// Now block 499 should only have the AT state data hash
+				// Content-addressed payloads can remain readable when a newer/current state
+				// shares the same immutable bytes.
 			System.out.println("Checking block 499 AT state data...");
 			List<ATStateData> block499AtStatesData = repository.getATRepository().getBlockATStatesAtHeight(499);
 			atStatesData = repository.getATRepository().getATStateAtHeight(block499AtStatesData.get(0).getATAddress(), 499);
 			assertNotNull(atStatesData.getStateHash());
-			assertNull(atStatesData.getStateData());
-			System.out.println("Block 499 AT state data contains only state hash as expected.");
+				assertNotNull(atStatesData.getStateData());
+				System.out.println("Block 499 shares a retained immutable payload as expected.");
 
 			// ... but block 500 should have the full data (due to being retained as the "latest" AT state in the trimmed range
 			System.out.println("Verifying block 500 AT state data again...");
@@ -528,11 +608,10 @@ public class BlockArchiveV2Tests extends Common {
 
 			// Prune the AT states for the archived blocks
 			System.out.println("Pruning AT states up to height 500...");
-			repository.getATRepository().rebuildLatestAtStates(500);
 			repository.saveChanges();
 			int numATStatesPruned = repository.getATRepository().pruneAtStates(2, 500);
-			System.out.println("Number of AT states pruned (Expected 498): " + numATStatesPruned);
-			assertEquals(498, numATStatesPruned); // Minus 1 for genesis block, and another for the latest AT state
+			System.out.println("Number of AT block results pruned (Expected 499): " + numATStatesPruned);
+			assertEquals(499, numATStatesPruned);
 			repository.getATRepository().setAtPruneHeight(501);
 
 			// Now ensure the SQL repository is missing blocks 2 and 500...
@@ -581,64 +660,35 @@ public class BlockArchiveV2Tests extends Common {
 			assertEquals(block3DataPreArchive.getHeight(), block3DataPostArchive.getHeight());
 			System.out.println("Block 3 data matches the original.");
 
-			// Orphan 2 more block, which should be the last one that is possible to be orphaned
-			// TODO: figure out why this is 1 block more than in the equivalent block archive V1 test
-			System.out.println("Orphaning 2 more blocks...");
-			BlockUtils.orphanBlocks(repository, 2);
-			System.out.println("Orphaned 2 blocks successfully.");
+			// These unpruned blocks still have individual AT receipts in the repository.
+			// The retained-state row supplies the exact VM payload at the trim boundary.
+			System.out.println("Orphaning 1 more block...");
+			BlockUtils.orphanBlocks(repository, 1);
+			System.out.println("Orphaned 1 block successfully.");
+			System.out.println("Orphaning the retained AT boundary block...");
+			BlockUtils.orphanBlocks(repository, 1);
+			System.out.println("Retained AT boundary block orphaned successfully.");
 
-			// Orphan another block, which should fail
-			System.out.println("Attempting to orphan another block, which should fail...");
-			Exception exception = null;
+			// V2 imports only the combined AT hash, so the next block's pruned individual
+			// state summaries are unavailable even before we try to load its parent payload.
+			System.out.println("Attempting to orphan beyond retained AT data...");
+			int retainedBoundaryHeight = repository.getBlockRepository().getBlockchainHeight();
+			int expectedATCount = repository.getBlockRepository().getLastBlock().getATCount();
+			assertTrue(expectedATCount > 0);
+			assertTrue(repository.getATRepository().getBlockATStatesAtHeight(retainedBoundaryHeight).isEmpty());
 			try {
 				BlockUtils.orphanBlocks(repository, 1);
+				fail("Orphaning without individual AT state summaries must fail");
 			} catch (DataException e) {
-				exception = e;
-				System.out.println("Caught expected DataException: " + e.getMessage());
+				assertEquals(String.format("AT state summary count mismatch at block %d: expected %d, found 0",
+						retainedBoundaryHeight, expectedATCount), e.getMessage());
+			} finally {
+				repository.discardChanges();
 			}
 
-			// Ensure that a DataException is thrown because there is no more AT states data available
-			assertNotNull(exception);
-			assertEquals(DataException.class, exception.getClass());
-			System.out.println("DataException confirmed due to lack of AT states data.");
-
-			// FUTURE: we may be able to retain unique AT states when trimming, to avoid this exception
-			// and allow orphaning back through blocks with trimmed AT states.
+			assertEquals(retainedBoundaryHeight, repository.getBlockRepository().getBlockchainHeight());
 
 			System.out.println("testTrimArchivePruneAndOrphan completed successfully.");
-		}
-	}
-
-
-	/**
-	 * Many nodes are missing an ATStatesHeightIndex due to an earlier bug
-	 * In these cases we disable archiving and pruning as this index is a
-	 * very essential component in these processes.
-	 */
-	@Test
-	public void testMissingAtStatesHeightIndex() throws DataException, SQLException {
-		try (final HSQLDBRepository repository = (HSQLDBRepository) RepositoryManager.getRepository()) {
-
-			System.out.println("Starting testMissingAtStatesHeightIndex");
-
-			// Firstly check that we're able to prune or archive when the index exists
-			System.out.println("Checking existence of ATStatesHeightIndex...");
-			assertTrue(repository.getATRepository().hasAtStatesHeightIndex());
-			assertTrue(RepositoryManager.canArchiveOrPrune());
-			System.out.println("ATStatesHeightIndex exists. Archiving and pruning are possible.");
-
-			// Delete the index
-			System.out.println("Dropping ATStatesHeightIndex...");
-			repository.prepareStatement("DROP INDEX ATSTATESHEIGHTINDEX").execute();
-			System.out.println("ATStatesHeightIndex dropped.");
-
-			// Ensure check that we're unable to prune or archive when the index doesn't exist
-			System.out.println("Verifying that ATStatesHeightIndex no longer exists...");
-			assertFalse(repository.getATRepository().hasAtStatesHeightIndex());
-			assertFalse(RepositoryManager.canArchiveOrPrune());
-			System.out.println("ATStatesHeightIndex does not exist. Archiving and pruning are disabled.");
-
-			System.out.println("testMissingAtStatesHeightIndex completed successfully.");
 		}
 	}
 

@@ -1,98 +1,62 @@
 package org.qortal.api.resource;
 
+import org.junit.Before;
 import org.junit.Test;
 import org.qortal.arbitrary.ArbitraryDataReader;
+import org.qortal.arbitrary.ArbitraryDataFile.ResourceIdType;
 import org.qortal.arbitrary.exception.MissingDataException;
+import org.qortal.arbitrary.misc.Service;
 import org.qortal.repository.DataException;
-
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicReference;
-
+import org.qortal.test.common.Common;
 import static org.junit.Assert.*;
-import static org.mockito.Mockito.*;
 
 public class ArbitraryDownloadWaitTests {
+    @Before public void settings() throws Exception { Common.useDefaultSettings(); }
 
-    @Test
-    public void queuedBuildTimesOutWithoutBusyPolling() throws Exception {
-        ArbitraryDataReader reader = mock(ArbitraryDataReader.class);
-        when(reader.isBuilding()).thenReturn(true);
-        try {
-            ArbitraryResource.loadWithRetries(reader, false, 5, 50);
-            fail("A queued build must time out");
-        } catch (DataException failure) {
-            assertTrue(failure.getMessage().contains("Timed out"));
+    private static class Reader extends ArbitraryDataReader {
+        int calls;
+        int failures;
+        boolean rebuild;
+        Reader(int failures) throws DataException {
+            super("download-wait-test", ResourceIdType.FILE_HASH, Service.ARBITRARY_DATA, null);
+            this.failures = failures;
         }
-        verify(reader, atMost(2)).isBuilding();
-        verify(reader, never()).loadSynchronously(anyBoolean());
-    }
-
-    @Test
-    public void queuedBuildCanServeCompletedCache() throws Exception {
-        ArbitraryDataReader reader = mock(ArbitraryDataReader.class);
-        when(reader.isBuilding()).thenReturn(true);
-        when(reader.isCachedDataAvailable()).thenReturn(true);
-        ArbitraryResource.loadWithRetries(reader, false, 5, 5000);
-        verify(reader, never()).loadSynchronously(anyBoolean());
-    }
-
-    @Test
-    public void forcedRebuildDoesNotAcceptTheOldCache() throws Exception {
-        ArbitraryDataReader reader = mock(ArbitraryDataReader.class);
-        when(reader.isBuilding()).thenReturn(true, false);
-        ArbitraryResource.loadWithRetries(reader, true, 5, 5000);
-        verify(reader, never()).isCachedDataAvailable();
-        verify(reader).loadSynchronously(true);
-    }
-
-    @Test
-    public void missingDataRetriesAreCountedAsLoads() throws Exception {
-        ArbitraryDataReader reader = mock(ArbitraryDataReader.class);
-        doThrow(new MissingDataException("missing chunks")).when(reader).loadSynchronously(false);
-        try {
-            ArbitraryResource.loadWithRetries(reader, false, 2, 5000);
-            fail("Missing chunks must exhaust the retry budget");
-        } catch (MissingDataException expected) {
-            assertEquals("missing chunks", expected.getMessage());
-        }
-        verify(reader, times(3)).loadSynchronously(false);
-    }
-
-    @Test
-    public void waitingDoesNotConsumeTheLoadRetryBudget() throws Exception {
-        ArbitraryDataReader reader = mock(ArbitraryDataReader.class);
-        when(reader.isBuilding()).thenReturn(true, false);
-        ArbitraryResource.loadWithRetries(reader, false, 0, 5000);
-        verify(reader).loadSynchronously(false);
-    }
-
-    @Test
-    public void interruptionReleasesAWaitingRequest() throws Exception {
-        ArbitraryDataReader reader = mock(ArbitraryDataReader.class);
-        CountDownLatch polled = new CountDownLatch(1);
-        when(reader.isBuilding()).thenAnswer(invocation -> {
-            polled.countDown();
-            return true;
-        });
-        AtomicReference<Throwable> result = new AtomicReference<>();
-        Thread request = new Thread(() -> {
-            try {
-                ArbitraryResource.loadWithRetries(reader, false, 5, 60_000);
-            } catch (Throwable e) {
-                result.set(e);
-            }
-        });
-        request.start();
-        try {
-            assertTrue(polled.await(5, TimeUnit.SECONDS));
-            request.interrupt();
-            request.join(5000);
-            assertFalse(request.isAlive());
-            assertTrue(result.get() instanceof InterruptedException);
-        } finally {
-            request.interrupt();
-            request.join(5000);
+        @Override public boolean isBuilding() { throw new AssertionError("API must not poll isBuilding"); }
+        @Override public void loadSynchronouslyWhenReady(boolean rebuild, java.util.function.BooleanSupplier stopping, long timeoutMillis) throws MissingDataException {
+            this.rebuild = rebuild;
+            if (++calls <= failures) throw new MissingDataException("missing");
         }
     }
+
+    @Test public void preservesInitialAttemptAndRetryCount() throws Exception {
+        Reader successful = new Reader(2);
+        ArbitraryResource.loadForDownload(successful, true, 2, () -> false);
+        assertEquals(3, successful.calls);
+        assertTrue(successful.rebuild);
+        Reader failed = new Reader(10);
+        try {
+            ArbitraryResource.loadForDownload(failed, false, 2, () -> false);
+            fail("Expected missing data");
+        } catch (MissingDataException expected) { assertEquals(3, failed.calls); }
+    }
+
+    @Test public void stoppingDoesNotStartAnotherLoad() throws Exception {
+        Reader reader = new Reader(10);
+        try {
+            ArbitraryResource.loadForDownload(reader, false, 5, () -> reader.calls > 0);
+            fail("Stopped request must not be reported as loaded");
+        } catch (DataException expected) { assertTrue(expected.getMessage().contains("stopping")); }
+        assertEquals(1, reader.calls);
+    }
+    @Test public void retryPacingSharesTheRequestDeadline() throws Exception {
+        Reader reader = new Reader(10);
+        try {
+            ArbitraryResource.loadForDownload(reader, false, 5, () -> false, 50L);
+            fail("Requested chunks cannot consume an unbounded retry wait");
+        } catch (DataException expected) {
+            assertTrue(expected.getMessage(), expected.getMessage().contains("Timed out"));
+        }
+        assertEquals(1, reader.calls);
+    }
+
 }

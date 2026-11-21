@@ -4,7 +4,6 @@ import com.google.common.primitives.Longs;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
-import org.qortal.controller.Controller;
 import org.qortal.crypto.Crypto;
 import org.qortal.data.at.ATData;
 import org.qortal.data.at.ATStateData;
@@ -17,6 +16,9 @@ import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -27,22 +29,26 @@ import org.qortal.data.account.AccountData;
 public class HSQLDBATRepository implements ATRepository {
 
 	private static final Logger LOGGER = LogManager.getLogger(HSQLDBATRepository.class);
+	private static final int PAYLOAD_CLEANUP_SWEEP_HEIGHTS = 10_000;
+	private static final int MAX_PAYLOAD_BUNDLES_PER_TRIM = 512;
 
 	protected HSQLDBRepository repository;
+	private final HSQLDBATStore store;
 
 	public HSQLDBATRepository(HSQLDBRepository repository) {
 		this.repository = repository;
+		this.store = new HSQLDBATStore(repository);
 	}
 
 	// ATs
 
 	@Override
 	public ATData fromATAddress(String atAddress) throws DataException {
-		String sql = "SELECT creator, created_when, version, asset_id, code_bytes, code_hash, "
-				+ "is_sleeping, sleep_until_height, is_finished, had_fatal_error, "
-				+ "is_frozen, frozen_balance, sleep_until_message_timestamp "
-				+ "FROM ATs "
-				+ "WHERE AT_address = ? LIMIT 1";
+		String sql = "SELECT ATs.creator,ATs.created_when,ATs.version,ATs.asset_id,ATCode.code_bytes,ATs.code_hash, "
+				+ "ATCurrentState.is_sleeping,ATCurrentState.sleep_until_height,ATCurrentState.is_finished,ATCurrentState.had_fatal_error, "
+				+ "ATCurrentState.is_frozen,ATCurrentState.frozen_balance,ATCurrentState.sleep_until_message_timestamp "
+				+ "FROM ATDefinitions ATs JOIN ATCurrentState USING(AT_address) JOIN ATCode USING(code_hash) "
+				+ "WHERE ATs.AT_address = ? LIMIT 1";
 
 		try (ResultSet resultSet = this.repository.checkedExecute(sql, atAddress)) {
 			if (resultSet == null)
@@ -82,11 +88,11 @@ public class HSQLDBATRepository implements ATRepository {
 
 	@Override
 	public List<ATData> fromATAddresses(List<String> atAddresses) throws DataException {
-		String sql = "SELECT creator, created_when, version, asset_id, code_bytes, code_hash, "
-				+ "is_sleeping, sleep_until_height, is_finished, had_fatal_error, "
-				+ "is_frozen, frozen_balance, sleep_until_message_timestamp, AT_address "
-				+ "FROM ATs "
-				+ "WHERE AT_address IN ("
+		String sql = "SELECT ATs.creator,ATs.created_when,ATs.version,ATs.asset_id,ATCode.code_bytes,ATs.code_hash, "
+				+ "ATCurrentState.is_sleeping,ATCurrentState.sleep_until_height,ATCurrentState.is_finished,ATCurrentState.had_fatal_error, "
+				+ "ATCurrentState.is_frozen,ATCurrentState.frozen_balance,ATCurrentState.sleep_until_message_timestamp,ATs.AT_address "
+				+ "FROM ATDefinitions ATs JOIN ATCurrentState USING(AT_address) JOIN ATCode USING(code_hash) "
+				+ "WHERE ATs.AT_address IN ("
 				+ String.join(", ", Collections.nCopies(atAddresses.size(), "?"))
 				+ ")"
 				;
@@ -140,7 +146,7 @@ public class HSQLDBATRepository implements ATRepository {
 	@Override
 	public boolean exists(String atAddress) throws DataException {
 		try {
-			return this.repository.exists("ATs", "AT_address = ?", atAddress);
+			return this.repository.exists("ATDefinitions", "AT_address = ?", atAddress);
 		} catch (SQLException e) {
 			throw new DataException("Unable to check for AT in repository", e);
 		}
@@ -148,7 +154,7 @@ public class HSQLDBATRepository implements ATRepository {
 
 	@Override
 	public byte[] getCreatorPublicKey(String atAddress) throws DataException {
-		String sql = "SELECT creator FROM ATs WHERE AT_address = ?";
+		String sql = "SELECT creator FROM ATDefinitions WHERE AT_address = ?";
 
 		try (ResultSet resultSet = this.repository.checkedExecute(sql, atAddress)) {
 			if (resultSet == null)
@@ -162,12 +168,12 @@ public class HSQLDBATRepository implements ATRepository {
 
 	@Override
 	public List<ATData> getAllExecutableATs() throws DataException {
-		String sql = "SELECT AT_address, creator, created_when, version, asset_id, code_bytes, code_hash, "
-				+ "is_sleeping, sleep_until_height, had_fatal_error, "
-				+ "is_frozen, frozen_balance, sleep_until_message_timestamp "
-				+ "FROM ATs "
-				+ "WHERE is_finished = false "
-				+ "ORDER BY created_when ASC, AT_address DESC";
+		String sql = "SELECT ATs.AT_address,ATs.creator,ATs.created_when,ATs.version,ATs.asset_id,ATCode.code_bytes,ATs.code_hash, "
+				+ "ATCurrentState.is_sleeping,ATCurrentState.sleep_until_height,ATCurrentState.had_fatal_error, "
+				+ "ATCurrentState.is_frozen,ATCurrentState.frozen_balance,ATCurrentState.sleep_until_message_timestamp "
+				+ "FROM ATDefinitions ATs JOIN ATCurrentState USING(AT_address) JOIN ATCode USING(code_hash) "
+				+ "WHERE ATCurrentState.is_finished = false "
+				+ "ORDER BY ATs.created_when ASC,ATs.AT_address DESC";
 
 		List<ATData> executableATs = new ArrayList<>();
 
@@ -215,20 +221,40 @@ public class HSQLDBATRepository implements ATRepository {
 		}
 	}
 
+    @Override
+    public List<ATData> getATsForExecution(int candidateHeight) throws DataException {
+        String sql = "SELECT d.AT_address,d.creator,d.created_when,d.version,d.asset_id,d.code_hash,c.is_sleeping,c.sleep_until_height,"
+                + "c.is_finished,c.had_fatal_error,c.is_frozen,c.frozen_balance,c.sleep_until_message_timestamp "
+                + "FROM (SELECT AT_address FROM ATCurrentState WHERE schedule_class=0 "
+                + "UNION SELECT AT_address FROM ATCurrentState WHERE schedule_class=1 AND message_pending=TRUE "
+                + "UNION SELECT AT_address FROM ATCurrentState WHERE schedule_class=1 AND sleep_until_height<>0 AND sleep_until_height<=?) ready "
+                + "JOIN ATDefinitions d ON d.AT_address=ready.AT_address JOIN ATCurrentState c ON c.AT_address=d.AT_address "
+                + "ORDER BY d.created_when ASC,d.AT_address DESC";
+        List<ATData> result = new ArrayList<>();
+        try (ResultSet rs = repository.checkedExecute(sql, candidateHeight)) {
+            if (rs != null) do {
+                result.add(new ATData(rs.getString(1),rs.getBytes(2),rs.getLong(3),rs.getInt(4),rs.getLong(5),null,rs.getBytes(6),
+                        rs.getBoolean(7),(Integer)rs.getObject(8),rs.getBoolean(9),rs.getBoolean(10),rs.getBoolean(11),
+                        (Long)rs.getObject(12),(Long)rs.getObject(13)));
+            } while (rs.next());
+        } catch (SQLException e) { throw new DataException("Unable to select scheduled ATs",e); }
+        return result;
+    }
+
 	@Override
 	public List<ATData> getATsByFunctionality(byte[] codeHash, Boolean isExecutable, Integer limit, Integer offset, Boolean reverse) throws DataException {
 		StringBuilder sql = new StringBuilder(512);
 		List<Object> bindParams = new ArrayList<>();
 
-		sql.append("SELECT AT_address, creator, created_when, version, asset_id, code_bytes, ")
-				.append("is_sleeping, sleep_until_height, is_finished, had_fatal_error, ")
-				.append("is_frozen, frozen_balance, sleep_until_message_timestamp ")
-				.append("FROM ATs ")
+		sql.append("SELECT ATs.AT_address,ATs.creator,ATs.created_when,ATs.version,ATs.asset_id,ATCode.code_bytes, ")
+				.append("ATCurrentState.is_sleeping,ATCurrentState.sleep_until_height,ATCurrentState.is_finished,ATCurrentState.had_fatal_error, ")
+				.append("ATCurrentState.is_frozen,ATCurrentState.frozen_balance,ATCurrentState.sleep_until_message_timestamp ")
+				.append("FROM ATDefinitions ATs JOIN ATCurrentState USING(AT_address) JOIN ATCode USING(code_hash) ")
 				.append("WHERE code_hash = ? ");
 		bindParams.add(codeHash);
 
 		if (isExecutable != null) {
-			sql.append("AND is_finished != ? ");
+			sql.append("AND ATCurrentState.is_finished != ? ");
 			bindParams.add(isExecutable);
 		}
 
@@ -285,10 +311,25 @@ public class HSQLDBATRepository implements ATRepository {
 
 	@Override
 	public List<ATData> getAllATsByFunctionality(Set<ByteArray> codeHashes, Boolean isExecutable) throws DataException {
+		return getAllATsByFunctionality(codeHashes, isExecutable, null, true);
+	}
+
+	@Override
+	public List<ATData> getAllATsByFunctionalitySince(Set<ByteArray> codeHashes, Boolean isExecutable,
+			Integer minimumLatestStateHeight) throws DataException {
+		return getAllATsByFunctionality(codeHashes, isExecutable, minimumLatestStateHeight, false);
+	}
+
+	private List<ATData> getAllATsByFunctionality(Set<ByteArray> codeHashes, Boolean isExecutable,
+			Integer minimumLatestStateHeight, boolean includeCodeBytes) throws DataException {
+		if (codeHashes == null || codeHashes.isEmpty())
+			return new ArrayList<>();
+
 		StringBuilder sql = new StringBuilder(512);
 		List<Object> bindParams = new ArrayList<>();
 
-		sql.append("SELECT AT_address, creator, created_when, version, asset_id, code_bytes, ")
+		sql.append("SELECT AT_address, creator, created_when, version, asset_id, ")
+				.append(includeCodeBytes ? "code_bytes, " : "CAST(NULL AS BLOB), ")
 				.append("is_sleeping, sleep_until_height, is_finished, had_fatal_error, ")
 				.append("is_frozen, frozen_balance, code_hash, sleep_until_message_timestamp ")
 				.append("FROM ");
@@ -308,11 +349,19 @@ public class HSQLDBATRepository implements ATRepository {
 		}
 		sql.append(") AS ATCodeHashes (code_hash) ");
 
-		sql.append("JOIN ATs ON ATs.code_hash = ATCodeHashes.code_hash ");
+		sql.append("JOIN ATDefinitions ATs USING(code_hash) JOIN ATCurrentState USING(AT_address) JOIN ATCode USING(code_hash) ");
 
+		boolean hasWhere = false;
 		if (isExecutable != null) {
-			sql.append("AND is_finished != ? ");
+			sql.append("WHERE ATCurrentState.is_finished != ? ");
 			bindParams.add(isExecutable);
+			hasWhere = true;
+		}
+
+		if (minimumLatestStateHeight != null) {
+			sql.append(hasWhere ? "AND " : "WHERE ");
+			sql.append("ATCurrentState.latest_state_height >= ? ");
+			bindParams.add(minimumLatestStateHeight);
 		}
 
 		List<ATData> matchingATs = new ArrayList<>();
@@ -378,29 +427,51 @@ public class HSQLDBATRepository implements ATRepository {
 
 	@Override
 	public void save(ATData atData) throws DataException {
-		HSQLDBSaver saveHelper = new HSQLDBSaver("ATs");
+        try { store.saveDefinition(atData); }
+        catch (SQLException e) { throw new DataException("Unable to save AT", e); }
+    }
 
-		saveHelper.bind("AT_address", atData.getATAddress()).bind("creator", atData.getCreatorPublicKey()).bind("created_when", atData.getCreation())
-				.bind("version", atData.getVersion()).bind("asset_id", atData.getAssetId())
-				.bind("code_bytes", atData.getCodeBytes()).bind("code_hash", atData.getCodeHash())
-				.bind("is_sleeping", atData.getIsSleeping()).bind("sleep_until_height", atData.getSleepUntilHeight())
-				.bind("is_finished", atData.getIsFinished()).bind("had_fatal_error", atData.getHadFatalError()).bind("is_frozen", atData.getIsFrozen())
-				.bind("frozen_balance", atData.getFrozenBalance()).bind("sleep_until_message_timestamp", atData.getSleepUntilMessageTimestamp());
+    @Override
+    public void saveBlockResult(int height, byte[] blob, List<ATData> updatedHeads, List<ATStateData> states) throws DataException {
+        try { store.saveBlockResult(height, blob, updatedHeads, states); }
+        catch (SQLException e) { throw new DataException("Unable to save AT block result", e); }
+    }
 
-		try {
-			saveHelper.execute(this.repository);
-		} catch (SQLException e) {
-			throw new DataException("Unable to save AT into repository", e);
-		}
-	}
+    @Override
+    public byte[] getBlockResult(int height) throws DataException {
+        try { return store.readBlockResult(height); }
+        catch (SQLException e) { throw new DataException("Unable to read AT block result", e); }
+    }
+
+    @Override
+    public void deleteBlockResult(int height) throws DataException {
+        try { store.deleteBlockResult(height); }
+        catch (SQLException e) { throw new DataException("Unable to delete AT block result", e); }
+    }
+
+    @Override
+    public void saveATMetadata(List<ATData> ats) throws DataException {
+        try { store.saveHeads(ats); }
+        catch (SQLException e) { throw new DataException("Unable to restore AT metadata", e); }
+    }
 
 	@Override
 	public void delete(String atAddress) throws DataException {
 		try {
-			this.repository.delete("ATs", "AT_address = ?", atAddress);
+			this.repository.delete("ATDefinitions", "AT_address = ?", atAddress);
 			// AT States also deleted via ON DELETE CASCADE
 		} catch (SQLException e) {
 			throw new DataException("Unable to delete AT from repository", e);
+		}
+	}
+
+	@Override
+	public void setCurrentStateHead(String atAddress, int height, byte[] payloadHash) throws DataException {
+		try {
+			repository.executeCheckedUpdate("UPDATE ATCurrentState SET latest_state_height=?,payload_hash=? WHERE AT_address=?",
+				height, payloadHash, atAddress);
+		} catch (SQLException e) {
+			throw new DataException("Unable to set AT current state head", e);
 		}
 	}
 
@@ -408,111 +479,102 @@ public class HSQLDBATRepository implements ATRepository {
 
 	@Override
 	public ATStateData getATStateAtHeight(String atAddress, int height) throws DataException {
-		String sql = "SELECT state_data, state_hash, fees, is_initial, sleep_until_message_timestamp "
-				+ "FROM ATStates "
-				+ "LEFT OUTER JOIN ATStatesData USING (AT_address, height) "
-				+ "WHERE ATStates.AT_address = ? AND ATStates.height = ? "
-				+ "LIMIT 1";
+		try {
+			byte[] blob = store.readBlockResult(height);
+			if (blob != null) {
+				for (org.qortal.at.ATBlockResult.Entry e : org.qortal.at.ATBlockResult.deserialize(blob)) {
+					if (e.address.equals(atAddress)) {
+						byte[] data = store.stateIfPresent(atAddress, height, e.stateHash);
+						return new ATStateData(atAddress, height, data, e.stateHash, e.fees, e.isInitial, e.sleepUntilMessageTimestamp);
+					}
+				}
+			}
 
-		try (ResultSet resultSet = this.repository.checkedExecute(sql, atAddress, height)) {
-			if (resultSet == null)
-				return null;
-
-			byte[] stateData = resultSet.getBytes(1); // Actually BLOB
-			byte[] stateHash = resultSet.getBytes(2);
-			long fees = resultSet.getLong(3);
-			boolean isInitial = resultSet.getBoolean(4);
-
-			Long sleepUntilMessageTimestamp = resultSet.getLong(5);
-			if (sleepUntilMessageTimestamp == 0 && resultSet.wasNull())
-				sleepUntilMessageTimestamp = null;
-
-			return new ATStateData(atAddress, height, stateData, stateHash, fees, isInitial, sleepUntilMessageTimestamp);
+			try (ResultSet rs = repository.checkedExecute("SELECT s.state_hash,s.fees,s.is_initial,s.sleep_until_message_timestamp "
+					+ "FROM ATStates s "
+					+ "WHERE s.AT_address=? AND s.height=?", atAddress, height)) {
+				if (rs == null) return null;
+				byte[] hash = rs.getBytes(1);
+				return new ATStateData(atAddress, height, store.stateIfPresent(atAddress, height, hash), hash,
+						rs.getLong(2), rs.getBoolean(3), (Long) rs.getObject(4));
+			}
 		} catch (SQLException e) {
 			throw new DataException("Unable to fetch AT state from repository", e);
 		}
 	}
 
-	@Override
-	public ATStateData getLatestATState(String atAddress) throws DataException {
-		String sql = "SELECT height, state_data, state_hash, fees, is_initial, sleep_until_message_timestamp "
-				+ "FROM ATStates "
-				+ "JOIN ATStatesData USING (AT_address, height) "
-				+ "WHERE ATStates.AT_address = ? "
-				// Order by AT_address and height to use compound primary key as index
-				// Both must be the same direction (DESC) also
-				+ "ORDER BY ATStates.AT_address DESC, ATStates.height DESC "
-				+ "LIMIT 1 ";
+    @Override
+    public ATStateData getLatestATState(String atAddress) throws DataException {
+        List<ATStateData> states = getLatestATStates(Collections.singletonList(atAddress));
+        return states.isEmpty() ? null : states.get(0);
+    }
 
-		try (ResultSet resultSet = this.repository.checkedExecute(sql, atAddress)) {
-			if (resultSet == null)
-				return null;
+    @Override
+    public byte[] getCodePayload(byte[] hash) throws DataException {
+        try { return store.code(hash); }
+        catch (SQLException e) { throw new DataException("Unable to load AT code", e); }
+    }
 
-			int height = resultSet.getInt(1);
-			byte[] stateData = resultSet.getBytes(2); // Actually BLOB
-			byte[] stateHash = resultSet.getBytes(3);
-			long fees = resultSet.getLong(4);
-			boolean isInitial = resultSet.getBoolean(5);
-
-			Long sleepUntilMessageTimestamp = resultSet.getLong(6);
-			if (sleepUntilMessageTimestamp == 0 && resultSet.wasNull())
-				sleepUntilMessageTimestamp = null;
-
-			return new ATStateData(atAddress, height, stateData, stateHash, fees, isInitial, sleepUntilMessageTimestamp);
-		} catch (SQLException e) {
-			throw new DataException("Unable to fetch latest AT state from repository", e);
-		}
-	}
+    @Override
+    public byte[] getStatePayload(byte[] hash) throws DataException {
+        try { return store.state(hash); }
+        catch (SQLException e) { throw new DataException("Unable to load AT payload", e); }
+    }
 
 	@Override
-	public List<ATStateData> getLatestATStates(List<String> atAddresses) throws DataException{
-		String sql = "SELECT height, state_data, state_hash, fees, is_initial, sleep_until_message_timestamp, AT_address "
-				+ "FROM ATStates "
-				+ "JOIN ATStatesData USING (AT_address, height) "
-				+ "WHERE ATStates.AT_address IN ("
-				+ String.join(", ", Collections.nCopies(atAddresses.size(), "?"))
-				+ ")";
-
-		List<ATStateData> stateDataList;
-
-		try (ResultSet resultSet = this.repository.checkedExecute(sql, atAddresses.toArray(new String[atAddresses.size()]))) {
-			if (resultSet == null)
-				return new ArrayList<>(0);
-
-			stateDataList = new ArrayList<>();
-
-			do {
-				int height = resultSet.getInt(1);
-				byte[] stateData = resultSet.getBytes(2); // Actually BLOB
-				byte[] stateHash = resultSet.getBytes(3);
-				long fees = resultSet.getLong(4);
-				boolean isInitial = resultSet.getBoolean(5);
-
-				Long sleepUntilMessageTimestamp = resultSet.getLong(6);
-				if (sleepUntilMessageTimestamp == 0 && resultSet.wasNull())
-					sleepUntilMessageTimestamp = null;
-
-				String atAddress = resultSet.getString(7);
-				stateDataList.add(new ATStateData(atAddress, height, stateData, stateHash, fees, isInitial, sleepUntilMessageTimestamp));
-			} while( resultSet.next());
-		} catch (SQLException e) {
-			throw new DataException("Unable to fetch latest AT state from repository", e);
-		}
-
-		Map<String, List<ATStateData>> stateDataByAtAddress
-			= stateDataList.stream()
-				.collect(Collectors.groupingBy(ATStateData::getATAddress));
-
-		List<ATStateData> latestForEachAtAddress
-			= stateDataByAtAddress.values().stream()
-				.map(list -> list.stream()
-						.max(Comparator.comparing(ATStateData::getHeight))
-						.orElse(null))
-				.filter(obj -> obj != null)
-				.collect(Collectors.toList());
-
-		return latestForEachAtAddress;
+	public byte[] getStatePayload(String address, int height, byte[] hash) throws DataException {
+		try { return store.state(address, height, hash); }
+		catch (SQLException e) { throw new DataException("Unable to load AT payload", e); }
 	}
+
+    @Override
+    public List<org.qortal.data.at.ATExecutionState> getExecutionStates(List<String> addresses) throws DataException {
+        List<org.qortal.data.at.ATExecutionState> result = new ArrayList<>();
+        for (int start = 0; start < addresses.size(); start += 256) {
+            List<String> chunk = addresses.subList(start, Math.min(start + 256, addresses.size()));
+            String sql = "SELECT c.AT_address,c.latest_state_height,c.payload_hash,COALESCE(b.balance,0) FROM ATCurrentState c "
+                    + "LEFT JOIN AccountBalances b ON b.account=c.AT_address AND b.asset_id=0 WHERE c.AT_address IN ("
+                    + String.join(",", Collections.nCopies(chunk.size(), "?")) + ")";
+            try (ResultSet rs = repository.checkedExecute(sql, chunk.toArray())) {
+                if (rs != null) do {
+                    byte[] hash = rs.getBytes(3);
+                    int height = rs.getInt(2);
+                    if (rs.wasNull() || hash == null) throw new DataException("Missing AT execution head");
+                    result.add(new org.qortal.data.at.ATExecutionState(rs.getString(1), height, hash, rs.getLong(4)));
+                } while (rs.next());
+            } catch (SQLException e) { throw new DataException("Unable to load execution heads", e); }
+        }
+        if (result.size() != addresses.size()) throw new DataException("Missing AT execution heads");
+        return result;
+    }
+
+    @Override
+    public List<ATStateData> getLatestATStates(List<String> addresses) throws DataException {
+        List<ATStateData> result = new ArrayList<>();
+        for (int start = 0; start < addresses.size(); start += 256) {
+            List<String> chunk = addresses.subList(start, Math.min(start + 256, addresses.size()));
+            String sql = "SELECT c.AT_address,c.latest_state_height,c.payload_hash,c.sleep_until_message_timestamp "
+                    + "FROM ATCurrentState c WHERE c.AT_address IN ("
+                    + String.join(",", Collections.nCopies(chunk.size(), "?")) + ")";
+            List<ATStateData> metadata = new ArrayList<>();
+            try (ResultSet rs = repository.checkedExecute(sql, chunk.toArray())) {
+                if (rs != null) do {
+                    int height = rs.getInt(2);
+                    byte[] payloadHash = rs.getBytes(3);
+                    if (rs.wasNull() || payloadHash == null) continue; // Deployed but not yet executed
+                    Long cursor = (Long) rs.getObject(4);
+                    metadata.add(new ATStateData(rs.getString(1), height, payloadHash, payloadHash, 0L, false, cursor));
+                } while (rs.next());
+            } catch (SQLException e) { throw new DataException("Unable to load AT heads", e); }
+            try { store.preloadStates(metadata); }
+            catch (SQLException e) { throw new DataException("Unable to bulk load AT payloads", e); }
+            for (ATStateData m : metadata) {
+                try { result.add(new ATStateData(m.getATAddress(), m.getHeight(), store.state(m.getATAddress(), m.getHeight(), m.getStateHash()), m.getStateHash(), 0L, false, m.getSleepUntilMessageTimestamp())); }
+                catch (SQLException e) { throw new DataException("Unable to load AT payload", e); }
+            }
+        }
+        return result;
+    }
 
 	@Override
 	public List<ATStateData> getMatchingFinalATStates(byte[] codeHash, byte[] buyerPublicKey, byte[] sellerPublicKey, Boolean isFinished,
@@ -521,94 +583,79 @@ public class HSQLDBATRepository implements ATRepository {
 		StringBuilder sql = new StringBuilder(1024);
 		List<Object> bindParams = new ArrayList<>();
 
-		sql.append("SELECT AT_address, height, state_data, state_hash, fees, is_initial, FinalATStates.sleep_until_message_timestamp "
-				+ "FROM ATs "
-				+ "CROSS JOIN LATERAL("
-					+ "SELECT height, state_data, state_hash, fees, is_initial, sleep_until_message_timestamp "
-					+ "FROM ATStates "
-					+ "JOIN ATStatesData USING (AT_address, height) "
-					+ "WHERE ATStates.AT_address = ATs.AT_address ");
-
-		if (minimumFinalHeight != null) {
-			sql.append("AND ATStates.height >= ? ");
-			bindParams.add(minimumFinalHeight);
-		}
-
-		// Order by AT_address and height to use compound primary key as index
-		// Both must be the same direction (DESC) also
-		sql.append("ORDER BY ATStates.height DESC LIMIT 1) AS FinalATStates ");
-
-		// Optional JOIN with ATTRANSACTIONS for buyerAddress
-		if (buyerPublicKey != null && buyerPublicKey.length > 0) {
-			sql.append("JOIN ATTRANSACTIONS tx ON tx.at_address = ATs.AT_address ");
-		}
-	
-		sql.append("WHERE ATs.code_hash = ? ");
+		sql.append("SELECT ATs.AT_address, c.latest_state_height, c.payload_hash, "
+				+ "c.sleep_until_message_timestamp "
+				+ "FROM ATDefinitions ATs "
+				+ "JOIN ATCurrentState c ON c.AT_address = ATs.AT_address "
+				+ "WHERE ATs.code_hash = ? ");
 		bindParams.add(codeHash);
 
 		if (isFinished != null) {
-			sql.append("AND is_finished = ? ");
+			sql.append("AND c.is_finished = ? ");
 			bindParams.add(isFinished);
 		}
 
-		if (dataByteOffset != null && expectedValue != null) {
-			sql.append("AND SUBSTRING(state_data FROM ? FOR 8) = ? ");
-
-			// We convert our long on Java-side to control endian
-			byte[] rawExpectedValue = Longs.toByteArray(expectedValue);
-
-			// SQL binary data offsets start at 1
-			bindParams.add(dataByteOffset + 1);
-			bindParams.add(rawExpectedValue);
-		}
-
-		if (buyerPublicKey != null && buyerPublicKey.length > 0 ) {
-			// the buyer must be the recipient of the transaction and not the creator of the AT
-			sql.append("AND tx.recipient = ? AND ATs.creator != ? ");
-
+		if (buyerPublicKey != null && buyerPublicKey.length > 0) {
+			sql.append("AND EXISTS(SELECT 1 FROM ATTransactions tx WHERE tx.at_address=ATs.AT_address AND tx.recipient=?) ");
+			sql.append("AND ATs.creator != ? ");
 			bindParams.add(Crypto.toAddress(buyerPublicKey));
 			bindParams.add(buyerPublicKey);
 		}
-
 
 		if (sellerPublicKey != null && sellerPublicKey.length > 0) {
 			sql.append("AND ATs.creator = ? ");
 			bindParams.add(sellerPublicKey);
 		}
+		if (minimumFinalHeight != null) {
+			sql.append("AND c.latest_state_height >= ? ");
+			bindParams.add(minimumFinalHeight);
+		}
 
-		sql.append(" ORDER BY FinalATStates.height ");
+		sql.append(" ORDER BY c.latest_state_height ");
 		if (reverse != null && reverse)
 			sql.append("DESC");
 
-		HSQLDBRepository.limitOffsetSql(sql, limit, offset);
+		boolean filterPayload = dataByteOffset != null && expectedValue != null;
+		if (!filterPayload) HSQLDBRepository.limitOffsetSql(sql, limit, offset);
 
-		List<ATStateData> atStates = new ArrayList<>();
+		List<ATStateData> metadata = new ArrayList<>();
 
 		try (ResultSet resultSet = this.repository.checkedExecute(sql.toString(), bindParams.toArray())) {
 			if (resultSet == null)
-				return atStates;
+				return metadata;
 
 			do {
 				String atAddress = resultSet.getString(1);
 				int height = resultSet.getInt(2);
-				byte[] stateData = resultSet.getBytes(3); // Actually BLOB
-				byte[] stateHash = resultSet.getBytes(4);
-				long fees = resultSet.getLong(5);
-				boolean isInitial = resultSet.getBoolean(6);
+				byte[] stateHash = resultSet.getBytes(3);
 
-				Long sleepUntilMessageTimestamp = resultSet.getLong(7);
+				Long sleepUntilMessageTimestamp = resultSet.getLong(4);
 				if (sleepUntilMessageTimestamp == 0 && resultSet.wasNull())
 					sleepUntilMessageTimestamp = null;
-
-				ATStateData atStateData = new ATStateData(atAddress, height, stateData, stateHash, fees, isInitial, sleepUntilMessageTimestamp);
-
-				atStates.add(atStateData);
+				metadata.add(new ATStateData(atAddress, height, stateHash, stateHash, 0L, false, sleepUntilMessageTimestamp));
 			} while (resultSet.next());
-
-			return atStates;
 		} catch (SQLException e) {
 			throw new DataException("Unable to fetch matching AT states from repository", e);
 		}
+
+		try { store.preloadStates(metadata); }
+		catch (SQLException e) { throw new DataException("Unable to bulk load matching AT payloads", e); }
+		List<ATStateData> result = new ArrayList<>();
+		int skipped = 0;
+		byte[] expectedBytes = filterPayload ? Longs.toByteArray(expectedValue) : null;
+		for (ATStateData item : metadata) {
+			byte[] data;
+			try { data = store.state(item.getATAddress(), item.getHeight(), item.getStateHash()); }
+			catch (SQLException e) { throw new DataException("Unable to load matching AT payload", e); }
+			if (filterPayload && (dataByteOffset < 0 || dataByteOffset + expectedBytes.length > data.length
+					|| !java.util.Arrays.equals(expectedBytes, java.util.Arrays.copyOfRange(data, dataByteOffset, dataByteOffset + expectedBytes.length))))
+				continue;
+			if (filterPayload && skipped++ < (offset == null ? 0 : offset)) continue;
+			result.add(new ATStateData(item.getATAddress(), item.getHeight(), data, item.getStateHash(), 0L, false,
+					item.getSleepUntilMessageTimestamp()));
+			if (filterPayload && limit != null && result.size() >= limit) break;
+		}
+		return result;
 	}
 
 	@Override
@@ -626,147 +673,51 @@ public class HSQLDBATRepository implements ATRepository {
 		if (mostRecentStates.isEmpty())
 			return mostRecentStates;
 
-		ATStateData mostRecentState = mostRecentStates.get(0);
-
-		StringBuilder sql = new StringBuilder(1024);
-		List<Object> bindParams = new ArrayList<>();
-
-		sql.append("SELECT AT_address, height, state_data, state_hash, fees, is_initial, sleep_until_message_timestamp "
-				+ "FROM ATs "
-				+ "CROSS JOIN LATERAL("
-					+ "SELECT height, state_data, state_hash, fees, is_initial "
-					+ "FROM ATStates "
-					+ "JOIN ATStatesData USING (AT_address, height) "
-					+ "WHERE ATStates.AT_address = ATs.AT_address ");
-
-		// Order by AT_address and height to use compound primary key as index
-		// Both must be the same direction (DESC) also
-		sql.append("ORDER BY ATStates.AT_address DESC, ATStates.height DESC "
-					+ "LIMIT 1 "
-				+ ") AS FinalATStates "
-				+ "WHERE code_hash = ? ");
-		bindParams.add(codeHash);
-
-		if (isFinished != null) {
-			sql.append("AND is_finished = ? ");
-			bindParams.add(isFinished);
-		}
-
-		if (dataByteOffset != null && expectedValue != null) {
-			sql.append("AND SUBSTRING(state_data FROM ? FOR 8) = ? ");
-
-			// We convert our long on Java-side to control endian
-			byte[] rawExpectedValue = Longs.toByteArray(expectedValue);
-
-			// SQL binary data offsets start at 1
-			bindParams.add(dataByteOffset + 1);
-			bindParams.add(rawExpectedValue);
-		}
-
 		// Slice so that we meet both minimumCount and minimumPeriod
-		int minimumHeight = mostRecentState.getHeight() - (int) (minimumPeriod / 60 * 1000L); // XXX assumes 60 second blocks
-
-		sql.append("AND (FinalATStates.height >= ? OR ROWNUM() < ?) ");
-		bindParams.add(minimumHeight);
-		bindParams.add(minimumCount);
-
-		sql.append("ORDER BY FinalATStates.height DESC LIMIT ?");
-		bindParams.add(maximumCount);
-
-		List<ATStateData> atStates = new ArrayList<>();
-
-		try (ResultSet resultSet = this.repository.checkedExecute(sql.toString(), bindParams.toArray())) {
-			if (resultSet == null)
-				return atStates;
-
-			do {
-				String atAddress = resultSet.getString(1);
-				int height = resultSet.getInt(2);
-				byte[] stateData = resultSet.getBytes(3); // Actually BLOB
-				byte[] stateHash = resultSet.getBytes(4);
-				long fees = resultSet.getLong(5);
-				boolean isInitial = resultSet.getBoolean(6);
-				Long sleepUntilMessageTimestamp = resultSet.getLong(7);
-
-				ATStateData atStateData = new ATStateData(atAddress, height, stateData, stateHash, fees, isInitial,
-						sleepUntilMessageTimestamp);
-
-				atStates.add(atStateData);
-			} while (resultSet.next());
-
-			return atStates;
-		} catch (SQLException e) {
-			throw new DataException("Unable to fetch matching AT states from repository", e);
+		int minimumHeight = mostRecentStates.get(0).getHeight() - (int) (minimumPeriod / 60 * 1000L);
+		List<ATStateData> candidates = this.getMatchingFinalATStates(codeHash, null, null, isFinished,
+				dataByteOffset, expectedValue, null, null, null, true);
+		List<ATStateData> result = new ArrayList<>();
+		for (ATStateData state : candidates) {
+			if (state.getHeight() < minimumHeight && result.size() >= minimumCount) break;
+			if (result.size() >= maximumCount) break;
+			result.add(state);
 		}
+		return result;
 	}
 
 	@Override
 	public List<ATStateData> getBlockATStatesAtHeight(int height) throws DataException {
-		String sql = "SELECT AT_address, state_hash, fees, is_initial "
-				+ "FROM ATs "
-				+ "JOIN ATStates "
-				+ "ON ATStates.AT_address = ATs.AT_address "
-				+ "WHERE height = ? "
-				+ "ORDER BY created_when ASC, AT_address DESC";
-
 		List<ATStateData> atStates = new ArrayList<>();
-
-		try (ResultSet resultSet = this.repository.checkedExecute(sql, height)) {
-			if (resultSet == null)
-				return atStates; // No atStates in this block
-
-			// NB: do-while loop because .checkedExecute() implicitly calls ResultSet.next() for us
-			do {
-				String atAddress = resultSet.getString(1);
-				byte[] stateHash = resultSet.getBytes(2);
-				long fees = resultSet.getLong(3);
-				boolean isInitial = resultSet.getBoolean(4);
-
-				ATStateData atStateData = new ATStateData(atAddress, height, stateHash, fees, isInitial);
-				atStates.add(atStateData);
-			} while (resultSet.next());
+		Set<String> addresses = new HashSet<>();
+		try {
+			byte[] blob = store.readBlockResult(height);
+			if (blob != null) {
+				List<org.qortal.at.ATBlockResult.Entry> entries = org.qortal.at.ATBlockResult.deserialize(blob);
+				for (org.qortal.at.ATBlockResult.Entry e : entries) {
+					ATStateData state = new ATStateData(e.address, height, e.stateHash, e.fees, e.isInitial);
+					atStates.add(state);
+					addresses.add(e.address);
+				}
+			}
 		} catch (SQLException e) {
-			throw new DataException("Unable to fetch AT states for this height from repository", e);
+			throw new DataException("Unable to fetch AT block result", e);
 		}
 
-		return atStates;
-	}
-
-
-	@Override
-	public void rebuildLatestAtStates(int maxHeight) throws DataException {
-		// latestATStatesLock is to prevent concurrent updates on LatestATStates
-		// that could result in one process using a partial or empty dataset
-		// because it was in the process of being rebuilt by another thread
-		synchronized (this.repository.latestATStatesLock) {
-			LOGGER.trace("Rebuilding latest AT states...");
-
-			// Rebuild cache of latest AT states that we can't trim
-			String deleteSql = "DELETE FROM LatestATStates";
-			try {
-				this.repository.executeCheckedUpdate(deleteSql);
-			} catch (SQLException e) {
-				repository.examineException(e);
-				throw new DataException("Unable to delete temporary latest AT states cache from repository", e);
-			}
-
-			String insertSql = "INSERT INTO LatestATStates ("
-					+ "SELECT AT_address, height FROM ATs "
-					+ "CROSS JOIN LATERAL("
-					+ "SELECT height FROM ATStates "
-					+ "WHERE ATStates.AT_address = ATs.AT_address "
-					+ "AND height <= ?"
-					+ "ORDER BY AT_address DESC, height DESC LIMIT 1"
-					+ ") "
-					+ ")";
-			try {
-				this.repository.executeCheckedUpdate(insertSql, maxHeight);
-			} catch (SQLException e) {
-				repository.examineException(e);
-				throw new DataException("Unable to populate temporary latest AT states cache in repository", e);
-			}
-			this.repository.saveChanges();
-			LOGGER.trace("Rebuilt latest AT states");
+		// Pre-migration history and initial deployments remain as compact metadata rows.
+		try (ResultSet resultSet = this.repository.checkedExecute(
+				"SELECT s.AT_address,s.state_hash,s.fees,s.is_initial FROM ATStates s "
+						+ "JOIN ATDefinitions d ON d.AT_address=s.AT_address WHERE s.height=? "
+						+ "ORDER BY d.created_when ASC,d.AT_address DESC", height)) {
+			if (resultSet != null) do {
+				String address = resultSet.getString(1);
+				if (addresses.add(address))
+					atStates.add(new ATStateData(address, height,
+							resultSet.getBytes(2), resultSet.getLong(3), resultSet.getBoolean(4)));
+			} while (resultSet.next());
+			return atStates;
+		} catch (SQLException e) {
+			throw new DataException("Unable to fetch AT states for this height from repository", e);
 		}
 	}
 
@@ -804,35 +755,107 @@ public class HSQLDBATRepository implements ATRepository {
 
 	@Override
 	public int trimAtStates(int minHeight, int maxHeight, int limit) throws DataException {
-		if (minHeight >= maxHeight)
-			return 0;
+		return this.trimAtStatesDetailed(minHeight, maxHeight, limit).getTrimmed();
+	}
 
-		// latestATStatesLock is to prevent concurrent updates on LatestATStates
-		// that could result in one process using a partial or empty dataset
-		// because it was in the process of being rebuilt by another thread
-		synchronized (this.repository.latestATStatesLock) {
-
-			// We're often called so no need to trim all states in one go.
-			// Limit updates to reduce CPU and memory load.
-			String sql = "DELETE FROM ATStatesData "
-					+ "WHERE height BETWEEN ? AND ? "
-					+ "AND NOT EXISTS("
-					+ "SELECT TRUE FROM LatestATStates "
-					+ "WHERE LatestATStates.AT_address = ATStatesData.AT_address "
-					+ "AND LatestATStates.height = ATStatesData.height"
-					+ ") "
-					+ "LIMIT ?";
-
-			try {
-				int modifiedRows = this.repository.executeCheckedUpdate(sql, minHeight, maxHeight, limit);
-				this.repository.saveChanges();
-				return modifiedRows;
-
-			} catch (SQLException e) {
-				repository.examineException(e);
-				throw new DataException("Unable to trim AT states in repository", e);
+	@Override
+	public ATTrimResult trimAtStatesDetailed(int minHeight, int maxHeight, int limit) throws DataException {
+		if (minHeight <= 1) minHeight = 2;
+		limit = Math.min(limit, MAX_PAYLOAD_BUNDLES_PER_TRIM);
+		if (limit <= 0) return new ATTrimResult(0, minHeight > maxHeight);
+		try {
+			// Move each AT's rollback boundary forward before clearing a bundle. This is the
+			// predecessor needed when an AT sleeps across the trim frontier.
+			Map<Integer, byte[]> candidates = new LinkedHashMap<>();
+			boolean rangeComplete = true;
+			if (minHeight <= maxHeight) {
+				int nextCurrentHeight = loadTrimCandidates(candidates, minHeight, maxHeight, limit);
+				rangeComplete = nextCurrentHeight > maxHeight;
 			}
+
+			// Once the current range is covered, spend any remaining bounded work on the
+			// older cleanup cursor. This also runs when the main trim cursor is caught up.
+			if (rangeComplete && candidates.size() < limit && minHeight > 2) {
+				int cleanupHeight = getPayloadCleanupHeight();
+				if (cleanupHeight < 2) cleanupHeight = 2;
+				if (cleanupHeight < minHeight) {
+					int cleanupEnd = Math.min(minHeight - 1, cleanupHeight + PAYLOAD_CLEANUP_SWEEP_HEIGHTS - 1);
+					int nextCleanupHeight = loadTrimCandidates(candidates, cleanupHeight, cleanupEnd, limit);
+					if (nextCleanupHeight > cleanupEnd) nextCleanupHeight = cleanupEnd + 1;
+					repository.executeCheckedUpdate("UPDATE ATStoreInfo SET cleanup_height=? WHERE id=1",
+							Math.min(nextCleanupHeight, minHeight));
+				}
+			}
+			if (candidates.isEmpty()) return new ATTrimResult(0, rangeComplete);
+
+			Map<String, BoundaryPointer> newest = new HashMap<>();
+			for (Map.Entry<Integer, byte[]> candidate : candidates.entrySet()) {
+				for (Map.Entry<String, org.qortal.at.ATStateBundle.Entry> entry
+						: org.qortal.at.ATStateBundle.deserialize(candidate.getValue()).entrySet()) {
+					BoundaryPointer prior = newest.get(entry.getKey());
+					if (prior == null || candidate.getKey() > prior.height)
+						newest.put(entry.getKey(), new BoundaryPointer(candidate.getKey(), entry.getValue().hash));
+				}
+			}
+
+			List<String> addresses = new ArrayList<>(newest.keySet());
+			List<Object[]> updates = newest.entrySet().stream()
+					.map(entry -> new Object[]{entry.getValue().height, entry.getValue().hash, entry.getKey(), entry.getValue().height})
+					.collect(Collectors.toList());
+			repository.executeCheckedBatchUpdate(
+					"UPDATE ATCurrentState SET rollback_state_height=?,rollback_payload_hash=? "
+							+ "WHERE AT_address=? AND (rollback_state_height IS NULL OR rollback_state_height<?)", updates);
+
+			// A pointer can outlive its block bundle (finished and long-sleeping ATs are
+			// common). Detach exactly those entries before deleting every expired bundle.
+			// Both actions are part of this repository transaction, so a crash exposes
+			// either the complete bundle or the verified retained row, never neither.
+			Set<String> affectedAddresses = new HashSet<>(addresses);
+			affectedAddresses.addAll(store.retainReferencedPayloads(candidates));
+
+			int trimmed = 0;
+			List<Integer> heights = new ArrayList<>(candidates.keySet());
+			for (int start = 0; start < heights.size(); start += 256) {
+				List<Integer> chunk = heights.subList(start, Math.min(start + 256, heights.size()));
+				trimmed += repository.executeCheckedUpdate(
+						"DELETE FROM ATBlockPayloads b WHERE b.block_height IN ("
+								+ String.join(",", Collections.nCopies(chunk.size(), "?")) + ")", chunk.toArray());
+			}
+			store.deleteUnreferencedRetainedPayloads(affectedAddresses);
+			return new ATTrimResult(trimmed, rangeComplete);
+		} catch (SQLException | DataException e) { throw new DataException("Unable to trim AT block payload bundles", e); }
+	}
+
+	private int loadTrimCandidates(Map<Integer, byte[]> candidates, int minHeight, int maxHeight, int limit)
+			throws SQLException {
+		int remaining = limit - candidates.size();
+		if (remaining <= 0)
+			return minHeight;
+		int rowCount = 0;
+		int lastHeight = minHeight - 1;
+		try (ResultSet rows = repository.checkedExecute(
+				"SELECT b.block_height,b.payload_bytes FROM ATBlockPayloads b "
+						+ "WHERE b.block_height BETWEEN ? AND ? AND b.payload_bytes IS NOT NULL "
+						+ "ORDER BY b.block_height LIMIT ?", minHeight, maxHeight, remaining)) {
+			if (rows != null) do {
+				lastHeight = rows.getInt(1);
+				++rowCount;
+				candidates.put(lastHeight, rows.getBytes(2));
+			} while (rows.next());
 		}
+		return rowCount < remaining ? maxHeight + 1 : lastHeight + 1;
+	}
+
+	private int getPayloadCleanupHeight() throws SQLException {
+		try (ResultSet row = repository.checkedExecute("SELECT cleanup_height FROM ATStoreInfo WHERE id=1")) {
+			return row == null ? 2 : row.getInt(1);
+		}
+	}
+
+	private static final class BoundaryPointer {
+		private final int height;
+		private final byte[] hash;
+		private BoundaryPointer(int height, byte[] hash) { this.height = height; this.hash = hash; }
 	}
 
 
@@ -867,189 +890,191 @@ public class HSQLDBATRepository implements ATRepository {
 		}
 	}
 
-	@Override
-	public int pruneAtStates(int minHeight, int maxHeight) throws DataException {
-		// latestATStatesLock is to prevent concurrent updates on LatestATStates
-		// that could result in one process using a partial or empty dataset
-		// because it was in the process of being rebuilt by another thread
-		synchronized (this.repository.latestATStatesLock) {
-
-			int deletedCount = 0;
-
-			for (int height = minHeight; height <= maxHeight; height++) {
-
-				// Give up if we're stopping
-				if (Controller.isStopping()) {
-					return deletedCount;
-				}
-
-				// Get latest AT states for this height
-				List<String> atAddresses = new ArrayList<>();
-				String updateSql = "SELECT AT_address FROM LatestATStates WHERE height = ?";
-				try (ResultSet resultSet = this.repository.checkedExecute(updateSql, height)) {
-					if (resultSet != null) {
-						do {
-							String atAddress = resultSet.getString(1);
-							atAddresses.add(atAddress);
-
-						} while (resultSet.next());
-					}
-				} catch (SQLException e) {
-					throw new DataException("Unable to fetch latest AT states from repository", e);
-				}
-
-				List<ATStateData> atStates = this.getBlockATStatesAtHeight(height);
-				for (ATStateData atState : atStates) {
-					//LOGGER.info("Found atState {} at height {}", atState.getATAddress(), atState.getHeight());
-
-					// Give up if we're stopping
-					if (Controller.isStopping()) {
-						return deletedCount;
-					}
-
-					if (atAddresses.contains(atState.getATAddress())) {
-						// We don't want to delete this AT state because it is still active
-						LOGGER.trace("Skipping atState {} at height {}", atState.getATAddress(), atState.getHeight());
-						continue;
-					}
-
-					// Safe to delete everything else for this height
-					try {
-						this.repository.delete("ATStates", "AT_address = ? AND height = ?",
-								atState.getATAddress(), atState.getHeight());
-						deletedCount++;
-					} catch (SQLException e) {
-						throw new DataException("Unable to delete AT state data from repository", e);
-					}
-				}
+    @Override
+    public int pruneAtStates(int minHeight, int maxHeight) throws DataException {
+        // Keep the genesis receipt just as pruneBlocks() keeps the genesis block.
+        // Apart from preserving the chain boundary, this prevents a fresh node from
+        // having a different retained AT-store prefix than an upgraded node.
+        if (minHeight <= 1)
+            minHeight = 2;
+        if (minHeight > maxHeight)
+            return 0;
+        try {
+			Set<String> affectedAddresses;
+			Map<Integer, byte[]> payloads = new LinkedHashMap<>();
+			try (ResultSet rows = repository.checkedExecute(
+					"SELECT block_height,payload_bytes FROM ATBlockPayloads "
+							+ "WHERE block_height BETWEEN ? AND ? AND payload_bytes IS NOT NULL ORDER BY block_height",
+					minHeight, maxHeight)) {
+				if (rows != null) do {
+					payloads.put(rows.getInt(1), rows.getBytes(2));
+				} while (rows.next());
 			}
-			this.repository.saveChanges();
-
-			return deletedCount;
-		}
-	}
-
+			affectedAddresses = store.retainReferencedPayloads(payloads);
+			int deletedResults = repository.executeCheckedUpdate(
+					"DELETE FROM ATBlockResults WHERE block_height BETWEEN ? AND ?",
+					minHeight, maxHeight);
+			int deletedPayloads = repository.executeCheckedUpdate(
+					"DELETE FROM ATBlockPayloads WHERE block_height BETWEEN ? AND ?",
+					minHeight, maxHeight);
+			// Pre-migration blocks use this compact metadata to locate their parent. Keep
+			// metadata for all live pointers even when the corresponding height is old.
+			repository.executeCheckedUpdate("DELETE FROM ATStates s WHERE height BETWEEN ? AND ? "
+					+ "AND NOT EXISTS(SELECT 1 FROM ATCurrentState c WHERE c.AT_address=s.AT_address AND "
+					+ "(c.latest_state_height=s.height OR c.previous_state_height=s.height "
+					+ "OR c.rollback_state_height=s.height))", minHeight, maxHeight);
+			store.deleteUnreferencedRetainedPayloads(affectedAddresses);
+            return Math.max(deletedResults, deletedPayloads);
+        } catch (SQLException e) {
+            throw new DataException("Unable to prune AT block results", e);
+        }
+    }
 
 	@Override
-	public boolean hasAtStatesHeightIndex() throws DataException {
-		String sql = "SELECT INDEX_NAME FROM INFORMATION_SCHEMA.SYSTEM_INDEXINFO where INDEX_NAME='ATSTATESHEIGHTINDEX'";
-
-		try (ResultSet resultSet = this.repository.checkedExecute(sql)) {
-			return resultSet != null;
-
-		} catch (SQLException e) {
-			throw new DataException("Unable to check for ATStatesHeightIndex in repository", e);
-		}
-	}
-
+	public void saveInitialState(ATStateData atStateData) throws DataException {
+		if (!atStateData.isInitial() || atStateData.getStateData() == null)
+			throw new IllegalArgumentException("AT deployment state must be initial and contain payload bytes");
+        try {
+			store.saveInitialState(atStateData);
+			saveStateSummary(atStateData);
+        } catch (SQLException e) { throw new DataException("Unable to save AT state", e); }
+    }
 
 	@Override
-	public void save(ATStateData atStateData) throws DataException {
-		// We shouldn't ever save partial ATStateData
-		if (atStateData.getStateHash() == null || atStateData.getHeight() == null)
-			throw new IllegalArgumentException("Refusing to save partial AT state into repository!");
+	public void saveArchivedStateSummary(ATStateData atStateData) throws DataException {
+		if (atStateData.getStateData() != null)
+			throw new IllegalArgumentException("Archived AT summary unexpectedly contains payload bytes");
+		try { saveStateSummary(atStateData); }
+		catch (SQLException e) { throw new DataException("Unable to save archived AT state summary", e); }
+	}
 
-		HSQLDBSaver atStatesSaver = new HSQLDBSaver("ATStates");
-
-		atStatesSaver.bind("AT_address", atStateData.getATAddress()).bind("height", atStateData.getHeight())
-				.bind("state_hash", atStateData.getStateHash())
-				.bind("fees", atStateData.getFees()).bind("is_initial", atStateData.isInitial())
-				.bind("sleep_until_message_timestamp", atStateData.getSleepUntilMessageTimestamp());
-
-		try {
-			atStatesSaver.execute(this.repository);
-		} catch (SQLException e) {
-			throw new DataException("Unable to save AT state into repository", e);
-		}
-
-		if (atStateData.getStateData() != null) {
-			HSQLDBSaver atStatesDataSaver = new HSQLDBSaver("ATStatesData");
-
-			atStatesDataSaver.bind("AT_address", atStateData.getATAddress()).bind("height", atStateData.getHeight())
-					.bind("state_data", atStateData.getStateData());
-
-			try {
-				atStatesDataSaver.execute(this.repository);
-			} catch (SQLException e) {
-				throw new DataException("Unable to save AT state data into repository", e);
-			}
-		} else {
-			try {
-				this.repository.delete("ATStatesData", "AT_address = ? AND height = ?",
-						atStateData.getATAddress(), atStateData.getHeight());
-			} catch (SQLException e) {
-				throw new DataException("Unable to delete AT state data from repository", e);
-			}
-		}
+	private void saveStateSummary(ATStateData state) throws SQLException {
+		new HSQLDBSaver("ATStates")
+				.bind("AT_address", state.getATAddress())
+				.bind("height", state.getHeight())
+				.bind("state_hash", state.getStateHash())
+				.bind("fees", state.getFees())
+				.bind("is_initial", state.isInitial())
+				.bind("sleep_until_message_timestamp", state.getSleepUntilMessageTimestamp())
+				.bind("payload_hash", state.getStateHash())
+				.execute(repository);
 	}
 
 	@Override
-	public void delete(String atAddress, int height) throws DataException {
-		try {
-			this.repository.delete("ATStates", "AT_address = ? AND height = ?", atAddress, height);
-			this.repository.delete("ATStatesData", "AT_address = ? AND height = ?", atAddress, height);
-		} catch (SQLException e) {
-			throw new DataException("Unable to delete AT state from repository", e);
-		}
-	}
-
-	@Override
-	public void deleteATStates(int height) throws DataException {
-		try {
-			this.repository.delete("ATStates", "height = ?", height);
-			this.repository.delete("ATStatesData", "height = ?", height);
-		} catch (SQLException e) {
-			throw new DataException("Unable to delete AT states from repository", e);
-		}
+	public boolean deleteATStates(int height) throws DataException {
+		try { return store.deleteBlockResult(height); }
+		catch (SQLException e) { throw new DataException("Unable to delete AT block result", e); }
 	}
 
 	// Finding transactions for ATs to process
 
-	public NextTransactionInfo findNextTransaction(String recipient, int height, int sequence) throws DataException {
-		// We only need to search for a subset of transaction types: MESSAGE, PAYMENT or AT
-
-		String sql = "SELECT block_height, block_sequence, Transactions.signature "
-				+ "FROM ("
-					+ "SELECT signature FROM PaymentTransactions WHERE recipient = ? "
-					+ "UNION "
-					+ "SELECT signature FROM MessageTransactions WHERE recipient = ? "
-					+ "UNION "
-					+ "SELECT signature FROM ATTransactions WHERE recipient = ?"
-				+ ") AS SelectedTransactions "
-				+ "JOIN Transactions USING (signature)"
-				+ "WHERE (block_height > ? OR (block_height = ? AND block_sequence > ?)) "
-				+ "ORDER BY block_height ASC, block_sequence ASC "
-				+ "LIMIT 1";
-
-		Object[] bindParams = new Object[] { recipient, recipient, recipient, height, height, sequence };
-
-		try (ResultSet resultSet = this.repository.checkedExecute(sql, bindParams)) {
-			if (resultSet == null)
-				return null;
-
-			int nextHeight = resultSet.getInt(1);
-			int nextSequence = resultSet.getInt(2);
-			byte[] nextSignature = resultSet.getBytes(3);
-
-			return new NextTransactionInfo(nextHeight, nextSequence, nextSignature);
-		} catch (SQLException e) {
-			throw new DataException("Unable to find next transaction to AT from repository", e);
-		}
-	}
+    public NextTransactionInfo findNextTransaction(String recipient, int height, int sequence) throws DataException {
+        // Two bounded seeks preserve NULL sequence ordering in old later-height records.
+        String[] predicates = {"block_height = ? AND block_sequence > ?", "block_height > ?"};
+        try {
+            for (int part = 0; part < 2; ++part) {
+                Object[] args = part == 0 ? new Object[]{recipient, height, sequence} : new Object[]{recipient, height};
+                try (ResultSet rs = repository.checkedExecute("SELECT block_height,block_sequence,signature FROM ATRecipientTransactions "
+                        + "WHERE recipient = ? AND " + predicates[part] + " ORDER BY block_height,block_sequence LIMIT 1", args)) {
+                    if (rs != null) return new NextTransactionInfo(rs.getInt(1), rs.getInt(2), rs.getBytes(3));
+                }
+            }
+            return null;
+        } catch (SQLException e) { throw new DataException("Unable to seek AT recipient transaction", e); }
+    }
 
 	// Other
 
+    /** Block-link boundary: all transactions have executed; wake state is published before the next block executes. */
+    public void refreshRecipients(List<org.qortal.data.transaction.TransactionData> transactions, int height) throws DataException {
+		List<Object[]> deletions = new ArrayList<>(), candidates = new ArrayList<>(), insertions = new ArrayList<>();
+        java.util.Set<String> affected = new java.util.LinkedHashSet<>();
+        for (int sequence = 0; sequence < transactions.size(); ++sequence) {
+            org.qortal.data.transaction.TransactionData data = transactions.get(sequence);
+            String recipient;
+            if (data instanceof org.qortal.data.transaction.PaymentTransactionData) recipient = ((org.qortal.data.transaction.PaymentTransactionData)data).getRecipient();
+            else if (data instanceof org.qortal.data.transaction.MessageTransactionData) recipient = ((org.qortal.data.transaction.MessageTransactionData)data).getRecipient();
+            else if (data instanceof org.qortal.data.transaction.ATTransactionData) recipient = ((org.qortal.data.transaction.ATTransactionData)data).getRecipient();
+            else continue;
+            deletions.add(new Object[]{data.getSignature()});
+            if (recipient != null) {
+				candidates.add(new Object[]{data.getSignature(),recipient,height,sequence});
+            }
+        }
+        try {
+			java.util.Set<String> ATRecipients = new java.util.HashSet<>();
+			java.util.List<String> candidateAddresses = candidates.stream().map(row -> (String) row[1]).distinct()
+					.collect(java.util.stream.Collectors.toList());
+			for (int start = 0; start < candidateAddresses.size(); start += 256) {
+				java.util.List<String> chunk = candidateAddresses.subList(start, Math.min(start + 256, candidateAddresses.size()));
+				try (ResultSet rs = repository.checkedExecute("SELECT AT_address FROM ATCurrentState WHERE AT_address IN ("
+						+ String.join(",", Collections.nCopies(chunk.size(), "?")) + ")", chunk.toArray())) {
+					if (rs != null) do { ATRecipients.add(rs.getString(1)); } while (rs.next());
+				}
+			}
+			for (Object[] row : candidates) {
+				String recipient = (String) row[1];
+				if (ATRecipients.contains(recipient)) {
+					insertions.add(row);
+					affected.add(recipient);
+				}
+			}
+            for (int start = 0; start < deletions.size(); start += 256) {
+                List<Object[]> chunk = deletions.subList(start,Math.min(start+256,deletions.size()));
+                Object[] signatures = chunk.stream().map(row -> row[0]).toArray();
+                try (ResultSet rs = repository.checkedExecute("SELECT DISTINCT recipient FROM ATRecipientTransactions WHERE signature IN ("
+                        + String.join(",",Collections.nCopies(chunk.size(),"?")) + ")",signatures)) {
+                    if (rs != null) do { affected.add(rs.getString(1)); } while (rs.next());
+                }
+            }
+            repository.executeCheckedBatchUpdate("DELETE FROM ATRecipientTransactions WHERE signature=?",deletions);
+            repository.executeCheckedBatchUpdate("INSERT INTO ATRecipientTransactions VALUES(?,?,?,?)",insertions);
+            List<Object[]> updates = affected.stream().map(address -> new Object[]{address}).collect(java.util.stream.Collectors.toList());
+            repository.executeCheckedBatchUpdate("UPDATE ATCurrentState s SET message_pending="
+                    + "(EXISTS(SELECT 1 FROM ATRecipientTransactions t WHERE t.recipient=s.AT_address AND t.block_height>s.cursor_height) "
+                    + "OR EXISTS(SELECT 1 FROM ATRecipientTransactions t WHERE t.recipient=s.AT_address AND t.block_height=s.cursor_height AND t.block_sequence>s.cursor_sequence)) "
+                    + "WHERE s.AT_address=? AND s.schedule_class=1",updates);
+        } catch (SQLException e) { throw new DataException("Unable to batch recipient changes",e); }
+    }
+
+    /** Called whenever a transaction's confirmed chain position changes. SQL rollback restores the index and schedule together. */
+    public void refreshRecipient(byte[] signature) throws DataException {
+        try {
+            java.util.Set<String> recipients = new java.util.HashSet<>();
+            try (ResultSet rs = repository.checkedExecute("SELECT recipient FROM ATRecipientTransactions WHERE signature=?", signature)) {
+                if (rs != null) recipients.add(rs.getString(1));
+            }
+            repository.delete("ATRecipientTransactions", "signature=?", signature);
+            String recipient = null; Integer height = null, sequence = null;
+            try (ResultSet rs = repository.checkedExecute("SELECT COALESCE(p.recipient,m.recipient,a.recipient),t.block_height,t.block_sequence "
+                    + "FROM Transactions t LEFT JOIN PaymentTransactions p USING(signature) LEFT JOIN MessageTransactions m USING(signature) "
+                    + "LEFT JOIN ATTransactions a USING(signature) WHERE t.signature=? AND t.block_height IS NOT NULL", signature)) {
+                if (rs != null) { recipient = rs.getString(1); height = (Integer)rs.getObject(2); sequence = (Integer)rs.getObject(3); }
+            }
+			if (recipient != null && repository.exists("ATCurrentState", "AT_address=?", recipient)) {
+                repository.executeCheckedUpdate("INSERT INTO ATRecipientTransactions VALUES(?,?,?,?)", signature, recipient, height, sequence);
+                recipients.add(recipient);
+            }
+            for (String address : recipients)
+                repository.executeCheckedUpdate("UPDATE ATCurrentState s SET message_pending=EXISTS "
+                        + "(SELECT 1 FROM ATRecipientTransactions t WHERE t.recipient=s.AT_address AND "
+                        + "(t.block_height>s.cursor_height OR (t.block_height=s.cursor_height AND t.block_sequence>s.cursor_sequence))) "
+                        + "WHERE s.AT_address=? AND s.schedule_class=1", address);
+        } catch (SQLException e) { throw new DataException("Unable to update AT recipient index",e); }
+    }
+
 	public void checkConsistency() throws DataException {
-		String sql = "SELECT COUNT(*) FROM ATs "
-				+ "CROSS JOIN LATERAL("
-					+ "SELECT height FROM ATStates "
-					+ "WHERE ATStates.AT_address = ATs.AT_address "
-					+ "ORDER BY AT_address DESC, height DESC "
-					+ "LIMIT 1"
-				+ ") AS LatestATState (height) "
-				+ "LEFT OUTER JOIN ATStatesData "
-				+ "ON ATStatesData.AT_address = ATs.AT_address AND ATStatesData.height = LatestATState.height "
-				+ "WHERE ATStatesData.AT_address IS NULL";
+		String sql = "SELECT COUNT(*) FROM ("
+				+ "SELECT c.AT_address FROM ATCurrentState c LEFT OUTER JOIN ATBlockPayloads b ON b.block_height=c.latest_state_height "
+				+ "LEFT OUTER JOIN ATRetainedStatePayloads r ON r.AT_address=c.AT_address AND r.state_height=c.latest_state_height "
+				+ "AND r.payload_hash=c.payload_hash WHERE c.payload_hash IS NOT NULL AND b.block_height IS NULL AND r.AT_address IS NULL "
+				+ "UNION ALL SELECT c.AT_address FROM ATCurrentState c LEFT OUTER JOIN ATBlockPayloads b ON b.block_height=c.previous_state_height "
+				+ "LEFT OUTER JOIN ATRetainedStatePayloads r ON r.AT_address=c.AT_address AND r.state_height=c.previous_state_height "
+				+ "AND r.payload_hash=c.previous_payload_hash WHERE c.previous_payload_hash IS NOT NULL AND b.block_height IS NULL AND r.AT_address IS NULL "
+				+ "UNION ALL SELECT c.AT_address FROM ATCurrentState c LEFT OUTER JOIN ATBlockPayloads b ON b.block_height=c.rollback_state_height "
+				+ "LEFT OUTER JOIN ATRetainedStatePayloads r ON r.AT_address=c.AT_address AND r.state_height=c.rollback_state_height "
+				+ "AND r.payload_hash=c.rollback_payload_hash WHERE c.rollback_payload_hash IS NOT NULL "
+				+ "AND b.block_height IS NULL AND r.AT_address IS NULL) missing";
 
 		try (ResultSet resultSet = this.repository.checkedExecute(sql)) {
 			if (resultSet == null)
@@ -1063,6 +1088,28 @@ public class HSQLDBATRepository implements ATRepository {
 			}
 		} catch (SQLException e) {
 			throw new DataException("Unable to check AT repository consistency", e);
+		}
+
+		try (ResultSet resultSet = this.repository.checkedExecute(
+				"SELECT AT_address,latest_state_height,payload_hash,previous_state_height,previous_payload_hash,"
+						+ "rollback_state_height,rollback_payload_hash "
+						+ "FROM ATCurrentState WHERE payload_hash IS NOT NULL")) {
+			if (resultSet != null) do {
+				String address = resultSet.getString(1);
+				int height = resultSet.getInt(2);
+				byte[] hash = resultSet.getBytes(3);
+				store.state(address, height, hash);
+				Integer previousHeight = (Integer) resultSet.getObject(4);
+				byte[] previousHash = resultSet.getBytes(5);
+				if (previousHeight != null && previousHash != null)
+					store.state(address, previousHeight, previousHash);
+				Integer rollbackHeight = (Integer) resultSet.getObject(6);
+				byte[] rollbackHash = resultSet.getBytes(7);
+				if (rollbackHeight != null && rollbackHash != null)
+					store.state(address, rollbackHeight, rollbackHash);
+			} while (resultSet.next());
+		} catch (SQLException e) {
+			throw new DataException("AT repository contains a corrupt or mismatched current payload", e);
 		}
 	}
 

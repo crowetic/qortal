@@ -9,6 +9,7 @@ import org.qortal.arbitrary.misc.Category;
 import org.qortal.arbitrary.misc.Service;
 import org.qortal.data.arbitrary.ArbitraryResourceCache;
 import org.qortal.data.arbitrary.ArbitraryResourceData;
+import org.qortal.data.arbitrary.ArbitraryResourceDirtyData;
 import org.qortal.data.arbitrary.ArbitraryResourceMetadata;
 import org.qortal.data.arbitrary.ArbitraryResourceStatus;
 import org.qortal.data.transaction.ArbitraryTransactionData;
@@ -35,6 +36,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Locale;
 import java.util.Objects;
 import java.util.Optional;
 
@@ -172,17 +174,26 @@ public class HSQLDBArbitraryRepository implements ArbitraryRepository {
 
 	@Override
 	public List<ArbitraryTransactionData> getArbitraryTransactions(String name, Service service, String identifier, long since) throws DataException {
-		String sql = "SELECT type, reference, signature, creator, Transactions.created_when, fee, " +
+		StringBuilder sql = new StringBuilder("SELECT type, reference, signature, creator, Transactions.created_when, fee, " +
 				"tx_group_id, block_height, approval_status, approval_height, " +
 				"version, nonce, service, size, is_data_raw, data, metadata_hash, " +
 				"name, identifier, update_method, secret, compression FROM ArbitraryTransactions " +
 				"JOIN Transactions USING (signature) " +
-				"WHERE lower(name) = ? AND service = ?" +
-				"AND (identifier = ? OR (identifier IS NULL AND ? IS NULL))" +
-				"AND Transactions.created_when >= ? ORDER BY Transactions.created_when ASC";
+				"WHERE lower_case_name = ? AND service = ? ");
+		List<Object> bindParams = new ArrayList<>();
+		bindParams.add(name.toLowerCase(Locale.ROOT));
+		bindParams.add(service.value);
+		if (identifier == null) {
+			sql.append("AND identifier IS NULL ");
+		} else {
+			sql.append("AND identifier = ? ");
+			bindParams.add(identifier);
+		}
+		sql.append("AND ArbitraryTransactions.created_when >= ? ORDER BY ArbitraryTransactions.created_when ASC");
+		bindParams.add(since);
 		List<ArbitraryTransactionData> arbitraryTransactionData = new ArrayList<>();
 
-		try (ResultSet resultSet = this.repository.checkedExecute(sql, name.toLowerCase(), service.value, identifier, identifier, since)) {
+		try (ResultSet resultSet = this.repository.checkedExecute(sql.toString(), bindParams.toArray())) {
 			if (resultSet == null)
 				return null;
 
@@ -428,6 +439,35 @@ public class HSQLDBArbitraryRepository implements ArbitraryRepository {
 	}
 
 	@Override
+	public List<ArbitraryTransactionDataHashWrapper> getLatestArbitraryMetadataCandidates(int limit) throws DataException {
+		List<ArbitraryTransactionDataHashWrapper> results = new ArrayList<>();
+		if (limit <= 0)
+			return results;
+
+		StringBuilder sql = new StringBuilder("SELECT signature, service, name, identifier, metadata_hash, created_when " +
+				"FROM ArbitraryTransactions WHERE name IS NOT NULL ORDER BY created_when DESC");
+		HSQLDBRepository.limitOffsetSql(sql, limit, null);
+		// The name predicate otherwise takes precedence and HSQLDB uses ArbitraryNameCreatedIndex,
+		// materializing and sorting every named row. This HSQLDB hint makes LIMIT walk the
+		// chronological index and stop as soon as it has found the requested named rows.
+		sql.append(" USING INDEX");
+
+		try (ResultSet resultSet = this.repository.checkedExecute(sql.toString())) {
+			if (resultSet == null)
+				return results;
+
+			do {
+				results.add(new ArbitraryTransactionDataHashWrapper(resultSet.getBytes(1), resultSet.getInt(2),
+						resultSet.getString(3), resultSet.getString(4), resultSet.getBytes(5), resultSet.getLong(6)));
+			} while (resultSet.next());
+
+			return results;
+		} catch (SQLException e) {
+			throw new DataException("Unable to fetch latest arbitrary metadata candidates", e);
+		}
+	}
+
+	@Override
 	public List<ArbitraryTransactionData> getLatestArbitraryTransactionsByName( String name ) throws DataException {
 		String sql = "SELECT type, reference, signature, creator, Transactions.created_when, fee, " +
 				"tx_group_id, block_height, approval_status, approval_height, " +
@@ -503,14 +543,22 @@ public class HSQLDBArbitraryRepository implements ArbitraryRepository {
 		}
 
 		StringBuilder sql = new StringBuilder(1024);
+		List<Object> bindParams = new ArrayList<>();
 
 		sql.append("SELECT type, reference, signature, creator, Transactions.created_when, fee, " +
 				"tx_group_id, block_height, approval_status, approval_height, " +
 				"version, nonce, service, size, is_data_raw, data, metadata_hash, " +
 				"name, identifier, update_method, secret, compression FROM ArbitraryTransactions " +
 				"JOIN Transactions USING (signature) " +
-				"WHERE lower(name) = ? AND service = ? " +
-				"AND (identifier = ? OR (identifier IS NULL AND ? IS NULL))");
+				"WHERE lower_case_name = ? AND service = ? ");
+		bindParams.add(name.toLowerCase(Locale.ROOT));
+		bindParams.add(service.value);
+		if (identifier == null) {
+			sql.append("AND identifier IS NULL");
+		} else {
+			sql.append("AND identifier = ?");
+			bindParams.add(identifier);
+		}
 
 		if (method != null) {
 			sql.append(" AND update_method = ");
@@ -528,7 +576,7 @@ public class HSQLDBArbitraryRepository implements ArbitraryRepository {
 
 		sql.append(" LIMIT 1");
 
-		try (ResultSet resultSet = this.repository.checkedExecute(sql.toString(), name.toLowerCase(), service.value, identifier, identifier)) {
+		try (ResultSet resultSet = this.repository.checkedExecute(sql.toString(), bindParams.toArray())) {
 			if (resultSet == null)
 				return null;
 
@@ -652,6 +700,49 @@ public class HSQLDBArbitraryRepository implements ArbitraryRepository {
 		return this.getSingleTransaction(name, service, method, identifier, false);
 	}
 
+	@Override
+	public boolean isOldestNamedResourceMissingFromCache() throws DataException {
+		// Use the timestamp index to stop at the first named transaction. Only read resource keys at that timestamp.
+		String sql = "SELECT DISTINCT service, name, identifier FROM ArbitraryTransactions "
+				+ "WHERE name IS NOT NULL AND created_when = (SELECT created_when FROM ArbitraryTransactions "
+				+ "WHERE name IS NOT NULL ORDER BY created_when LIMIT 1 USING INDEX)";
+
+		try (ResultSet rows = this.repository.checkedExecute(sql)) {
+			if (rows == null)
+				return false;
+
+			Boolean firstMissing = null;
+			do {
+				Service service = Service.valueOf(rows.getInt(1));
+				String name = rows.getString(2);
+				String identifier = rows.getString(3);
+				// Let the transaction decoder handle historical values that need its original interpretation.
+				if (service == null || (identifier != null && identifier.isEmpty()))
+					return isLegacyOldestNamedResourceMissing();
+
+				boolean missing = getArbitraryResource(service, name, identifier) == null;
+				if (firstMissing != null && firstMissing != missing)
+					// The original query orders by timestamp alone. Preserve its choice when the tie matters.
+					return isLegacyOldestNamedResourceMissing();
+
+				firstMissing = missing;
+			} while (rows.next());
+
+			return firstMissing;
+		} catch (SQLException e) {
+			throw new DataException("Unable to check the oldest named arbitrary resource", e);
+		}
+	}
+
+	private boolean isLegacyOldestNamedResourceMissing() throws DataException {
+		List<ArbitraryTransactionData> transactions = getArbitraryTransactions(true, 1, 0, false);
+		if (transactions == null || transactions.isEmpty())
+			return false;
+
+		ArbitraryTransactionData oldest = transactions.get(0);
+		return getArbitraryResource(oldest.getService(), oldest.getName(), oldest.getIdentifier()) == null;
+	}
+
 	public List<ArbitraryTransactionData> getArbitraryTransactions(boolean requireName, Integer limit, Integer offset, Boolean reverse) throws DataException {
 		StringBuilder sql = new StringBuilder(512);
 		sql.append("SELECT type, reference, signature, creator, Transactions.created_when, fee, " +
@@ -731,6 +822,89 @@ public class HSQLDBArbitraryRepository implements ArbitraryRepository {
 		}
 	}
 
+	@Override
+	public void markResourceDirty(ArbitraryTransactionData transactionData, int flags) throws DataException {
+		if (transactionData == null || transactionData.getName() == null || transactionData.getService() == null || flags == 0)
+			return;
+
+		String identifier = transactionData.getIdentifier() != null ? transactionData.getIdentifier() : "default";
+		String lowerCaseName = transactionData.getName().toLowerCase(Locale.ROOT);
+		long now = System.currentTimeMillis();
+		String sql = "INSERT INTO ArbitraryResourceDirty " +
+				"(service, lower_case_name, name, identifier, flags, triggering_signature, revision, retry_count, next_attempt, updated_when) " +
+				"VALUES (?, ?, ?, ?, ?, ?, 1, 0, ?, ?) ON DUPLICATE KEY UPDATE " +
+				"name = ?, flags = flags + ? - BITAND(flags, ?), triggering_signature = ?, " +
+				"revision = revision + 1, retry_count = 0, next_attempt = ?, updated_when = ?";
+
+		try {
+			this.repository.executeCheckedUpdate(sql, transactionData.getService().value, lowerCaseName,
+					transactionData.getName(), identifier, flags, transactionData.getSignature(), now, now,
+					transactionData.getName(), flags, flags, transactionData.getSignature(), now, now);
+		} catch (SQLException e) {
+			throw new DataException("Unable to mark arbitrary resource cache entry dirty", e);
+		}
+	}
+
+	@Override
+	public List<ArbitraryResourceDirtyData> getDirtyResources(int limit, long now) throws DataException {
+		StringBuilder sql = new StringBuilder("SELECT service, name, identifier, flags, triggering_signature, revision, retry_count " +
+				"FROM ArbitraryResourceDirty WHERE next_attempt <= ? ORDER BY next_attempt, updated_when");
+		HSQLDBRepository.limitOffsetSql(sql, limit, null);
+		List<ArbitraryResourceDirtyData> results = new ArrayList<>();
+		try (ResultSet resultSet = this.repository.checkedExecute(sql.toString(), now)) {
+			if (resultSet == null)
+				return results;
+			do {
+				results.add(new ArbitraryResourceDirtyData(Service.valueOf(resultSet.getInt(1)),
+						resultSet.getString(2), resultSet.getString(3), resultSet.getInt(4),
+						resultSet.getBytes(5), resultSet.getLong(6), resultSet.getInt(7)));
+			} while (resultSet.next());
+			return results;
+		} catch (SQLException e) {
+			throw new DataException("Unable to fetch dirty arbitrary resources", e);
+		}
+	}
+
+	@Override
+	public void clearDirtyResource(ArbitraryResourceDirtyData dirtyData) throws DataException {
+		try {
+			this.repository.delete("ArbitraryResourceDirty",
+					"service = ? AND lower_case_name = ? AND identifier = ? AND revision = ?",
+					dirtyData.getService().value, dirtyData.getName().toLowerCase(Locale.ROOT),
+					dirtyData.getIdentifier(), dirtyData.getRevision());
+		} catch (SQLException e) {
+			throw new DataException("Unable to acknowledge dirty arbitrary resource", e);
+		}
+	}
+
+	@Override
+	public void deferDirtyResource(ArbitraryResourceDirtyData dirtyData, long nextAttempt) throws DataException {
+		String sql = "UPDATE ArbitraryResourceDirty SET retry_count = retry_count + 1, next_attempt = ? " +
+				"WHERE service = ? AND lower_case_name = ? AND identifier = ? AND revision = ?";
+		try {
+			this.repository.executeCheckedUpdate(sql, nextAttempt, dirtyData.getService().value,
+					dirtyData.getName().toLowerCase(Locale.ROOT), dirtyData.getIdentifier(), dirtyData.getRevision());
+		} catch (SQLException e) {
+			throw new DataException("Unable to defer dirty arbitrary resource", e);
+		}
+	}
+
+	@Override
+	public void sanitizeDirtyResourcesForBootstrap() throws DataException {
+		try {
+			// HEAD_DIRTY is generated by chain processing and must survive until the
+			// materialized resource cache catches up. Every other flag represents
+			// work derived from the originating node's local QDN files.
+			this.repository.delete("ArbitraryResourceDirty", "BITAND(flags, ?) = 0",
+					ArbitraryResourceDirtyData.HEAD_DIRTY);
+			this.repository.executeCheckedUpdate("UPDATE ArbitraryResourceDirty SET " +
+					"flags = ?, triggering_signature = NULL, retry_count = 0, next_attempt = 0, updated_when = 0",
+					ArbitraryResourceDirtyData.HEAD_DIRTY);
+		} catch (SQLException e) {
+			throw new DataException("Unable to sanitize dirty arbitrary resources for bootstrap", e);
+		}
+	}
+
 
 	// Resource related
 
@@ -748,10 +922,10 @@ public class HSQLDBArbitraryRepository implements ArbitraryRepository {
 				"title, description, category, tag1, tag2, tag3, tag4, tag5, latest_signature " +
 				"FROM ArbitraryResourcesCache " +
 				"LEFT JOIN ArbitraryMetadataCache USING (service, name, identifier) " +
-				"WHERE ArbitraryResourcesCache.service = ? AND ArbitraryResourcesCache.name = ?");
+				"WHERE ArbitraryResourcesCache.service = ? AND ArbitraryResourcesCache.lower_case_name = ?");
 
 		bindParams.add(service.value);
-		bindParams.add(name);
+		bindParams.add(name.toLowerCase(Locale.ROOT));
 
 		if (identifier != null) {
 			sql.append(" AND identifier = ?");
@@ -843,14 +1017,20 @@ public class HSQLDBArbitraryRepository implements ArbitraryRepository {
 		bindParams.add(identifier != null ? identifier : "default");
 
 		try (ResultSet resultSet = this.repository.checkedExecute(sql.toString(), bindParams.toArray())) {
-			if (resultSet == null)
-				return null;
-
-			return resultSet.getBytes(1);
+			if (resultSet != null) {
+				byte[] latestSignature = resultSet.getBytes(1);
+				if (latestSignature != null)
+					return latestSignature;
+			}
 
 		} catch (SQLException e) {
 			throw new DataException("Unable to fetch arbitrary resource from repository", e);
 		}
+
+		// The materialized cache is intentionally asynchronous. Keep reads correct while a
+		// newly committed resource, restart backlog, or retry is waiting for the worker.
+		ArbitraryTransactionData latestTransaction = getLatestTransaction(name, service, null, identifier);
+		return latestTransaction != null ? latestTransaction.getSignature() : null;
 	}
 
 	@Override
@@ -1115,10 +1295,11 @@ public class HSQLDBArbitraryRepository implements ArbitraryRepository {
 				= HSQLDBCacheUtils.callCache(
 					ArbitraryResourceCache.getInstance(),
 					service, query, identifier, names, title, description, prefixOnly, exactMatchNames,
+					keywords,
 					defaultResource, mode, minLevel, followedOnly, excludeBlocked, includeMetadata, includeStatus,
 					before, after, limit, offset, reverse);
 
-			if( !list.isEmpty() ) {
+			if (!list.isEmpty() || (service != null && ArbitraryResourceCache.getInstance().isInitialized())) {
 				List<ArbitraryResourceData> results
 					= HSQLDBCacheUtils.filterList(
 						list,
@@ -1582,14 +1763,17 @@ public class HSQLDBArbitraryRepository implements ArbitraryRepository {
 	}
 
 	@Override
-	public void setStatus(ArbitraryResourceData arbitraryResourceData, ArbitraryResourceStatus.Status status) throws DataException {
+	public boolean setStatus(ArbitraryResourceData arbitraryResourceData, ArbitraryResourceStatus.Status status) throws DataException {
 		if (status == null) {
-			return;
+			return false;
 		}
-		String updateSql = "UPDATE ArbitraryResourcesCache SET status = ? WHERE service = ? AND LCASE(name) = ? AND LCASE(identifier) = ?";
+		String updateSql = "UPDATE ArbitraryResourcesCache SET status = ? " +
+				"WHERE service = ? AND lower_case_name = ? AND identifier = ? AND (status IS NULL OR status <> ?)";
 
 		try {
-			this.repository.executeCheckedUpdate(updateSql, status.value, arbitraryResourceData.service.value, arbitraryResourceData.name.toLowerCase(), arbitraryResourceData.identifier.toLowerCase());
+			return this.repository.executeCheckedUpdate(updateSql, status.value, arbitraryResourceData.service.value,
+					arbitraryResourceData.name.toLowerCase(Locale.ROOT), arbitraryResourceData.identifier,
+					status.value) > 0;
 		} catch (SQLException e) {
 			throw new DataException("Unable to set status for arbitrary resource", e);
 		}
@@ -1600,8 +1784,8 @@ public class HSQLDBArbitraryRepository implements ArbitraryRepository {
 		// NOTE: arbitrary metadata are deleted automatically by the database thanks to "ON DELETE CASCADE"
 		// in ArbitraryMetadataCache' FOREIGN KEY definition.
 		try {
-			this.repository.delete("ArbitraryResourcesCache", "service = ? AND name = ? AND identifier = ?",
-					arbitraryResourceData.service.value, arbitraryResourceData.name, arbitraryResourceData.identifier);
+			this.repository.delete("ArbitraryResourcesCache", "service = ? AND lower_case_name = ? AND identifier = ?",
+					arbitraryResourceData.service.value, arbitraryResourceData.name.toLowerCase(Locale.ROOT), arbitraryResourceData.identifier);
 
 		} catch (SQLException e) {
 			throw new DataException("Unable to delete account from repository", e);

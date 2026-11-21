@@ -574,6 +574,8 @@ public class ArbitraryDataFileListRelayTests {
 
         RecordingPeer(int port) {
             super(new PeerData(PeerAddress.fromString("127.0.0.1:" + port), 0L, "relay-test"), Peer.NETWORKDATA);
+            setPeersCapabilities(new org.qortal.network.helper.PeerCapabilities(Collections.singletonMap(
+                    org.qortal.network.helper.PeerCapabilities.QDN_OPTIONAL_SOURCE_ADDRESS, true)));
         }
 
         @Override

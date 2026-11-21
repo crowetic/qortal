@@ -193,6 +193,19 @@ public class HSQLDBAccountRepository implements AccountRepository {
 		}
 	}
 
+    @Override
+    public void setLastReferences(List<AccountData> accounts) throws DataException {
+        List<Object[]> withKey = new java.util.ArrayList<>(), withoutKey = new java.util.ArrayList<>();
+        for (AccountData account : accounts) {
+            if (account.getPublicKey() == null) withoutKey.add(new Object[]{account.getAddress(),account.getReference(),account.getReference()});
+            else withKey.add(new Object[]{account.getAddress(),account.getReference(),account.getPublicKey(),account.getReference(),account.getPublicKey()});
+        }
+        try {
+            repository.executeCheckedBatchUpdate("INSERT INTO Accounts(account,reference) VALUES(?,?) ON DUPLICATE KEY UPDATE reference=?", withoutKey);
+            repository.executeCheckedBatchUpdate("INSERT INTO Accounts(account,reference,public_key) VALUES(?,?,?) ON DUPLICATE KEY UPDATE reference=?,public_key=?", withKey);
+        } catch (SQLException e) { throw new DataException("Unable to batch account references",e); }
+    }
+
 	@Override
 	public void setLastReference(AccountData accountData) throws DataException {
 		HSQLDBSaver saveHelper = new HSQLDBSaver("Accounts");
@@ -606,6 +619,15 @@ public class HSQLDBAccountRepository implements AccountRepository {
 			}
 		}
 	}
+
+    @Override
+    public void modifyExistingAssetBalances(List<AccountBalanceData> deltas) throws DataException {
+        List<Object[]> parameters = deltas.stream().filter(delta -> delta.getBalance() != 0L)
+                .map(delta -> new Object[]{delta.getBalance(),delta.getAddress(),delta.getAssetId()}).collect(Collectors.toList());
+        try {
+            repository.executeCheckedBatchUpdate("UPDATE AccountBalances SET balance=balance+? WHERE account=? AND asset_id=?",parameters);
+        } catch (SQLException e) { throw new DataException("Unable to batch existing account balance changes",e); }
+    }
 
 	public void modifyAssetBalances(List<AccountBalanceData> accountBalanceDeltas) throws DataException {
 		// Nothing to do?

@@ -9,6 +9,7 @@ import org.qortal.arbitrary.metadata.ArbitraryDataTransactionMetadata;
 import org.qortal.arbitrary.misc.Service;
 import org.qortal.block.BlockChain;
 import org.qortal.controller.arbitrary.ArbitraryDataManager;
+import org.qortal.controller.arbitrary.ArbitraryResourceStateRegistry;
 import org.qortal.controller.arbitrary.ArbitraryTransactionDataHashWrapper;
 import org.qortal.controller.repository.NamesDatabaseIntegrityCheck;
 import org.qortal.crypto.Crypto;
@@ -16,6 +17,7 @@ import org.qortal.crypto.MemoryPoW;
 import org.qortal.data.PaymentData;
 import org.qortal.data.arbitrary.ArbitraryResourceCache;
 import org.qortal.data.arbitrary.ArbitraryResourceData;
+import org.qortal.data.arbitrary.ArbitraryResourceDirtyData;
 import org.qortal.data.arbitrary.ArbitraryResourceMetadata;
 import org.qortal.data.arbitrary.ArbitraryResourceStatus;
 import org.qortal.data.naming.NameData;
@@ -26,7 +28,6 @@ import org.qortal.notification.ResourcePublishedEvent;
 import org.qortal.payment.Payment;
 import org.qortal.repository.DataException;
 import org.qortal.repository.Repository;
-import org.qortal.repository.RepositoryManager;
 import org.qortal.settings.Settings;
 import org.qortal.transform.TransformationException;
 import org.qortal.transform.Transformer;
@@ -298,9 +299,8 @@ public class ArbitraryTransaction extends Transaction {
 		this.updateCaches(false);
 	}
 
-	private void updateCaches(boolean autoInvalidate) {
-		// Very important to use a separate repository instance from the one being used for validation/processing
-		try (final Repository repository = RepositoryManager.getRepository()) {
+	private void updateCaches(boolean autoInvalidate) throws DataException {
+		try {
 			// If the data is local, we need to perform a few actions
 			if (isDataLocal()) {
 
@@ -315,23 +315,17 @@ public class ArbitraryTransaction extends Transaction {
 				}
 			}
 
-			// Add/update arbitrary resource caches, but don't update the status as this involves time-consuming
-			// disk reads, and is more prone to failure. The status will be updated on metadata retrieval, or when
-			// accessing the resource.
-			// Also, must add this transaction as a latest transaction, since the it has not been saved to the
-			// repository yet.
-			this.updateArbitraryResourceCacheIncludingMetadata(
-				repository,
-				Set.of(new ArbitraryTransactionDataHashWrapper(arbitraryTransactionData)),
-				new HashMap<>(0)
-			);
-
-			repository.saveChanges();
-
 		} catch (Exception e) {
-			// Log and ignore all exceptions. The cache is updated from other places too, and can be rebuilt if needed.
-			LOGGER.info("Unable to update arbitrary caches", e);
+			// File-cache invalidation is rebuildable and must not prevent consensus processing.
+			LOGGER.info("Unable to invalidate arbitrary file cache", e);
 		}
+
+			// Keep this marker in the caller's transaction. It commits or rolls back with the
+			// authoritative transaction, and moves all expensive QDN work off the block path.
+			ArbitraryResourceStateRegistry.getInstance().invalidate(arbitraryTransactionData.getService(),
+					arbitraryTransactionData.getName(), arbitraryTransactionData.getIdentifier());
+			this.repository.getArbitraryRepository().markResourceDirty(arbitraryTransactionData,
+				ArbitraryResourceDirtyData.ALL_DIRTY);
 	}
 
 	@Override
@@ -345,6 +339,12 @@ public class ArbitraryTransaction extends Transaction {
 	public void orphan() throws DataException {
 		// Wrap and delegate payment processing to Payment class.
 		new Payment(this.repository).orphan(arbitraryTransactionData.getSenderPublicKey(), arbitraryTransactionData.getPayments());
+
+			// Recompute the materialized resource view after this chain change commits.
+			ArbitraryResourceStateRegistry.getInstance().invalidate(arbitraryTransactionData.getService(),
+					arbitraryTransactionData.getName(), arbitraryTransactionData.getIdentifier());
+			this.repository.getArbitraryRepository().markResourceDirty(arbitraryTransactionData,
+				ArbitraryResourceDirtyData.ALL_DIRTY);
 	}
 
 	@Override
@@ -446,6 +446,9 @@ public class ArbitraryTransaction extends Transaction {
 		}
 		else {
 			resourceByWrapper.put(wrapper, existingArbitraryResourceData);
+			// Preserve the cache row's original primary-key spelling when callers use a
+			// differently-cased form of the same registered name.
+			arbitraryResourceData.name = existingArbitraryResourceData.name;
 			// An entry already exists - update created time from current transaction if this is older
 			arbitraryResourceData.created = Math.min(existingArbitraryResourceData.created, arbitraryTransactionData.getTimestamp());
 
@@ -516,17 +519,16 @@ public class ArbitraryTransaction extends Transaction {
 		// Update in-memory search cache so new/updated resources are visible immediately
 		// without waiting for the periodic cache-refresh timer.
 		if (Settings.getInstance().isDbCacheEnabled()) {
-			ArbitraryResourceCache cache = ArbitraryResourceCache.getInstance();
-			synchronized (cache.getDataByService()) {
-				cache.getDataByService()
-						.computeIfAbsent(service.value, k -> new HashMap<>())
-						.put(ArbitraryResourceCache.resourceKey(name, identifier), arbitraryResourceData);
-			}
+				repository.afterCommit(() -> {
+					ArbitraryResourceCache cache = ArbitraryResourceCache.getInstance();
+					cache.put(arbitraryResourceData);
+				});
 		}
 
 		// Fire RESOURCE_PUBLISHED notification for new resources.
 		if (isNewResource && service != null && name != null) {
-			try {
+			repository.afterCommit(() -> {
+			  try {
 				String serviceName = service.name();
 				String ident = arbitraryTransactionData.getIdentifier() != null ? arbitraryTransactionData.getIdentifier() : "";
 				String sig = arbitraryTransactionData.getSignature() != null ? Base58.encode(arbitraryTransactionData.getSignature()) : null;
@@ -543,15 +545,19 @@ public class ArbitraryTransaction extends Transaction {
 			} catch (Exception e) {
 				LOGGER.debug("Error firing RESOURCE_PUBLISHED notification: {}", e.getMessage());
 			}
+			});
 		}
 
 		// If we saved metadata for the first time, fire full notification (with metadata) so metadata-based filters match.
 		if (metadataFirstTimeEvent != null) {
-			try {
-				NotificationManager.getInstance().processResourcePublished(metadataFirstTimeEvent);
-			} catch (Exception e) {
-				LOGGER.debug("Error firing RESOURCE_PUBLISHED notification (metadata first time): {}", e.getMessage());
-			}
+			ResourcePublishedEvent committedMetadataEvent = metadataFirstTimeEvent;
+			repository.afterCommit(() -> {
+				try {
+					NotificationManager.getInstance().processResourcePublished(committedMetadataEvent);
+				} catch (Exception e) {
+					LOGGER.debug("Error firing RESOURCE_PUBLISHED notification (metadata first time): {}", e.getMessage());
+				}
+			});
 		}
 	}
 
@@ -583,7 +589,16 @@ public class ArbitraryTransaction extends Transaction {
 
 		// Update status
 		ArbitraryDataResource resource = new ArbitraryDataResource(name, ArbitraryDataFile.ResourceIdType.NAME, service, identifier);
-		ArbitraryResourceStatus arbitraryResourceStatus = resource.getStatus(repository);
+			ArbitraryResourceStatus arbitraryResourceStatus;
+			try {
+				arbitraryResourceStatus = ArbitraryResourceStateRegistry.getInstance().getOrReconcile(
+						service, name, identifier, arbitraryTransactionData.getSignature(),
+						() -> resource.getStatus(repository));
+			} catch (DataException e) {
+				throw e;
+			} catch (Exception e) {
+				throw new DataException("Unable to reconcile arbitrary resource status", e);
+			}
 		ArbitraryResourceStatus.Status status = arbitraryResourceStatus != null ? arbitraryResourceStatus.getStatus() : null;
 		repository.getArbitraryRepository().setStatus(arbitraryResourceData, status);
 	}

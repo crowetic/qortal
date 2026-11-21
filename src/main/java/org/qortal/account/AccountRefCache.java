@@ -134,7 +134,8 @@ public class AccountRefCache implements AutoCloseable {
 
 		Map<String, Pair<byte[], byte[]>> newLastReferenceValues = refCache.getNewLastReferences();
 
-		for (Entry<String, Pair<byte[], byte[]>> entry : newLastReferenceValues.entrySet()) {
+		java.util.List<AccountData> updates = new java.util.ArrayList<>(newLastReferenceValues.size());
+        for (Entry<String, Pair<byte[], byte[]>> entry : newLastReferenceValues.entrySet()) {
 			AccountData accountData = new AccountData(entry.getKey());
 
 			accountData.setReference(entry.getValue().getA());
@@ -142,8 +143,9 @@ public class AccountRefCache implements AutoCloseable {
 			if (entry.getValue().getB() != null)
 				accountData.setPublicKey(entry.getValue().getB());
 
-			this.repository.getAccountRepository().setLastReference(accountData);
+			updates.add(accountData);
 		}
+		this.repository.getAccountRepository().setLastReferences(updates);
 	}
 
 	@Override

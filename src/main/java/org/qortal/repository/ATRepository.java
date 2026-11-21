@@ -9,6 +9,11 @@ import java.util.Set;
 
 public interface ATRepository {
 
+    List<org.qortal.data.at.ATExecutionState> getExecutionStates(List<String> addresses) throws DataException;
+    byte[] getStatePayload(byte[] hash) throws DataException;
+    byte[] getStatePayload(String address, int height, byte[] hash) throws DataException;
+    byte[] getCodePayload(byte[] hash) throws DataException;
+
 	// CIYAM AutomatedTransactions
 
 	/** Returns ATData using AT's address or null if none found */
@@ -25,11 +30,33 @@ public interface ATRepository {
 	/** Returns list of executable ATs, empty if none found */
 	public List<ATData> getAllExecutableATs() throws DataException;
 
+	/** Candidates selected against the current repository view, in canonical order; code bytes are loaded lazily. */
+	public List<ATData> getATsForExecution(int candidateHeight) throws DataException;
+
+    /** Persist a pre-serialized block result blob, store new payloads, and update ATCurrentState. */
+    public void saveBlockResult(int height, byte[] blob, List<ATData> updatedHeads, List<ATStateData> states) throws DataException;
+
+    /** Read a block result blob by height, or null if none. */
+    public byte[] getBlockResult(int height) throws DataException;
+
+    /** Delete a block result by height and restore affected ATCurrentState entries. */
+    public void deleteBlockResult(int height) throws DataException;
+
+    /** Update mutable AT flags after restoring a block's parent receipts. */
+    public void saveATMetadata(List<ATData> ats) throws DataException;
+
 	/** Returns list of ATs with matching code hash, optionally executable only. */
 	public List<ATData> getATsByFunctionality(byte[] codeHash, Boolean isExecutable, Integer limit, Integer offset, Boolean reverse) throws DataException;
 
 	/** Returns list of all ATs matching one of passed code hashes, optionally executable only. */
 	public List<ATData> getAllATsByFunctionality(Set<ByteArray> codeHashes, Boolean isExecutable) throws DataException;
+
+	/**
+	 * Returns current AT definitions matching one of the supplied code hashes whose current-state
+	 * head is at or above {@code minimumLatestStateHeight}. A null height returns all matches.
+	 */
+	public List<ATData> getAllATsByFunctionalitySince(Set<ByteArray> codeHashes, Boolean isExecutable,
+			Integer minimumLatestStateHeight) throws DataException;
 
 	/** Returns creation block height given AT's address or null if not found */
 	public Integer getATCreationBlockHeight(String atAddress) throws DataException;
@@ -39,6 +66,9 @@ public interface ATRepository {
 
 	/** Removes an AT from repository, including associated ATStateData */
 	public void delete(String atAddress) throws DataException;
+
+	/** Set the initial or latest state head in ATCurrentState for a newly deployed AT. */
+	public void setCurrentStateHead(String atAddress, int height, byte[] payloadHash) throws DataException;
 
 	// AT States
 
@@ -117,13 +147,6 @@ public interface ATRepository {
 	public List<ATStateData> getBlockATStatesAtHeight(int height) throws DataException;
 
 
-	/** Rebuild the latest AT states cache, necessary for AT state trimming/pruning.
-	 * <p>
-	 * NOTE: performs implicit <tt>repository.saveChanges()</tt>.
-	 */
-	public void rebuildLatestAtStates(int maxHeight) throws DataException;
-
-
 	/** Returns height of first trimmable AT state. */
 	public int getAtTrimHeight() throws DataException;
 
@@ -135,6 +158,32 @@ public interface ATRepository {
 
 	/** Trims full AT state data between passed heights. Returns number of trimmed rows. */
 	public int trimAtStates(int minHeight, int maxHeight, int limit) throws DataException;
+
+	/** Result from a bounded AT payload trim, including whether the requested range is complete. */
+	public static final class ATTrimResult {
+		private final int trimmed;
+		private final boolean rangeComplete;
+
+		public ATTrimResult(int trimmed, boolean rangeComplete) {
+			this.trimmed = trimmed;
+			this.rangeComplete = rangeComplete;
+		}
+
+		public int getTrimmed() {
+			return this.trimmed;
+		}
+
+		public boolean isRangeComplete() {
+			return this.rangeComplete;
+		}
+	}
+
+	/**
+	 * Trims a bounded range and reports when every releasable payload in that range
+	 * was examined. Legacy cleanup performed by the same call does not hold back
+	 * this completion signal.
+	 */
+	public ATTrimResult trimAtStatesDetailed(int minHeight, int maxHeight, int limit) throws DataException;
 
 
 	/** Returns height of first prunable AT state. */
@@ -150,31 +199,20 @@ public interface ATRepository {
 	public int pruneAtStates(int minHeight, int maxHeight) throws DataException;
 
 
-	/** Checks for the presence of the ATStatesHeightIndex in repository */
-	public boolean hasAtStatesHeightIndex() throws DataException;
+	/** Persist the initial state produced by an AT deployment. */
+	public void saveInitialState(ATStateData atStateData) throws DataException;
 
-
-	/**
-	 * Save ATStateData into repository.
-	 * <p>
-	 * Note: Requires at least these <tt>ATStateData</tt> properties to be filled, or an <tt>IllegalArgumentException</tt> will be thrown:
-	 * <p>
-	 * <ul>
-	 * <li><tt>creation</tt></li>
-	 * <li><tt>stateHash</tt></li>
-	 * <li><tt>height</tt></li>
-	 * </ul>
-	 * 
-	 * @param atStateData
-	 * @throws IllegalArgumentException
-	 */
-	public void save(ATStateData atStateData) throws DataException;
-
-	/** Delete AT's state data at this height */
-	public void delete(String atAddress, int height) throws DataException;
+	/** Store an archive V1 AT receipt summary. Archive records never contain VM payload bytes. */
+	public void saveArchivedStateSummary(ATStateData atStateData) throws DataException;
 
 	/** Delete state data for all ATs at this height */
-	public void deleteATStates(int height) throws DataException;
+	/**
+	 * Delete a block's AT states and restore their current-state heads.
+	 *
+	 * @return true when the block result restored all mutable AT metadata, or false when
+	 *         the legacy state path still requires metadata restoration from parent payloads
+	 */
+	public boolean deleteATStates(int height) throws DataException;
 
 	// Finding transactions for ATs to process
 

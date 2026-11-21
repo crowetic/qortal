@@ -1,19 +1,17 @@
 package org.qortal.network.message;
 
-import com.google.common.primitives.Ints;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.qortal.arbitrary.ArbitraryDataFile;
+import org.qortal.arbitrary.QdnByteArrayPool;
 import org.qortal.network.Network;
 import org.qortal.repository.DataException;
 import org.qortal.transform.Transformer;
 
-import java.io.ByteArrayOutputStream;
-import java.io.IOException;
 import java.nio.BufferUnderflowException;
 import java.nio.ByteBuffer;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.CompletionException;
 
 public class ArbitraryDataFileMessage extends Message {
 
@@ -32,9 +30,7 @@ public class ArbitraryDataFileMessage extends Message {
 	
 	// Shallow prefetch: async disk read when message enters sendQueue
 	// Reduces blocking in writeChannel() by having data ready when needed
-	private volatile byte[] prefetchedData = null;
-	private final AtomicBoolean prefetchInProgress = new AtomicBoolean(false);
-	private volatile boolean prefetchComplete = false;
+	private volatile CompletableFuture<byte[]> prefetchFuture;
 
 	/**
 	 * Constructor for outgoing messages.
@@ -83,57 +79,18 @@ public class ArbitraryDataFileMessage extends Message {
 	 * 
 	 * @return true if prefetch was started, false if already in progress or complete
 	 */
-	public boolean startPrefetch() {
-		// Check if already complete
-		if (prefetchComplete) {
-			return false; // Already prefetched
-		}
-		
-		// Skip prefetch if fileContent is already loaded in memory (from byte array constructor)
-		// This prevents double-loading: fileContent + prefetchedData = 2x memory
-		// Prefetch is only needed when data needs to be loaded from disk (filePath exists, fileContent is null)
-		// We can detect this by checking if getBytes() returns data immediately without disk I/O
-		// If arbitraryDataFile was created from byte array, filePath is null and fileContent is set
-		// In that case, getBytes() returns fileContent immediately - no need to prefetch
-		if (arbitraryDataFile != null) {
+	public synchronized boolean startPrefetch() {
+		if (this.arbitraryDataFile == null || this.arbitraryDataFile.hasInMemoryContent()
+				|| this.prefetchFuture != null)
+			return false;
+
+		this.prefetchFuture = CompletableFuture.supplyAsync(() -> {
 			try {
-				// Try to get data - if it returns immediately, it's already in memory
-				// This happens when ArbitraryDataFile was created from byte array (relay cache)
-				byte[] existingData = arbitraryDataFile.getBytes();
-				if (existingData != null) {
-					// Data is already in memory (fileContent) - skip prefetch to avoid double copy
-					// Mark as complete so toBytes() knows data is ready, but don't copy to prefetchedData
-					// toBytes() will use getBytes() which returns fileContent directly
-					prefetchComplete = true;
-					// Don't set prefetchedData - let toBytes() use fileContent directly
-					return false; // No prefetch needed, data already in memory
-				}
-			} catch (Exception e) {
-				// If getBytes() fails, fall through to normal prefetch
-				LOGGER.trace("Could not check existing data for prefetch: {}", e.getMessage());
-			}
-		}
-		
-		// Try to start prefetch (atomic check-and-set)
-		if (!prefetchInProgress.compareAndSet(false, true)) {
-			return false; // Already in progress
-		}
-		
-		// Start async prefetch
-		CompletableFuture.supplyAsync(() -> {
-			try {
-				if (arbitraryDataFile != null) {
-					byte[] data = arbitraryDataFile.getBytes();
-					prefetchedData = data;
-					prefetchComplete = true;
-					return true;
-				}
+				return this.arbitraryDataFile.getBytes();
 			} catch (Exception e) {
 				LOGGER.warn("Prefetch failed for message {}: {}", getId(), e.getMessage());
-			} finally {
-				prefetchInProgress.set(false);
+				return null;
 			}
-			return false;
 		});
 		return true;
 	}
@@ -142,7 +99,9 @@ public class ArbitraryDataFileMessage extends Message {
 	 * Returns true if prefetch is complete and data is ready.
 	 */
 	public boolean isPrefetchReady() {
-		return prefetchComplete && prefetchedData != null;
+		CompletableFuture<byte[]> future = this.prefetchFuture;
+		return future != null && future.isDone() && !future.isCompletedExceptionally()
+				&& future.getNow(null) != null;
 	}
 
 	/**
@@ -156,71 +115,60 @@ public class ArbitraryDataFileMessage extends Message {
 			throw new MessageException("Missing arbitrary data file");
 		}
 
-		// Use prefetched data if available, otherwise load synchronously
-		byte[] data;
-		if (prefetchComplete && prefetchedData != null) {
-			// Prefetch succeeded - use prefetched data
-			data = prefetchedData;
-			// Clear prefetched data immediately after use to free memory
-			// The data is now in the serialized message, so we don't need the prefetched copy
-			prefetchedData = null;
-		} else {
-			// Prefetch not ready or failed - fall back to blocking read
-			// This is the original behavior, so no performance regression
-			data = arbitraryDataFile.getBytes();
+		// If an asynchronous disk read was started, wait for that same read instead of
+		// issuing a second synchronous read when the write queue reaches this message.
+		CompletableFuture<byte[]> future = this.prefetchFuture;
+		byte[] data = null;
+		if (future != null) {
+			try {
+				data = future.join();
+			} catch (CompletionException e) {
+				LOGGER.debug("Prefetch completion failed for message {}: {}", getId(), e.getMessage());
+			}
 		}
+		this.prefetchFuture = null;
+		if (data == null)
+			data = this.arbitraryDataFile.getBytes();
+		if (data == null)
+			throw new MessageException("Unable to load arbitrary data file");
 		
 		// Clear fileContent after loading - we no longer need it in memory
 		// The serialized message will be sent, and data can be reloaded from disk if needed
 		arbitraryDataFile.clearFileContent();
 
-		// Serialize data payload
-		ByteArrayOutputStream dataBytesStream = new ByteArrayOutputStream();
-		try {
-			dataBytesStream.write(signature);
-			dataBytesStream.write(Ints.toByteArray(data.length));
-			dataBytesStream.write(data);
-		} catch (IOException e) {
-			throw new AssertionError("IOException shouldn't occur with ByteArrayOutputStream");
-		}
-
-		byte[] dataBytes = dataBytesStream.toByteArray();
-		byte[] checksumBytes = Message.generateChecksum(dataBytes);
+		int dataLength = this.signature.length + Integer.BYTES + data.length;
 
 		// Calculate full message length
 		int messageLength = MAGIC_LENGTH + TYPE_LENGTH + HAS_ID_LENGTH;
 		messageLength += this.hasId() ? ID_LENGTH : 0;
-		messageLength += DATA_SIZE_LENGTH + (dataBytes.length > 0 ? CHECKSUM_LENGTH + dataBytes.length : 0);
+		messageLength += DATA_SIZE_LENGTH + CHECKSUM_LENGTH + dataLength;
 
 		if (messageLength > MAX_DATA_SIZE)
 			throw new MessageException(String.format("About to send message with length %d larger than allowed %d", messageLength, MAX_DATA_SIZE));
 
-		// Serialize full message
-		ByteArrayOutputStream bytes = new ByteArrayOutputStream(messageLength);
-		try {
-			// Magic
-			bytes.write(Network.getInstance().getMessageMagic());
+		// Allocate the wire message once. The previous ByteArrayOutputStream path copied
+		// the chunk into a payload buffer, copied that buffer out, copied it into the full
+		// message, and then copied the full message out again.
+		byte[] messageBytes = new byte[messageLength];
+		ByteBuffer output = ByteBuffer.wrap(messageBytes);
+		output.put(Network.getInstance().getMessageMagic());
+		output.putInt(this.type.value);
+		output.put((byte) (this.hasId() ? 1 : 0));
+		if (this.hasId())
+			output.putInt(this.id);
+		output.putInt(dataLength);
 
-			bytes.write(Ints.toByteArray(this.type.value));
+		int checksumOffset = output.position();
+		output.position(checksumOffset + CHECKSUM_LENGTH);
+		int dataOffset = output.position();
+		output.put(this.signature);
+		output.putInt(data.length);
+		output.put(data);
 
-			if (this.hasId()) {
-				bytes.write(1);
-				bytes.write(Ints.toByteArray(this.id));
-			} else {
-				bytes.write(0);
-			}
-
-			bytes.write(Ints.toByteArray(dataBytes.length));
-
-			if (dataBytes.length > 0) {
-				bytes.write(checksumBytes);
-				bytes.write(dataBytes);
-			}
-
-			return bytes.toByteArray();
-		} catch (IOException e) {
-			throw new MessageException("Failed to serialize message", e);
-		}
+		ByteBuffer payload = ByteBuffer.wrap(messageBytes, dataOffset, dataLength).slice();
+		byte[] checksum = Message.generateChecksum(payload);
+		System.arraycopy(checksum, 0, messageBytes, checksumOffset, CHECKSUM_LENGTH);
+		return messageBytes;
 	}
 
 	public static Message fromByteBuffer(int id, ByteBuffer byteBuffer) throws MessageException {
@@ -228,17 +176,21 @@ public class ArbitraryDataFileMessage extends Message {
 		byteBuffer.get(signature);
 
 		int dataLength = byteBuffer.getInt();
+		if (dataLength < 0)
+			throw new MessageException("Invalid arbitrary data file length: " + dataLength);
 
 		if (byteBuffer.remaining() < dataLength)
 			throw new BufferUnderflowException();
 
-		byte[] data = new byte[dataLength];
-		byteBuffer.get(data);
+		byte[] data = QdnByteArrayPool.acquire(dataLength);
+		byteBuffer.get(data, 0, dataLength);
 
 		try {
-			ArbitraryDataFile arbitraryDataFile = new ArbitraryDataFile(data, signature, false);
+			ArbitraryDataFile arbitraryDataFile = ArbitraryDataFile.fromReceivedBytes(
+					data, dataLength, signature, () -> QdnByteArrayPool.release(data, dataLength));
 			return new ArbitraryDataFileMessage(id, signature, arbitraryDataFile);
 		} catch (DataException e) {
+			QdnByteArrayPool.release(data, dataLength);
 			LOGGER.info("Unable to process received file: {}", e.getMessage());
 			throw new MessageException("Unable to process received file: " + e.getMessage(), e);
 		}

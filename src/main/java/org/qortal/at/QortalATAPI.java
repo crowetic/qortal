@@ -36,6 +36,7 @@ public class QortalATAPI extends API {
 
 	// Properties
 	private Repository repository;
+	private final ATExecutionContext executionContext;
 	private ATData atData;
 	private long blockTimestamp;
 	private final CiyamAtSettings ciyamAtSettings;
@@ -46,6 +47,11 @@ public class QortalATAPI extends API {
 	// Constructors
 
 	public QortalATAPI(Repository repository, ATData atData, long blockTimestamp) {
+        this(repository, atData, blockTimestamp, null);
+    }
+
+    public QortalATAPI(Repository repository, ATData atData, long blockTimestamp, ATExecutionContext executionContext) {
+        this.executionContext = executionContext;
 		this.repository = repository;
 		this.atData = atData;
 		this.transactions = new ArrayList<>();
@@ -78,7 +84,7 @@ public class QortalATAPI extends API {
 			if (!wakeDueToHeight) {
 				// No avoiding asking repository
 				Timestamp previousTxTimestamp = new Timestamp(sleepUntilMessageTimestamp);
-				NextTransactionInfo nextTransactionInfo = this.repository.getATRepository().findNextTransaction(this.atData.getATAddress(),
+				NextTransactionInfo nextTransactionInfo = this.findNextTransaction(this.atData.getATAddress(),
 						previousTxTimestamp.blockHeight,
 						previousTxTimestamp.transactionSequence);
 
@@ -105,6 +111,18 @@ public class QortalATAPI extends API {
 		}
 	}
 
+    private NextTransactionInfo findNextTransaction(String address, int height, int sequence) throws DataException {
+        return executionContext != null ? executionContext.next(address, height, sequence) : repository.getATRepository().findNextTransaction(address,height,sequence);
+    }
+
+    Integer getAccountBlocksMinted(Account account) throws DataException {
+        return executionContext != null ? executionContext.blocksMinted(account.getAddress()) : account.getBlocksMinted();
+    }
+
+    Integer getAccountLevel(Account account) throws DataException {
+        return executionContext != null ? executionContext.level(account.getAddress()) : account.getLevel();
+    }
+
 	// Inherited methods from CIYAM AT API
 
 	@Override
@@ -128,7 +146,7 @@ public class QortalATAPI extends API {
 	@Override
 	public int getCurrentBlockHeight() {
 		try {
-			return this.repository.getBlockRepository().getBlockchainHeight();
+			return this.executionContext != null ? this.executionContext.height() : this.repository.getBlockRepository().getBlockchainHeight();
 		} catch (DataException e) {
 			throw new RuntimeException("AT API unable to fetch current blockchain height?", e);
 		}
@@ -137,7 +155,7 @@ public class QortalATAPI extends API {
 	@Override
 	public int getATCreationBlockHeight(MachineState state) {
 		try {
-			return this.repository.getATRepository().getATCreationBlockHeight(this.atData.getATAddress());
+			return this.executionContext != null ? this.executionContext.creationHeight(this.atData.getATAddress()) : this.repository.getATRepository().getATCreationBlockHeight(this.atData.getATAddress());
 		} catch (DataException e) {
 			throw new RuntimeException("AT API unable to fetch AT's creation block height?", e);
 		}
@@ -146,18 +164,22 @@ public class QortalATAPI extends API {
 	@Override
 	public void putPreviousBlockHashIntoA(MachineState state) {
 		try {
-			int previousBlockHeight = this.repository.getBlockRepository().getBlockchainHeight() - 1;
+			int previousBlockHeight = getCurrentBlockHeight() - 1;
 
 			// We only need signature, so only request a block summary
-			List<BlockSummaryData> blockSummaries = this.repository.getBlockRepository().getBlockSummaries(previousBlockHeight, previousBlockHeight);
-			if (blockSummaries == null || blockSummaries.size() != 1)
-				throw new RuntimeException("AT API unable to fetch previous block hash?");
+            byte[] signature;
+            if (executionContext != null) signature = executionContext.previousSignature();
+            else {
+                List<BlockSummaryData> blockSummaries = repository.getBlockRepository().getBlockSummaries(previousBlockHeight, previousBlockHeight);
+                if (blockSummaries == null || blockSummaries.size() != 1)
+                    throw new RuntimeException("AT API unable to fetch previous block hash?");
+                signature = blockSummaries.get(0).getSignature();
+            }
 
 			// Block's signature is 128 bytes so we need to reduce this to 4 longs (32 bytes)
 			// To be able to use hash to look up block, save height (8 bytes) and partial signature (24 bytes)
 			this.setA1(state, previousBlockHeight);
 
-			byte[] signature = blockSummaries.get(0).getSignature();
 			// Save some of minter's signature and transactions signature, so middle 24 bytes of the full 128 byte signature.
 			this.setA2(state, BitTwiddling.longFromBEBytes(signature, 52));
 			this.setA3(state, BitTwiddling.longFromBEBytes(signature, 60));
@@ -181,7 +203,7 @@ public class QortalATAPI extends API {
 
 		ATRepository.NextTransactionInfo nextTransactionInfo;
 		try {
-			nextTransactionInfo = this.getRepository().getATRepository().findNextTransaction(atAddress, height, sequence);
+			nextTransactionInfo = this.findNextTransaction(atAddress, height, sequence);
 		} catch (DataException e) {
 			throw new RuntimeException("AT API unable to fetch next transaction?", e);
 		}
@@ -271,7 +293,7 @@ public class QortalATAPI extends API {
 			TransactionData transactionData = this.getTransactionFromA(state);
 
 			try {
-				BlockData blockData = this.repository.getBlockRepository().getLastBlock();
+				BlockData blockData = executionContext != null ? executionContext.parent() : this.repository.getBlockRepository().getLastBlock();
 
 				if (blockData == null)
 					throw new RuntimeException("AT API unable to fetch latest block?");
@@ -343,7 +365,7 @@ public class QortalATAPI extends API {
 		try {
 			Account atAccount = this.getATAccount();
 
-			return atAccount.getConfirmedBalance(Asset.QORT);
+			return this.executionContext != null ? this.executionContext.balance(this.atData.getATAddress()) : atAccount.getConfirmedBalance(Asset.QORT);
 		} catch (DataException e) {
 			throw new RuntimeException("AT API unable to fetch AT's current balance?", e);
 		}
@@ -462,8 +484,7 @@ public class QortalATAPI extends API {
 		Timestamp timestamp = new Timestamp(this.getA1(state));
 
 		try {
-			TransactionData transactionData = this.repository.getTransactionRepository().fromHeightAndSequence(timestamp.blockHeight,
-					timestamp.transactionSequence);
+			TransactionData transactionData = this.executionContext != null ? this.executionContext.transaction(timestamp.blockHeight, timestamp.transactionSequence) : this.repository.getTransactionRepository().fromHeightAndSequence(timestamp.blockHeight, timestamp.transactionSequence);
 
 			if (transactionData == null)
 				throw new RuntimeException("AT API unable to fetch transaction?");
@@ -530,7 +551,7 @@ public class QortalATAPI extends API {
 			// Look up AT's account's last reference from repository
 			Account atAccount = this.getATAccount();
 
-			return atAccount.getLastReference();
+			return this.executionContext != null ? this.executionContext.reference(this.atData.getATAddress()) : atAccount.getLastReference();
 		} catch (DataException e) {
 			throw new RuntimeException("AT API unable to fetch AT's last reference from repository?", e);
 		}

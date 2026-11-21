@@ -91,17 +91,18 @@ public class ArbitraryResourceSearchPlanTests extends Common {
     }
 
     @Test
-    public void version53UpgradePreservesResourcesAndAddsOrderedIndex() throws Exception {
+    public void version55UpgradePreservesResourcesAndAddsOrderedIndex() throws Exception {
         String url = "jdbc:hsqldb:mem:resource-index-upgrade-" + UUID.randomUUID();
         try (Connection connection = DriverManager.getConnection(url)) {
             try (Statement statement = connection.createStatement()) {
-                statement.execute("CREATE TABLE DatabaseInfo(version INT NOT NULL)");
-                statement.execute("INSERT INTO DatabaseInfo VALUES(53)");
-                statement.execute("CREATE TABLE ArbitraryResourcesCache(service SMALLINT, created_when BIGINT)");
-                statement.execute("INSERT INTO ArbitraryResourcesCache VALUES(100,10),(200,20),(100,30)");
+                HSQLDBDatabaseUpdates.updateDatabase(connection);
+                statement.execute("DROP INDEX ArbitraryResourcesServiceCreatedIndex");
+                statement.execute("UPDATE DatabaseInfo SET version=55");
+                statement.execute("INSERT INTO ArbitraryResourcesCache(service,name,identifier,size,created_when) "
+                        + "VALUES(100,'alpha','default',0,10),(200,'beta','default',0,20),(100,'gamma','default',0,30)");
             }
             HSQLDBDatabaseUpdates.updateDatabase(connection);
-            assertEquals(54, HSQLDBDatabaseUpdates.fetchDatabaseVersion(connection));
+            assertEquals(57, HSQLDBDatabaseUpdates.fetchDatabaseVersion(connection));
             SortedMap<Integer, String> columns = new TreeMap<>();
             try (ResultSet indexes = connection.getMetaData().getIndexInfo(null, "PUBLIC", "ARBITRARYRESOURCESCACHE", false, false)) {
                 while (indexes.next()) {
@@ -117,7 +118,7 @@ public class ArbitraryResourceSearchPlanTests extends Common {
             }
             // Reopening/updating a migrated schema must not attempt to recreate the index.
             HSQLDBDatabaseUpdates.updateDatabase(connection);
-            assertEquals(54, HSQLDBDatabaseUpdates.fetchDatabaseVersion(connection));
+            assertEquals(57, HSQLDBDatabaseUpdates.fetchDatabaseVersion(connection));
             try (Statement statement = connection.createStatement()) { statement.execute("SHUTDOWN"); }
         }
     }

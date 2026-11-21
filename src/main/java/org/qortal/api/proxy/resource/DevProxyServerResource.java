@@ -32,14 +32,16 @@ public class DevProxyServerResource {
 
 
     @GET
-    public HttpServletResponse getProxyIndex() {
-        return this.proxy("/");
+    public void getProxyIndex() throws java.io.IOException {
+        this.proxy("/");
+        response.flushBuffer();
     }
 
     @GET
     @Path("{path:.*}")
-    public HttpServletResponse getProxyPath(@PathParam("path") String inPath) {
-        return this.proxy(inPath);
+    public void getProxyPath(@PathParam("path") String inPath) throws java.io.IOException {
+        this.proxy(inPath);
+        response.flushBuffer();
     }
 
     private HttpServletResponse proxy(String inPath) {

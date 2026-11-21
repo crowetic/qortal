@@ -5,6 +5,7 @@ import org.junit.Before;
 import org.junit.Test;
 import org.qortal.account.Account;
 import org.qortal.account.PublicKeyAccount;
+import org.qortal.account.PrivateKeyAccount;
 import org.qortal.asset.Asset;
 import org.qortal.data.account.AccountBalanceData;
 import org.qortal.data.account.AccountData;
@@ -31,6 +32,17 @@ public class AccountBalanceTests extends Common {
 	@Before
 	public void beforeTest() throws DataException {
 		Common.useDefaultSettings();
+	}
+
+	@Test
+	public void testMissingBalanceRowMeansZero() throws DataException {
+		try (Repository repository = RepositoryManager.getRepository()) {
+			PrivateKeyAccount account = new PrivateKeyAccount(repository, org.qortal.crypto.Crypto.digest("missing-balance".getBytes()));
+			assertEquals(0L, account.getConfirmedBalance(Asset.QORT));
+			assertEquals(null, repository.getAccountRepository().getBalance(account.getAddress(), Asset.QORT));
+			assertTrue(repository.getAccountRepository()
+					.getBalances(Arrays.asList(account.getAddress()), Asset.QORT).isEmpty());
+		}
 	}
 
 	@After

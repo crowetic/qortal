@@ -2149,6 +2149,40 @@ public String finalizeUpload(
 		}
 	}
 
+	/** Join a shared build with a single bounded budget for queued waits and retries. */
+	static void loadForDownload(ArbitraryDataReader reader, boolean rebuild, int maxAttempts,
+			java.util.function.BooleanSupplier stopping) throws DataException, IOException, MissingDataException {
+		loadForDownload(reader, rebuild, maxAttempts, stopping, 60_000L);
+	}
+
+	static void loadForDownload(ArbitraryDataReader reader, boolean rebuild, int maxAttempts,
+			java.util.function.BooleanSupplier stopping, long timeoutMillis) throws DataException, IOException, MissingDataException {
+		long started = System.nanoTime();
+		int attempts = 0;
+		while (!stopping.getAsBoolean()) {
+			long remaining = timeoutMillis - TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
+			if (remaining <= 0)
+				throw new DataException("Timed out waiting for QDN data");
+			try {
+				reader.loadSynchronouslyWhenReady(rebuild, stopping, remaining);
+				return;
+			} catch (MissingDataException e) {
+				if (++attempts > maxAttempts)
+					throw e;
+                // Give requested chunks time to arrive before consuming the next retry.
+                long retryWait = timeoutMillis - TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
+                if (retryWait > 0) {
+                    try { Thread.sleep(Math.min(200L, retryWait)); }
+                    catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        throw new DataException("Interrupted while waiting for QDN data", interrupted);
+                    }
+                }
+			}
+		}
+		throw new DataException("Node is stopping");
+	}
+
 	private void download(Service service, String name, String identifier, String filepath, String encoding, boolean rebuild, boolean async, Integer maxAttempts, boolean attachment, String attachmentFilename) {
 	
 		
@@ -2206,9 +2240,10 @@ public String finalizeUpload(
 					// Need to validate or rebuild
 					// This includes: new data, stale cache, updates, or explicit rebuild
 					try {
-						loadWithRetries(arbitraryDataReader, rebuild, maxAttempts, 60_000L);
+						loadForDownload(arbitraryDataReader, rebuild, maxAttempts, Controller::isStopping);
 					} catch (MissingDataException e) {
-						throw ApiExceptionFactory.INSTANCE.createCustomException(request, ApiError.INVALID_CRITERIA, "Data unavailable. Please try again later.");
+						throw ApiExceptionFactory.INSTANCE.createCustomException(request, ApiError.INVALID_CRITERIA,
+								"Data unavailable. Please try again later.");
 					}
 				}
 				
@@ -2387,12 +2422,13 @@ public String finalizeUpload(
 		
 	
 
-	} catch (InterruptedException e) {
-			Thread.currentThread().interrupt();
-			if (!response.isCommitted()) {
-				throw ApiExceptionFactory.INSTANCE.createCustomException(request, ApiError.REPOSITORY_ISSUE, "Interrupted while waiting for QDN data");
-			}
-		} catch (IOException | ApiException | DataException e) {
+	} catch (DataException e) {
+            LOGGER.debug("Repository/build wait failed for {} {}", service, name, e);
+            if (!response.isCommitted())
+                throw ApiExceptionFactory.INSTANCE.createException(request, ApiError.REPOSITORY_ISSUE, e);
+        } catch (ApiException e) {
+            if (!response.isCommitted()) throw e;
+        } catch (IOException e) {
 			LOGGER.debug(String.format("Unable to load %s %s: %s", service, name, e.getMessage()));
 			if (!response.isCommitted()) {
 				throw ApiExceptionFactory.INSTANCE.createCustomException(request, ApiError.FILE_NOT_FOUND, e.getMessage());
@@ -2406,42 +2442,6 @@ public String finalizeUpload(
 	}
 	
 	
-	/** Bound retries and queued-build polling without spinning on HTTP worker threads.
-	 * An individual synchronous load still owns its existing I/O timeouts. */
-	static void loadWithRetries(ArbitraryDataReader reader, boolean rebuild, int maxRetries, long timeoutMillis)
-			throws IOException, DataException, MissingDataException, InterruptedException {
-		long started = System.nanoTime();
-		long timeoutNanos = TimeUnit.MILLISECONDS.toNanos(timeoutMillis);
-		int failures = 0;
-		while (!Controller.isStopping()) {
-			if (Thread.currentThread().isInterrupted()) {
-				throw new InterruptedException("Interrupted while waiting for QDN data");
-			}
-			if (System.nanoTime() - started >= timeoutNanos) {
-				throw new DataException("Timed out waiting for QDN data");
-			}
-			if (reader.isBuilding()) {
-				if (!rebuild && reader.isCachedDataAvailable()) {
-					return;
-				}
-			} else {
-				try {
-					reader.loadSynchronously(rebuild);
-					return;
-				} catch (MissingDataException e) {
-					if (failures++ >= maxRetries) {
-						throw e;
-					}
-				}
-			}
-			long remaining = timeoutNanos - (System.nanoTime() - started);
-			if (remaining > 0) {
-				TimeUnit.NANOSECONDS.sleep(Math.min(remaining, TimeUnit.MILLISECONDS.toNanos(200)));
-			}
-		}
-		throw new DataException("Node is stopping");
-	}
-
 	private FileProperties getFileProperties(Service service, String name, String identifier) {
 		try {
 

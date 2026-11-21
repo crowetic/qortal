@@ -847,7 +847,7 @@ public class TradeBot implements Listener {
 		}
 
 		List<CrossChainTradeData> updatedCrossChainTrades = new ArrayList<>(crossChainTrades);
-		int getMaxTradeOfferAttempts = Settings.getInstance().getMaxTradeOfferAttempts();
+		List<CrossChainTradeData> uncachedOffers = new ArrayList<>();
 
 		for (CrossChainTradeData crossChainTradeData : crossChainTrades) {
 			// We only care about trades in the OFFERING state
@@ -870,22 +870,34 @@ public class TradeBot implements Listener {
 				continue;
 			}
 
-			try {
-				List<TransactionData> transactions = repository.getTransactionRepository().getUnconfirmedTransactions(Arrays.asList(Transaction.TransactionType.MESSAGE), null, null, null, null);
+			uncachedOffers.add(crossChainTradeData);
+		}
 
-				for (TransactionData transactionData : transactions) {
-					// Treat as failed if buy attempt was more than 60 mins ago (as it's still in the OFFERING state)
-					if (transactionData.getRecipient().equals(crossChainTradeData.qortalCreatorTradeAddress) && now - transactionData.getTimestamp() > 60*60*1000L) {
-						failedTrades.put(crossChainTradeData.qortalAtAddress, now);
-						updatedCrossChainTrades.remove(crossChainTradeData);
-					} else {
-						validTrades.put(crossChainTradeData.qortalAtAddress, now);
-					}
+		if (uncachedOffers.isEmpty())
+			return updatedCrossChainTrades;
+
+		try {
+			// This list is identical for every offer. Load it once instead of issuing one query per AT.
+			List<TransactionData> transactions = repository.getTransactionRepository().getUnconfirmedTransactions(
+					Arrays.asList(Transaction.TransactionType.MESSAGE), null, null, null, null);
+			Set<String> staleRecipients = transactions.stream()
+					.filter(transactionData -> transactionData.getRecipient() != null)
+					.filter(transactionData -> now - transactionData.getTimestamp() > 60 * 60 * 1000L)
+					.map(TransactionData::getRecipient)
+					.collect(Collectors.toSet());
+
+			for (CrossChainTradeData offer : uncachedOffers) {
+				if (staleRecipients.contains(offer.qortalCreatorTradeAddress)) {
+					failedTrades.put(offer.qortalAtAddress, now);
+					validTrades.remove(offer.qortalAtAddress);
+					updatedCrossChainTrades.remove(offer);
+				} else {
+					validTrades.put(offer.qortalAtAddress, now);
+					failedTrades.remove(offer.qortalAtAddress);
 				}
-
-			} catch (DataException e) {
-				LOGGER.info("Unable to determine failed state of AT {}", crossChainTradeData.qortalAtAddress);
-            }
+			}
+		} catch (DataException e) {
+			LOGGER.info("Unable to determine failed state for {} cross-chain offers", uncachedOffers.size());
 		}
 
 		return updatedCrossChainTrades;

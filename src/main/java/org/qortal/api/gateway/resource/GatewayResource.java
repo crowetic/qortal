@@ -13,9 +13,6 @@ import org.qortal.arbitrary.ArbitraryDataRenderer;
 import org.qortal.arbitrary.ArbitraryDataResource;
 import org.qortal.arbitrary.misc.Service;
 import org.qortal.data.arbitrary.ArbitraryResourceStatus;
-import org.qortal.repository.DataException;
-import org.qortal.repository.Repository;
-import org.qortal.repository.RepositoryManager;
 
 import javax.servlet.ServletContext;
 import javax.servlet.http.HttpServletRequest;
@@ -52,29 +49,26 @@ public class GatewayResource {
             }
         }
 
-        try (final Repository repository = RepositoryManager.getRepository()) {
-            ArbitraryDataResource resource = new ArbitraryDataResource(name, ResourceIdType.NAME, service, identifier);
-            return resource.getStatus(repository);
-
-        } catch (DataException e) {
-            throw ApiExceptionFactory.INSTANCE.createException(request, ApiError.REPOSITORY_ISSUE, e);
-        }
+		ArbitraryDataResource resource = new ArbitraryDataResource(name, ResourceIdType.NAME, service, identifier);
+		return resource.getStatusAndUpdateCache(false);
     }
 
 
     @GET
-    public HttpServletResponse getRoot() {
-        return ArbitraryDataRenderer.getResponse(response, 200, "");
+    public void getRoot() throws java.io.IOException {
+        ArbitraryDataRenderer.getResponse(response, 200, "");
+        response.flushBuffer();
     }
 
 
     @GET
     @Path("{path:.*}")
     @SecurityRequirement(name = "apiKey")
-    public HttpServletResponse getPath(@PathParam("path") String inPath) {
+    public void getPath(@PathParam("path") String inPath) throws java.io.IOException {
         // Block requests from localhost, to prevent websites/apps from running javascript that fetches unvetted data
         Security.disallowLoopbackRequests(request);
-        return this.parsePath(inPath, "gateway", null, true, true);
+        this.parsePath(inPath, "gateway", null, true, true);
+        response.flushBuffer();
     }
 
     

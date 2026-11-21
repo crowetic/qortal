@@ -1,5 +1,8 @@
 # Recent QDN transaction query optimization
 
+For the separate experimental `optimize-data-Nov-2027` branch, use
+[its schema-57 testing and recovery guide](optimize-data-Nov-2027.md).
+
 `performance-db-improvements` consolidates `db-query-improvements` at
 `a5d20f639db3e5472d1bd0e29cce77c6c81f9dcd` and `performance-fixes` at
 `b9d8816a7d0ae1cc062eed8355211f2b5d768949`, with the new timestamp query

@@ -5,7 +5,6 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.qortal.block.Block;
 import org.qortal.controller.Controller;
-import org.qortal.controller.Synchronizer;
 import org.qortal.data.at.ATStateData;
 import org.qortal.data.block.BlockArchiveData;
 import org.qortal.data.block.BlockData;
@@ -20,8 +19,11 @@ import java.io.ByteArrayOutputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.nio.file.Files;
+import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
+import java.util.ArrayList;
 import java.util.List;
 
 public class BlockArchiveWriter {
@@ -56,6 +58,11 @@ public class BlockArchiveWriter {
     private BlockArchiveDataSource dataSource = BlockArchiveDataSource.BLOCK_REPOSITORY;
 
     private boolean shouldLogProgress = false;
+    private long blockPause;
+
+    // Release HSQLDB's read snapshot regularly while building large files. Archive
+    // index rows remain in memory until the complete file has been made durable.
+    private static final int READ_SNAPSHOT_REFRESH_INTERVAL = 100;
 
     private int writtenCount;
     private int lastWrittenHeight;
@@ -72,6 +79,7 @@ public class BlockArchiveWriter {
         this.endHeight = endHeight;
         this.archivePath = archivePath.toAbsolutePath();
         this.repository = repository;
+        this.blockPause = Settings.getInstance().getArchivingPause();
 
         if (serializationVersion == null) {
             // When serialization version isn't specified, fetch it from the existing archive
@@ -149,21 +157,20 @@ public class BlockArchiveWriter {
         ByteArrayOutputStream headerBytes = new ByteArrayOutputStream();
         // Bytes will store the actual block data
         ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        // Publish these rows only after the corresponding archive file is durable.
+        List<BlockArchiveData> archiveIndexRows = new ArrayList<>();
 
         LOGGER.info(String.format("Fetching blocks from height %d...", startHeight));
         int i = 0;
         while (headerBytes.size() + bytes.size() < this.fileSizeTarget) {
 
             // pause, since this can be a long process and other processes need to execute
-            Thread.sleep(Settings.getInstance().getArchivingPause());
+            if (this.blockPause > 0)
+                Thread.sleep(this.blockPause);
 
             if (Controller.isStopping()) {
                 return BlockArchiveWriteResult.STOPPING;
             }
-
-            // wait until the Synchronizer stops
-            if( Synchronizer.getInstance().isSynchronizing() )
-                continue;
 
             int currentHeight = startHeight + i;
             if (currentHeight > endHeight) {
@@ -198,10 +205,7 @@ public class BlockArchiveWriter {
                 return BlockArchiveWriteResult.BLOCK_NOT_FOUND;
             }
 
-            // Write the signature and height into the BlockArchive table
-            BlockArchiveData blockArchiveData = new BlockArchiveData(blockData);
-            repository.getBlockArchiveRepository().save(blockArchiveData);
-            repository.saveChanges();
+            archiveIndexRows.add(new BlockArchiveData(blockData));
 
             // Build the block
             Block block;
@@ -249,6 +253,9 @@ public class BlockArchiveWriter {
 
             i++;
 
+            if (i % READ_SNAPSHOT_REFRESH_INTERVAL == 0)
+                repository.discardChanges();
+
         }
         int totalLength = headerBytes.size() + bytes.size();
         LOGGER.info("Total length of {} blocks is {}", i, StringUtils.formatBytes(totalLength));
@@ -260,33 +267,52 @@ public class BlockArchiveWriter {
 
         // We have enough blocks to create a new file
         int endHeight = startHeight + i - 1;
-        String filePath = String.format("%s/%d-%d.dat", archivePath.toString(), startHeight, endHeight);
-        FileOutputStream fileOutputStream = new FileOutputStream(filePath);
-        // Write version number
-        fileOutputStream.write(Ints.toByteArray(serializationVersion));
-        // Write start height
-        fileOutputStream.write(Ints.toByteArray(startHeight));
-        // Write end height
-        fileOutputStream.write(Ints.toByteArray(endHeight));
-        // Write total count
-        fileOutputStream.write(Ints.toByteArray(i));
-        // Write dynamic header (block indexes) segment length
-        fileOutputStream.write(Ints.toByteArray(headerBytes.size()));
-        // Write dynamic header (block indexes) data
-        headerBytes.writeTo(fileOutputStream);
-        // Write data segment (block data) length
-        fileOutputStream.write(Ints.toByteArray(bytes.size()));
-        // Write data
-        bytes.writeTo(fileOutputStream);
-        // Close the file
-        fileOutputStream.close();
+        Path finalPath = archivePath.resolve(String.format("%d-%d.dat", startHeight, endHeight));
+        Path temporaryPath = archivePath.resolve(String.format(".%d-%d.dat.tmp", startHeight, endHeight));
+        Files.deleteIfExists(temporaryPath);
+        try {
+            try (FileOutputStream fileOutputStream = new FileOutputStream(temporaryPath.toFile())) {
+                // Write version number
+                fileOutputStream.write(Ints.toByteArray(serializationVersion));
+                // Write start height
+                fileOutputStream.write(Ints.toByteArray(startHeight));
+                // Write end height
+                fileOutputStream.write(Ints.toByteArray(endHeight));
+                // Write total count
+                fileOutputStream.write(Ints.toByteArray(i));
+                // Write dynamic header (block indexes) segment length
+                fileOutputStream.write(Ints.toByteArray(headerBytes.size()));
+                // Write dynamic header (block indexes) data
+                headerBytes.writeTo(fileOutputStream);
+                // Write data segment length and data
+                fileOutputStream.write(Ints.toByteArray(bytes.size()));
+                bytes.writeTo(fileOutputStream);
+                fileOutputStream.getFD().sync();
+            }
+
+            try {
+                Files.move(temporaryPath, finalPath, StandardCopyOption.ATOMIC_MOVE,
+                        StandardCopyOption.REPLACE_EXISTING);
+            } catch (AtomicMoveNotSupportedException e) {
+                Files.move(temporaryPath, finalPath, StandardCopyOption.REPLACE_EXISTING);
+            }
+        } finally {
+            Files.deleteIfExists(temporaryPath);
+        }
 
         // Invalidate cache so that the rest of the app picks up the new file
         BlockArchiveReader.getInstance().invalidateFileListCache();
 
+        // End the long read snapshot before opening the small index transaction.
+        // The caller commits these rows together with block_archive_height, so the
+        // pruners can never observe a published cursor without a durable file.
+        repository.discardChanges();
+        for (BlockArchiveData archiveIndexRow : archiveIndexRows)
+            repository.getBlockArchiveRepository().save(archiveIndexRow);
+
         this.writtenCount = i;
         this.lastWrittenHeight = endHeight;
-        this.outputPath = Paths.get(filePath);
+        this.outputPath = finalPath;
         return BlockArchiveWriteResult.OK;
     }
 
@@ -317,6 +343,13 @@ public class BlockArchiveWriter {
 
     public void setShouldLogProgress(boolean shouldLogProgress) {
         this.shouldLogProgress = shouldLogProgress;
+    }
+
+    public void setBlockPause(long blockPause) {
+        if (blockPause < 0)
+            throw new IllegalArgumentException("Block archive pause cannot be negative");
+
+        this.blockPause = blockPause;
     }
 
 }

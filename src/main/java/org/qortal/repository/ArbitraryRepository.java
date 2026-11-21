@@ -4,6 +4,7 @@ import org.qortal.api.SearchMode;
 import org.qortal.arbitrary.misc.Service;
 import org.qortal.controller.arbitrary.ArbitraryTransactionDataHashWrapper;
 import org.qortal.data.arbitrary.ArbitraryResourceData;
+import org.qortal.data.arbitrary.ArbitraryResourceDirtyData;
 import org.qortal.data.arbitrary.ArbitraryResourceMetadata;
 import org.qortal.data.arbitrary.ArbitraryResourceStatus;
 import org.qortal.data.transaction.ArbitraryTransactionData;
@@ -44,6 +45,9 @@ public interface ArbitraryRepository {
 	/** Lightweight fetch — returns only (signature, service, name, identifier) ordered newest-first. */
 	List<ArbitraryTransactionDataHashWrapper> getArbitraryTransactionSignaturesLite() throws DataException;
 
+	/** Lightweight fetch of the newest named arbitrary transactions used for metadata discovery. */
+	List<ArbitraryTransactionDataHashWrapper> getLatestArbitraryMetadataCandidates(int limit) throws DataException;
+
 	List<ArbitraryTransactionData> getLatestArbitraryTransactionsByName(String name) throws DataException;
 
 	public ArbitraryTransactionData getSingleTransactionBySignature(byte[] signature) throws DataException;
@@ -53,6 +57,17 @@ public interface ArbitraryRepository {
 	public ArbitraryTransactionData getLatestTransaction(String name, Service service, Method method, String identifier) throws DataException;
 
 	public List<ArbitraryTransactionData> getArbitraryTransactions(boolean requireName, Integer limit, Integer offset, Boolean reverse) throws DataException;
+
+	/** Whether the oldest named arbitrary transaction refers to a resource missing from the cache. */
+	boolean isOldestNamedResourceMissingFromCache() throws DataException;
+
+	// Durable resource-cache work queue
+	public void markResourceDirty(ArbitraryTransactionData transactionData, int flags) throws DataException;
+	public List<ArbitraryResourceDirtyData> getDirtyResources(int limit, long now) throws DataException;
+	public void clearDirtyResource(ArbitraryResourceDirtyData dirtyData) throws DataException;
+	public void deferDirtyResource(ArbitraryResourceDirtyData dirtyData, long nextAttempt) throws DataException;
+	/** Remove node-local work while retaining pending chain-head reconciliation. */
+	public void sanitizeDirtyResourcesForBootstrap() throws DataException;
 
 
 	// Resource related
@@ -84,7 +99,12 @@ public interface ArbitraryRepository {
 	// Arbitrary resources cache save/load
 
 	public void save(ArbitraryResourceData arbitraryResourceData) throws DataException;
-	public void setStatus(ArbitraryResourceData arbitraryResourceData, ArbitraryResourceStatus.Status status) throws DataException;
+	/**
+	 * Update a cached resource status only when its stored value differs.
+	 *
+	 * @return true when a row changed, false when the row was absent, already had this status, or status was null
+	 */
+	public boolean setStatus(ArbitraryResourceData arbitraryResourceData, ArbitraryResourceStatus.Status status) throws DataException;
 	public void delete(ArbitraryResourceData arbitraryResourceData) throws DataException;
 
 	public void save(ArbitraryResourceMetadata metadata) throws DataException;

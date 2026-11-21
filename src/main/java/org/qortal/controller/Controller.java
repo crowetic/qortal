@@ -170,6 +170,10 @@ public class Controller extends Thread {
             public AtomicLong unknownBlocks = new AtomicLong();
             public AtomicLong cacheFills = new AtomicLong();
             public AtomicLong fullyFromCache = new AtomicLong();
+            public AtomicLong archiveHits = new AtomicLong();
+            public AtomicLong archiveBlocks = new AtomicLong();
+            public AtomicLong archiveBytes = new AtomicLong();
+            public AtomicLong archiveFailures = new AtomicLong();
 
             public GetBlocksMessageStats() {
             }
@@ -1031,6 +1035,16 @@ public class Controller extends Thread {
 		if (peerChainTipData == null)
 			return true;
 
+		// A node that is still replaying historical blocks cannot know whether the
+		// reward-share key at a peer's present-day tip is valid. Treating an unknown
+		// key as invalid here can permanently strand a genesis sync. Every downloaded
+		// block still undergoes the normal consensus checks before it is applied.
+		final BlockData localChainTipData = getInstance().getChainTip();
+		final Long minimumLatestBlockTimestamp = getMinimumLatestBlockTimestamp();
+		if (localChainTipData == null || minimumLatestBlockTimestamp == null
+				|| localChainTipData.getTimestamp() < minimumLatestBlockTimestamp)
+			return false;
+
 		try (Repository repository = RepositoryManager.getRepository()) {
 			return Account.getRewardShareEffectiveMintingLevel(repository, peerChainTipData.getMinterPublicKey()) == 0;
 		} catch (DataException e) {
@@ -1235,12 +1249,19 @@ public class Controller extends Thread {
 			ArbitraryDataManager.getInstance().shutdown();
 			ArbitraryDataFileManager.getInstance().shutdown();
 			ArbitraryDataFileListManager.getInstance().shutdown();
-			ArbitraryDataCacheManager.getInstance().shutdown();
+			ArbitraryDataCacheManager arbitraryDataCacheManager = ArbitraryDataCacheManager.getInstance();
+			arbitraryDataCacheManager.shutdown();
 			ArbitraryDataBuildManager.getInstance().shutdown();
 			ArbitraryDataCleanupManager.getInstance().shutdown();
 			ArbitraryDataStorageManager.getInstance().shutdown();
 			ArbitraryDataRenderManager.getInstance().shutdown();
 			ArbitraryDataHostMonitor.getInstance().shutdown();
+			try {
+				arbitraryDataCacheManager.join();
+			} catch (InterruptedException e) {
+				Thread.currentThread().interrupt();
+				LOGGER.warn("Interrupted while waiting for arbitrary data cache queue to flush");
+			}
 
 				LOGGER.info("Shutting down online accounts manager");
 				OnlineAccountsManager.getInstance().shutdown();
@@ -1893,51 +1914,83 @@ public class Controller extends Thread {
         byte[] parentSignature = getBlocksMessage.getParentSignature();
         this.stats.getBlocksMessageStats.requests.incrementAndGet();
 
+        Message blocksMessage;
+        Integer archiveStartHeight = null;
+        int responseLimit = Math.min(Network.MAX_BLOCKS_PER_REPLY, Settings.getInstance().getMaxBlocksPerResponse());
+        int numberRequested = Math.max(0, Math.min(responseLimit, getBlocksMessage.getNumberRequested()));
+
         try (final Repository repository = RepositoryManager.getRepository()) {
 
             // If peer's parent signature matches our latest block signature
             // then we can short-circuit with an empty response
             BlockData chainTip = getChainTip();
             if (chainTip != null && Arrays.equals(parentSignature, chainTip.getSignature())) {
-                Message blocksMessage = new BlocksMessage(Collections.emptyList());
-                blocksMessage.setId(message.getId());
-                if (!peer.sendMessage(blocksMessage))
-                    peer.disconnect("failed to send blocks");
+                blocksMessage = new BlocksMessage(Collections.emptyList());
+            } else {
+                List<Block> blocks = new ArrayList<>();
+                BlockData blockData = repository.getBlockRepository().fromReference(parentSignature);
 
-                return;
-            }
-
-            // Ensure that we don't serve more blocks than the amount specified in the settings
-            // Serializing multiple blocks is very slow, so by default we are using a low limit
-            int blockLimitPerRequest = Settings.getInstance().getMaxBlocksPerResponse();
-            int untrimmedBlockLimitPerRequest = Settings.getInstance().getMaxBlocksPerResponse();
-            int numberRequested = Math.min(blockLimitPerRequest, getBlocksMessage.getNumberRequested());
-
-            List<Block> blocks = new ArrayList<>();
-            BlockData blockData = repository.getBlockRepository().fromReference(parentSignature);
-
-            while (blockData != null && blocks.size() < numberRequested) {
-                // If we're dealing with untrimmed blocks, ensure we don't go above the untrimmedBlockLimitPerRequest
-                if (blockData.isTrimmed() == false && blocks.size() >= untrimmedBlockLimitPerRequest) {
-                    break;
+                while (blockData != null && blocks.size() < numberRequested) {
+                    Block block = new Block(repository, blockData);
+                    blocks.add(block);
+                    blockData = repository.getBlockRepository().fromReference(blockData.getSignature());
                 }
-                Block block = new Block(repository, blockData);
-                blocks.add(block);
-                blockData = repository.getBlockRepository().fromReference(blockData.getSignature());
-            }
 
-            Message blocksMessage = new BlocksMessage(blocks);
-            blocksMessage.setId(message.getId());
-            try {
-                if (!peer.sendMessageWithTimeout(blocksMessage, FETCH_BLOCKS_TIMEOUT))
-                    peer.disconnect("failed to send blocks");
-            } catch (java.io.IOException e) {
-                // Socket closed - peer already disconnected
-                LOGGER.debug("Socket closed while sending blocks to peer {}: {}", peer, e.getMessage());
-            }
+                if (!blocks.isEmpty() || numberRequested == 0) {
+                    // Build while the repository is open because Block serialization can load transactions lazily.
+                    blocksMessage = new BlocksMessage(blocks);
+                } else {
+                    int parentHeight = repository.getBlockArchiveRepository().getHeightFromSignature(parentSignature);
+                    if (parentHeight == 0) {
+                        // Genesis is deliberately absent from the archive lookup table.
+                        BlockData parentBlock = repository.getBlockRepository().fromSignature(parentSignature);
+                        if (parentBlock != null && parentBlock.getHeight() == 1)
+                            parentHeight = 1;
+                    }
 
+                    if (parentHeight > 0)
+                        archiveStartHeight = parentHeight + 1;
+
+                    blocksMessage = null;
+                }
+            }
         } catch (DataException e) {
             LOGGER.error(String.format("Repository issue while sending blocks after %s to peer %s", Base58.encode(parentSignature), peer), e);
+            return;
+        }
+
+        // Archive reads and network sends must not occupy an HSQLDB connection.
+        if (blocksMessage == null) {
+            List<BlockArchiveReader.SerializedBlock> archivedBlocks = archiveStartHeight == null
+                    ? Collections.emptyList()
+                    : BlockArchiveReader.getInstance().fetchSerializedBlocksFromHeight(archiveStartHeight,
+                            numberRequested, BlocksMessage.getMaximumPayloadSize());
+
+            try {
+                blocksMessage = new BlocksMessage(parentSignature, archivedBlocks);
+                if (archivedBlocks.isEmpty()) {
+                    this.stats.getBlocksMessageStats.unknownBlocks.incrementAndGet();
+                } else {
+                    this.stats.getBlocksMessageStats.archiveHits.incrementAndGet();
+                    this.stats.getBlocksMessageStats.archiveBlocks.addAndGet(archivedBlocks.size());
+                    long byteCount = archivedBlocks.stream().mapToLong(BlockArchiveReader.SerializedBlock::getWireSize).sum();
+                    this.stats.getBlocksMessageStats.archiveBytes.addAndGet(byteCount);
+                }
+            } catch (TransformationException e) {
+                this.stats.getBlocksMessageStats.archiveFailures.incrementAndGet();
+                LOGGER.warn("Unable to build archived block batch at height {} for peer {}: {}",
+                        archiveStartHeight, peer, e.getMessage());
+                blocksMessage = new BlocksMessage(Collections.emptyList());
+            }
+        }
+
+        blocksMessage.setId(message.getId());
+        try {
+            if (!peer.sendMessageWithTimeout(blocksMessage, FETCH_BLOCKS_TIMEOUT))
+                peer.disconnect("failed to send blocks");
+        } catch (java.io.IOException e) {
+            // Socket closed - peer already disconnected
+            LOGGER.debug("Socket closed while sending blocks to peer {}: {}", peer, e.getMessage());
         }
     }
 
@@ -1980,14 +2033,6 @@ public class Controller extends Thread {
 				if (blockData == null) {
 					// Try the archive
 					blockData = repository.getBlockArchiveRepository().fromReference(parentSignature);
-				}
-
-				if (blockData != null) {
-					if (PruneManager.getInstance().isBlockPruned(blockData.getHeight())) {
-						// If this request contains a pruned block, we likely only have partial data, so best not to sent anything
-						// We always prune from the oldest first, so it's fine to just check the first block requested
-						blockData = null;
-					}
 				}
 
 				while (blockData != null && blockSummaries.size() < numberRequested) {

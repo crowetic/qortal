@@ -558,6 +558,7 @@ public class HSQLDBBlockRepository implements BlockRepository {
 
 	@Override
 	public void save(BlockData blockData) throws DataException {
+        this.repository.markChainChanged();
 		HSQLDBSaver saveHelper = new HSQLDBSaver("Blocks");
 
 		saveHelper.bind("signature", blockData.getSignature()).bind("version", blockData.getVersion()).bind("reference", blockData.getReference())
@@ -579,6 +580,7 @@ public class HSQLDBBlockRepository implements BlockRepository {
 
 	@Override
 	public void delete(BlockData blockData) throws DataException {
+        this.repository.markChainChanged();
 		try {
 			this.repository.delete("Blocks", "signature = ?", blockData.getSignature());
 		} catch (SQLException e) {

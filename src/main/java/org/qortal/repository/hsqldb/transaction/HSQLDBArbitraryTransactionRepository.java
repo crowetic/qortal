@@ -69,6 +69,7 @@ public class HSQLDBArbitraryTransactionRepository extends HSQLDBTransactionRepos
 				.bind("nonce", arbitraryTransactionData.getNonce()).bind("size", arbitraryTransactionData.getSize())
 				.bind("is_data_raw", arbitraryTransactionData.getDataType() == DataType.RAW_DATA).bind("data", arbitraryTransactionData.getData())
 				.bind("metadata_hash", arbitraryTransactionData.getMetadataHash()).bind("name", arbitraryTransactionData.getName())
+				.bind("lower_case_name", arbitraryTransactionData.getName() == null ? null : arbitraryTransactionData.getName().toLowerCase(java.util.Locale.ROOT))
 				.bind("identifier", arbitraryTransactionData.getIdentifier()).bind("update_method", method)
 				.bind("secret", arbitraryTransactionData.getSecret()).bind("compression", compression)
 				.bind("created_when", arbitraryTransactionData.getTimestamp());

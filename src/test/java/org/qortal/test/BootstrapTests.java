@@ -14,6 +14,7 @@ import org.qortal.test.common.AtUtils;
 import org.qortal.test.common.Common;
 import org.qortal.transform.TransformationException;
 import org.qortal.utils.NTP;
+import org.qortal.utils.SevenZ;
 
 import java.io.IOException;
 import java.io.PrintWriter;
@@ -23,6 +24,11 @@ import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.sql.Statement;
+import java.sql.Connection;
+import java.sql.DriverManager;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -68,7 +74,7 @@ public class BootstrapTests extends Common {
 
 
     @Test
-    public void testCreateAndImportBootstrap() throws DataException, InterruptedException, TransformationException, IOException {
+    public void testCreateAndImportBootstrap() throws DataException, InterruptedException, TransformationException, IOException, SQLException {
 
         Path archivePath = Paths.get(Settings.getInstance().getRepositoryPath(), "archive", "2-900.dat");
         BlockData block1000;
@@ -76,6 +82,19 @@ public class BootstrapTests extends Common {
 
         try (final Repository repository = RepositoryManager.getRepository()) {
             this.buildDummyBlockchain(repository);
+
+            try (Statement statement = repository.getConnection().createStatement()) {
+                statement.executeUpdate("INSERT INTO ArbitraryResourceDirty " +
+                        "(service, lower_case_name, name, identifier, flags, triggering_signature, revision, " +
+                        "retry_count, next_attempt, updated_when) VALUES " +
+                        "(200, 'bootstrap-chain', 'bootstrap-chain', 'default', 5, X'01', 1, 3, 999, 1)");
+                statement.executeUpdate("INSERT INTO ArbitraryResourceDirty " +
+                        "(service, lower_case_name, name, identifier, flags, triggering_signature, revision, " +
+                        "retry_count, next_attempt, updated_when) VALUES " +
+                        "(200, 'bootstrap-local', 'bootstrap-local', 'default', 6, X'02', 1, 3, 999, 1)");
+            }
+            repository.saveChanges();
+            assertEquals(2, countDirtyResources(repository));
 
             Bootstrap bootstrap = new Bootstrap(repository);
             Path bootstrapPath = bootstrap.getBootstrapOutputPath();
@@ -85,6 +104,35 @@ public class BootstrapTests extends Common {
 
             // Create bootstrap
             bootstrap.create();
+
+            // Creating a distributable copy must not consume the creator's live work queue.
+            assertEquals(2, countDirtyResources(repository));
+
+            // Verify the compressed artifact itself is clean, independently of import's
+            // defensive cleanup for older bootstraps.
+            Path extractedBootstrap = Files.createTempDirectory("qortal-bootstrap-queue-test-");
+            try {
+                SevenZ.decompress(bootstrapPath.toString(), extractedBootstrap.toFile());
+                String extractedUrl = "jdbc:hsqldb:file:" + extractedBootstrap.resolve("bootstrap/blockchain") +
+                        ";create=false;hsqldb.full_log_replay=true";
+                try (Connection connection = DriverManager.getConnection(extractedUrl);
+                     Statement statement = connection.createStatement()) {
+                    try (ResultSet resultSet = statement.executeQuery(
+                            "SELECT flags, triggering_signature, retry_count, next_attempt, updated_when " +
+                                    "FROM ArbitraryResourceDirty")) {
+                        resultSet.next();
+                        assertEquals(1, resultSet.getInt(1));
+                        assertNull(resultSet.getBytes(2));
+                        assertEquals(0, resultSet.getInt(3));
+                        assertEquals(0L, resultSet.getLong(4));
+                        assertEquals(0L, resultSet.getLong(5));
+                        assertFalse(resultSet.next());
+                    }
+                    statement.execute("SHUTDOWN");
+                }
+            } finally {
+                FileUtils.deleteDirectory(extractedBootstrap.toFile());
+            }
 
             // Ensure the compressed bootstrap exists
             assertTrue(Files.exists(bootstrapPath));
@@ -136,6 +184,18 @@ public class BootstrapTests extends Common {
 
             // Ensure we can retrieve block 10 from the archive
             assertNotNull(repository.getBlockArchiveRepository().fromHeight(10));
+
+            // Only pending chain-head reconciliation survives. Local status and
+            // metadata work from the bootstrap producer is discarded.
+            assertEquals(1, countDirtyResources(repository));
+        }
+    }
+
+    private int countDirtyResources(Repository repository) throws SQLException {
+        try (Statement statement = repository.getConnection().createStatement();
+             ResultSet resultSet = statement.executeQuery("SELECT COUNT(*) FROM ArbitraryResourceDirty")) {
+            resultSet.next();
+            return resultSet.getInt(1);
         }
     }
 
@@ -176,7 +236,6 @@ public class BootstrapTests extends Common {
         repository.getBlockRepository().setBlockPruneHeight(901);
 
         // Prune the AT states for the archived blocks
-        repository.getATRepository().rebuildLatestAtStates(900);
         repository.saveChanges();
         repository.getATRepository().pruneAtStates(0, 900);
         repository.getATRepository().setAtPruneHeight(901);
@@ -211,6 +270,8 @@ public class BootstrapTests extends Common {
 
     @Test
     public void testBootstrapHosts() throws IOException {
+        // External host health is opt-in; it is not a repository regression check.
+        org.junit.Assume.assumeTrue(Boolean.getBoolean("qortal.test.bootstrapHosts"));
         String[] bootstrapHosts = Settings.getInstance().getBootstrapHosts();
         String[] bootstrapTypes = { "archive" }; // , "toponly", "full"
         boolean invalidFile = false;
@@ -225,6 +286,8 @@ public class BootstrapTests extends Common {
                 URL url = new URL(bootstrapUrl);
                 HttpURLConnection connection = (HttpURLConnection) url.openConnection();
                 connection.setRequestMethod("HEAD");
+                connection.setConnectTimeout(10_000);
+                connection.setReadTimeout(10_000);
                 connection.connect();
                 long fileSize = connection.getContentLengthLong();
                 long lastModified = connection.getLastModified();

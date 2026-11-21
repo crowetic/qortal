@@ -3,12 +3,13 @@ package org.qortal.controller.arbitrary;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.qortal.arbitrary.ArbitraryDataFolderSizeEstimator;
+import org.qortal.arbitrary.QdnFileManifestCache;
+import org.qortal.arbitrary.QdnPathResolver;
 import org.qortal.data.transaction.ArbitraryTransactionData;
 import org.qortal.data.transaction.TransactionData;
 import org.qortal.event.DataMonitorEvent;
 import org.qortal.event.EventBus;
 import org.qortal.repository.DataException;
-import org.qortal.repository.ArbitraryRepository;
 import org.qortal.repository.Repository;
 import org.qortal.repository.RepositoryManager;
 import org.qortal.settings.Settings;
@@ -24,10 +25,12 @@ import java.nio.file.Paths;
 import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.HashSet;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.List;
 import java.util.Optional;
-import java.util.Set;
+import java.util.stream.Collectors;
 
 import static org.qortal.controller.arbitrary.ArbitraryDataStorageManager.DELETION_THRESHOLD;
 
@@ -61,8 +64,12 @@ public class ArbitraryDataCleanupManager extends Thread {
 	 * up data fast enough.
 	 */
 	private static final int CHUNK_DELETION_BATCH_SIZE = 1000;
-
-	private static final long TRANSACTION_LIST_REFRESH_INTERVAL = 6 * 60 * 60 * 1000L; // 6 hours
+	private static final long INDEX_AUDIT_INTERVAL = 5 * 60 * 1000L;
+	private static final int INDEX_AUDIT_BATCH_SIZE = 25;
+	private static final int DISCOVERY_BATCH_SIZE = 1_000;
+	private static final long DISCOVERY_INTERVAL = 1_000L;
+	private static final SecureRandom RANDOM = new SecureRandom();
+	private long lastIndexedAudit;
 
 
 	/*
@@ -81,255 +88,303 @@ public class ArbitraryDataCleanupManager extends Thread {
 		return instance;
 	}
 
-	/** Maintains a stable newest-first sweep even when transactions disappear between batches. */
-	static final class TransactionBatch {
-		static final int LIMIT = 100;
-		private List<byte[]> signatures;
-		private long fetchedAt;
-		private int offset;
-		boolean startOfCycle;
-
-		List<ArbitraryTransactionData> next(ArbitraryRepository repository, long now) throws DataException {
-			boolean restart = this.signatures == null || this.offset >= this.signatures.size();
-			boolean refresh = restart && (this.signatures == null || now - this.fetchedAt >= TRANSACTION_LIST_REFRESH_INTERVAL);
-			List<byte[]> snapshot = refresh ? repository.getArbitraryTransactionSignatures() : this.signatures;
-			int from = restart ? 0 : this.offset;
-			int to = Math.min(from + LIMIT, snapshot.size());
-			List<ArbitraryTransactionData> transactions = repository.getArbitraryTransactionsBySignatures(snapshot.subList(from, to));
-
-			// Commit progress only after both queries succeed, so a failure retries the same batch.
-			this.signatures = snapshot;
-			if (refresh)
-				this.fetchedAt = now;
-			this.offset = to;
-			this.startOfCycle = restart;
-			return transactions;
-		}
-	}
-
 	@Override
 	public void run() {
 		Thread.currentThread().setName("Arbitrary Data Cleanup Manager");
 		Thread.currentThread().setPriority(NORM_PRIORITY);
 
-		TransactionBatch transactionsToClean = new TransactionBatch();
-
-		Set<ArbitraryTransactionDataHashWrapper> processedTransactions = new HashSet<>();
+		final int indexedBatchSize = 100;
+		List<Path> discoveryPaths = null;
+		int discoveryOffset = 0;
+		long lastSystemTempCleanup = 0L;
+		long lastTempCleanup = 0L;
+		LocalQdnContentJournal contentJournal = LocalQdnContentJournal.getInstance();
 
 		try {
 			while (!isStopping) {
-				Thread.sleep(30000);
+				Thread.sleep(contentJournal.isDiscoveryComplete() ? 30_000L : DISCOVERY_INTERVAL);
 
-				// Don't run if QDN is disabled
 				if (!Settings.getInstance().isQdnEnabled()) {
 					Thread.sleep(60 * 60 * 1000L);
 					continue;
 				}
 
 				Long now = NTP.getTime();
-				if (now == null) {
-					// Don't attempt to make decisions if we haven't synced our time yet
+				if (now == null)
 					continue;
-				}
 
 				ArbitraryDataStorageManager storageManager = ArbitraryDataStorageManager.getInstance();
+				if (now - lastSystemTempCleanup >= 30_000L) {
+					cleanupSystemTempDirectory(now, STALE_FILE_TIMEOUT);
+					lastSystemTempCleanup = now;
+				}
+				if (!storageManager.isStorageCapacityCalculated())
+					continue;
 
-				// cleanup system temp directory
-				cleanupSystemTempDirectory(now, STALE_FILE_TIMEOUT);
+				if (now - lastTempCleanup >= 5 * 60 * 1000L) {
+					this.cleanupTempDirectory(now);
+					lastTempCleanup = now;
+				}
 
-				// Wait until storage capacity has been calculated
-				if (!storageManager.isStorageCapacityCalculated()) {
+				if (!contentJournal.isDiscoveryComplete()) {
+					if (discoveryPaths == null) {
+						try {
+							discoveryPaths = this.loadHostedPathsForDiscovery();
+							discoveryOffset = 0;
+							LOGGER.info("QDN local-content discovery found {} signature directories", discoveryPaths.size());
+						} catch (IOException e) {
+							LOGGER.warn("Unable to enumerate QDN content for discovery; retrying later", e);
+							continue;
+						}
+					}
+
+					discoveryOffset = this.processDiscoveryBatch(
+							contentJournal, discoveryPaths, discoveryOffset, DISCOVERY_BATCH_SIZE);
+					if (discoveryOffset >= discoveryPaths.size()) {
+						contentJournal.markDiscoveryComplete();
+						discoveryPaths = Collections.emptyList();
+					}
 					continue;
 				}
 
-				// Periodically delete any unnecessary files from the temp directory
-				if (transactionsToClean.offset % (TransactionBatch.LIMIT * 10) == 0) {
-					this.cleanupTempDirectory(now);
-				}
-
-				// Any arbitrary transactions we want to fetch data for?
-				try (final Repository repository = RepositoryManager.getRepository()) {
-					// Fetch only after QDN, clock and storage checks. Keep a signature snapshot, then hydrate
-					// just the next batch rather than joining and retaining the entire QDN history.
-					List<ArbitraryTransactionData> transactions = transactionsToClean.next(
-							repository.getArbitraryRepository(), System.currentTimeMillis());
-					if (isStopping) {
-						return;
-					}
-					if (transactionsToClean.startOfCycle) {
-						processedTransactions.clear();
-					}
-
-					now = NTP.getTime();
-
-					// Loop through the signatures in this batch
-					for (int i=0; i<transactions.size(); i++) {
-						if (isStopping) {
-							return;
-						}
-
-						ArbitraryTransactionData arbitraryTransactionData = transactions.get(i);
-						if (arbitraryTransactionData == null) {
-							continue;
-						}
-
-						// Don't interfere with the filesystem whilst a build is in progress
-						if (ArbitraryDataBuildManager.getInstance().getBuildInProgress()) {
-							Thread.sleep(5000);
-						}
-
-						if (arbitraryTransactionData.getService() == null) {
-							continue;
-						}
-
-						// Raw data doesn't have any associated files to clean up
-						if (arbitraryTransactionData.getDataType() == ArbitraryTransactionData.DataType.RAW_DATA) {
-							continue;
-						}
-
-						boolean mostRecentTransaction = processedTransactions.add(new ArbitraryTransactionDataHashWrapper(arbitraryTransactionData));
-
-						// Check if we have the complete file
-						boolean completeFileExists = ArbitraryTransactionUtils.completeFileExists(arbitraryTransactionData);
-
-						// Check if we have any of the chunks
-						boolean anyChunksExist = ArbitraryTransactionUtils.anyChunksExist(arbitraryTransactionData);
-						boolean transactionHasChunks = (arbitraryTransactionData.getMetadataHash() != null);
-
-						if (!completeFileExists && !anyChunksExist) {
-							// We don't have any files at all for this transaction - nothing to do
-							continue;
-						}
-
-						// We have at least 1 chunk or file for this transaction, so we might need to delete them...
-
-
-						// Check to see if we should be hosting data for this transaction at all
-						if (!storageManager.canStoreData(arbitraryTransactionData)) {
-							LOGGER.debug("Deleting transaction {} because we can't host its data",
-									Base58.encode(arbitraryTransactionData.getSignature()));
-							ArbitraryTransactionUtils.deleteCompleteFileAndChunks(arbitraryTransactionData);
-
-							EventBus.INSTANCE.notify(
-								new DataMonitorEvent(
-									System.currentTimeMillis(),
-									arbitraryTransactionData.getIdentifier(),
-									arbitraryTransactionData.getName(),
-									arbitraryTransactionData.getService().name(),
-									"can't store data, deleting",
-									arbitraryTransactionData.getTimestamp(),
-									arbitraryTransactionData.getTimestamp()
-								)
-							);
-							continue;
-						}
-
-						// Check to see if we have had a more recent PUT
-						if (!mostRecentTransaction) {
-							// There is a more recent PUT transaction than the one we are currently processing.
-							// When a PUT is issued, it replaces any layers that would have been there before.
-							// Therefore any data relating to this older transaction is no longer needed.
-							LOGGER.debug(String.format("Newer PUT found for %s %s since transaction %s. " +
-											"Deleting all files associated with the earlier transaction.", arbitraryTransactionData.getService(),
-									arbitraryTransactionData.getName(), Base58.encode(arbitraryTransactionData.getSignature())));
-
-							ArbitraryTransactionUtils.deleteCompleteFileAndChunks(arbitraryTransactionData);
-
-							Optional<ArbitraryTransactionDataHashWrapper> moreRecentPutTransaction
-								= processedTransactions.stream()
-									.filter(data -> data.equals(arbitraryTransactionData))
-									.findAny();
-
-							if( moreRecentPutTransaction.isPresent() ) {
-								EventBus.INSTANCE.notify(
-									new DataMonitorEvent(
-										System.currentTimeMillis(),
-										arbitraryTransactionData.getIdentifier(),
-										arbitraryTransactionData.getName(),
-										arbitraryTransactionData.getService().name(),
-										"deleting data due to replacement",
-										arbitraryTransactionData.getTimestamp(),
-										moreRecentPutTransaction.get().getData().getTimestamp()
-									)
-								);
-							}
-							else {
-								LOGGER.warn("Something went wrong with the most recent put transaction determination!");
-							}
-
-							continue;
-						}
-
-						if (completeFileExists && !transactionHasChunks) {
-							// This file doesn't have any chunks because it is too small.
-							// We must not delete anything.
-							continue;
-						}
-
-						// Check if we have all of the chunks
-						boolean allChunksExist = ArbitraryTransactionUtils.allChunksExist(arbitraryTransactionData);
-
-						if (completeFileExists && allChunksExist) {
-							// We have the complete file and all the chunks, so we can delete
-							// the complete file if it has reached a certain age.
-							LOGGER.debug(String.format("Transaction %s has complete file and all chunks",
-									Base58.encode(arbitraryTransactionData.getSignature())));
-
-							boolean wasDeleted = ArbitraryTransactionUtils.deleteCompleteFile(arbitraryTransactionData, now, STALE_FILE_TIMEOUT);
-
-							if( wasDeleted ) {
-								EventBus.INSTANCE.notify(
-									new DataMonitorEvent(
-										System.currentTimeMillis(),
-										arbitraryTransactionData.getIdentifier(),
-										arbitraryTransactionData.getName(),
-										arbitraryTransactionData.getService().name(),
-										"deleting file, retaining chunks",
-										arbitraryTransactionData.getTimestamp(),
-										arbitraryTransactionData.getTimestamp()
-									)
-								);
-							}
-							continue;
-						}
-
-						if (completeFileExists && !allChunksExist) {
-							// We have the complete file but not the chunks, so let's convert it
-							LOGGER.debug(String.format("Transaction %s has complete file but no chunks",
-									Base58.encode(arbitraryTransactionData.getSignature())));
-
-							ArbitraryTransactionUtils.convertFileToChunks(arbitraryTransactionData, now, STALE_FILE_TIMEOUT);
-                        }
-					}
-
-				} catch (DataException e) {
-					LOGGER.error("Repository issue when fetching arbitrary transaction data", e);
-				}
-
-				// Check if there are any hosted files that don't have matching transactions
-				// UPDATE: This has been disabled for now as it was deleting valid transactions
-				// and causing chunks to go missing on the network. If ever re-enabled, we MUST
-				// ensure that original copies of data aren't deleted, and that sufficient time
-				// is allowed (ideally several hours) before treating a transaction as missing.
-				// this.checkForExpiredTransactions(repository);
-
-				// Delete additional data at random if we're over our storage limit
-				// Use the DELETION_THRESHOLD so that we only start deleting once the hard limit is reached
-				// This also allows some headroom between the regular threshold (90%) and the hard
-				// limit, to avoid data getting into a fetch/delete loop.
+				this.processIndexedBatch(contentJournal, storageManager, now, indexedBatchSize);
 				if (!storageManager.isStorageSpaceAvailable(DELETION_THRESHOLD)) {
-
 					LOGGER.info("no storage space available");
-
-					// Rate limit, to avoid repeated calls to calculateDirectorySize()
-					Thread.sleep(10000);
-					// Now delete some data at random
+					Thread.sleep(10_000L);
 					this.storageLimitReached();
 				}
 			}
 		} catch (InterruptedException e) {
-			// Fall-through to exit thread...
+			// Fall through to exit.
 		}
+	}
+
+	/**
+	 * Enumerate only the actual signature-directory level. No transaction history is loaded,
+	 * and no file contents or metadata are parsed during discovery.
+	 */
+	private List<Path> loadHostedPathsForDiscovery() throws IOException {
+		Path dataPath = Paths.get(Settings.getInstance().getDataPath()).toAbsolutePath().normalize();
+		if (!Files.isDirectory(dataPath))
+			return new ArrayList<>(0);
+
+		try (java.util.stream.Stream<Path> paths = Files.walk(dataPath, 3)) {
+			return paths.filter(Files::isDirectory)
+					.filter(path -> dataPath.relativize(path.toAbsolutePath().normalize()).getNameCount() == 3)
+					.filter(path -> {
+						Path relative = dataPath.relativize(path.toAbsolutePath().normalize());
+						return !relative.getName(0).toString().startsWith("_");
+					})
+					.collect(Collectors.toList());
+		}
+	}
+
+	private int processDiscoveryBatch(LocalQdnContentJournal contentJournal,
+			List<Path> discoveryPaths, int offset, int limit) throws InterruptedException {
+		int end = Math.min(discoveryPaths.size(), offset + limit);
+		Map<String, byte[]> discovered = new java.util.LinkedHashMap<>();
+		for (int i = offset; i < end; ++i) {
+			if (isStopping)
+				throw new InterruptedException();
+
+			Path path = discoveryPaths.get(i);
+			String signature58 = path.getFileName().toString();
+
+			try {
+				if (!this.directoryHasEntries(path) || !this.hasValidSignatureShard(path, signature58))
+					continue;
+				byte[] signature = Base58.decode(signature58);
+				if (signature.length == 64 && !contentJournal.containsSignature(signature))
+					discovered.put(signature58, signature);
+			} catch (IOException | NumberFormatException e) {
+				LOGGER.debug("Skipping invalid QDN discovery path {}", path);
+			}
+		}
+
+		int added = contentJournal.confirmPresentBatch(discovered);
+		if (added > 0)
+			LOGGER.debug("QDN discovery persisted {} hosted signatures ({}/{})",
+					added, end, discoveryPaths.size());
+		return end;
+	}
+
+	private boolean directoryHasEntries(Path directory) throws IOException {
+		try (java.nio.file.DirectoryStream<Path> entries = Files.newDirectoryStream(directory)) {
+			return entries.iterator().hasNext();
+		}
+	}
+
+	private boolean hasValidSignatureShard(Path path, String signature58) {
+		if (signature58 == null || signature58.length() < 4 || path.getParent() == null
+				|| path.getParent().getParent() == null)
+			return false;
+		String first = path.getParent().getParent().getFileName().toString();
+		String second = path.getParent().getFileName().toString();
+		return first.equalsIgnoreCase(signature58.substring(0, 2))
+				&& second.equalsIgnoreCase(signature58.substring(2, 4));
+	}
+
+	private void processIndexedBatch(LocalQdnContentJournal contentJournal,
+			ArbitraryDataStorageManager storageManager, long now, int limit) throws InterruptedException {
+		List<byte[]> signatures = contentJournal.nextCandidates(limit, false);
+		if (signatures.isEmpty() && now - this.lastIndexedAudit >= INDEX_AUDIT_INTERVAL) {
+			signatures = contentJournal.nextCandidates(INDEX_AUDIT_BATCH_SIZE, true);
+			this.lastIndexedAudit = now;
+		}
+		if (signatures.isEmpty())
+			return;
+
+		if (ArbitraryDataBuildManager.getInstance().getBuildInProgress()) {
+			signatures.forEach(contentJournal::recordFilesystemChange);
+			return;
+		}
+
+		Map<ByteArray, ArbitraryTransactionData> transactionBySignature = new HashMap<>();
+		Map<ByteArray, ArbitraryTransactionData> newerPutBySignature = new HashMap<>();
+		try (Repository repository = RepositoryManager.getRepository()) {
+			List<TransactionData> transactionData = repository.getTransactionRepository().fromSignatures(signatures);
+			for (TransactionData data : transactionData) {
+				if (!(data instanceof ArbitraryTransactionData))
+					continue;
+				ArbitraryTransactionData arbitraryData = (ArbitraryTransactionData) data;
+				ByteArray signatureKey = ByteArray.wrap(arbitraryData.getSignature());
+				transactionBySignature.put(signatureKey, arbitraryData);
+				if (arbitraryData.getName() != null && arbitraryData.getService() != null) {
+					ArbitraryTransactionData latestPut = repository.getArbitraryRepository().getLatestTransaction(
+							arbitraryData.getName(), arbitraryData.getService(),
+							ArbitraryTransactionData.Method.PUT, arbitraryData.getIdentifier());
+					if (latestPut != null && latestPut.getTimestamp() > arbitraryData.getTimestamp())
+						newerPutBySignature.put(signatureKey, latestPut);
+				}
+			}
+			repository.discardChanges();
+		} catch (DataException e) {
+			signatures.forEach(contentJournal::recordFilesystemChange);
+			LOGGER.warn("Unable to resolve local QDN cleanup batch; deferring it", e);
+			return;
+		}
+
+		for (byte[] signature : signatures) {
+			if (isStopping)
+				return;
+			ByteArray signatureKey = ByteArray.wrap(signature);
+			ArbitraryTransactionData transactionData = transactionBySignature.get(signatureKey);
+			if (transactionData == null) {
+				// Existing files are retained when the transaction cannot be resolved. Confirming
+				// their presence removes this item from the dirty queue; the rotating audit will
+				// check it again later without creating a permanent hot loop.
+				try {
+					if (this.indexedDirectoryHasEntries(signature))
+						contentJournal.confirmPresent(signature);
+					else
+						contentJournal.confirmAbsent(signature);
+				} catch (IOException e) {
+					contentJournal.recordFilesystemChange(signature);
+				}
+				continue;
+			}
+
+			try {
+				this.processIndexedTransaction(transactionData, newerPutBySignature.get(signatureKey),
+						storageManager, contentJournal, now);
+			} catch (DataException e) {
+				contentJournal.recordFilesystemChange(signature);
+				LOGGER.debug("Unable to reconcile local QDN data for {}; deferring it",
+						QdnPathResolver.encode(signature), e);
+			}
+		}
+	}
+
+	private boolean indexedDirectoryHasEntries(byte[] signature) throws IOException {
+		Path directory = QdnPathResolver.resolveTransactionDirectory(signature);
+		if (directory == null)
+			return false;
+		if (!Files.isDirectory(directory))
+			return false;
+		try (java.util.stream.Stream<Path> paths = Files.list(directory)) {
+			return paths.findAny().isPresent();
+		}
+	}
+
+	private void processIndexedTransaction(ArbitraryTransactionData transactionData,
+			ArbitraryTransactionData newerPut, ArbitraryDataStorageManager storageManager,
+			LocalQdnContentJournal contentJournal, long now) throws DataException {
+		LocalQdnContentJournal.SignatureLease cleanupLease =
+				contentJournal.tryAcquireCleanupLease(transactionData.getSignature());
+		if (cleanupLease == null) {
+			contentJournal.recordFilesystemChange(transactionData.getSignature());
+			return;
+		}
+		try (LocalQdnContentJournal.SignatureLease ignored = cleanupLease) {
+		if (transactionData.getService() == null
+				|| transactionData.getDataType() == ArbitraryTransactionData.DataType.RAW_DATA) {
+			contentJournal.confirmAbsent(transactionData.getSignature());
+			return;
+		}
+
+		QdnFileManifestCache.Manifest manifest = QdnFileManifestCache.get(transactionData);
+		boolean completeFileExists = manifest != null
+				? manifest.completeFileExists() : ArbitraryTransactionUtils.completeFileExists(transactionData);
+		boolean anyChunksExist = manifest != null
+				? manifest.anyChunksExist() : ArbitraryTransactionUtils.anyChunksExist(transactionData);
+		if (!completeFileExists && !anyChunksExist) {
+			contentJournal.confirmAbsent(transactionData.getSignature());
+			return;
+		}
+		contentJournal.confirmPresent(transactionData.getSignature());
+
+		if (!storageManager.canStoreData(transactionData)) {
+			ArbitraryTransactionUtils.deleteCompleteFileAndChunks(transactionData);
+			this.reconcileJournalEntry(contentJournal, transactionData);
+			this.notifyCleanup(transactionData, "can't store data, deleting", transactionData.getTimestamp());
+			return;
+		}
+
+		if (newerPut != null) {
+			ArbitraryTransactionUtils.deleteCompleteFileAndChunks(transactionData);
+			this.reconcileJournalEntry(contentJournal, transactionData);
+			this.notifyCleanup(transactionData, "deleting data due to replacement", newerPut.getTimestamp());
+			return;
+		}
+
+		boolean transactionHasChunks = transactionData.getMetadataHash() != null;
+		if (completeFileExists && !transactionHasChunks)
+			return;
+
+		boolean allChunksExist = manifest != null
+				? manifest.allChunksExist() : ArbitraryTransactionUtils.allChunksExist(transactionData);
+		if (completeFileExists && allChunksExist) {
+			if (ArbitraryTransactionUtils.deleteCompleteFile(transactionData, now, STALE_FILE_TIMEOUT)) {
+				this.reconcileJournalEntry(contentJournal, transactionData);
+				this.notifyCleanup(transactionData, "deleting file, retaining chunks", transactionData.getTimestamp());
+			}
+			return;
+		}
+
+		if (completeFileExists) {
+			ArbitraryTransactionUtils.convertFileToChunks(transactionData, now, STALE_FILE_TIMEOUT);
+			this.reconcileJournalEntry(contentJournal, transactionData);
+		}
+		}
+	}
+
+	private void reconcileJournalEntry(LocalQdnContentJournal contentJournal,
+			ArbitraryTransactionData transactionData) throws DataException {
+		QdnFileManifestCache.Manifest manifest = QdnFileManifestCache.get(transactionData);
+		boolean contentExists = manifest != null
+				? manifest.completeFileExists() || manifest.anyChunksExist()
+				: ArbitraryTransactionUtils.completeFileExists(transactionData)
+						|| ArbitraryTransactionUtils.anyChunksExist(transactionData);
+		if (contentExists)
+			contentJournal.confirmPresent(transactionData.getSignature());
+		else
+			contentJournal.confirmAbsent(transactionData.getSignature());
+	}
+
+	private void notifyCleanup(ArbitraryTransactionData transactionData, String reason, long latestTimestamp) {
+		EventBus.INSTANCE.notify(new DataMonitorEvent(
+				System.currentTimeMillis(), transactionData.getIdentifier(), transactionData.getName(),
+				transactionData.getService().name(), reason, transactionData.getTimestamp(), latestTimestamp));
 	}
 
 	public List<Path> findPathsWithNoAssociatedTransaction(Repository repository) {
@@ -380,6 +435,38 @@ public class ArbitraryDataCleanupManager extends Thread {
 		// We think that the storage limit has been reached
 
 		LOGGER.info("no storage space available, proceed to delete");
+		LocalQdnContentJournal contentJournal = LocalQdnContentJournal.getInstance();
+		if (contentJournal.isDiscoveryComplete()) {
+			if (ArbitraryDataBuildManager.getInstance().getBuildInProgress())
+				return;
+			List<byte[]> signatures = contentJournal.snapshotSignatures();
+			Collections.shuffle(signatures, RANDOM);
+			Map<ByteArray, ArbitraryTransactionData> transactionsBySignature = new HashMap<>();
+			try (Repository repository = RepositoryManager.getRepository()) {
+				for (TransactionData data : repository.getTransactionRepository().fromSignatures(signatures)) {
+					if (data instanceof ArbitraryTransactionData) {
+						ArbitraryTransactionData arbitraryData = (ArbitraryTransactionData) data;
+						transactionsBySignature.put(ByteArray.wrap(arbitraryData.getSignature()), arbitraryData);
+					}
+				}
+				repository.discardChanges();
+			} catch (DataException e) {
+				LOGGER.warn("Unable to resolve indexed QDN data for storage-pressure cleanup; deferring eviction", e);
+				return;
+			}
+			int deleted = 0;
+			long now = System.currentTimeMillis();
+			for (byte[] signature : signatures) {
+				if (isStopping || deleted >= CHUNK_DELETION_BATCH_SIZE)
+					break;
+				ArbitraryTransactionData transactionData =
+						transactionsBySignature.get(ByteArray.wrap(signature));
+				if (transactionData != null && this.deleteOneIndexedFile(transactionData, now))
+					deleted++;
+			}
+			LOGGER.info("Deleted {} indexed QDN files after reaching the storage limit", deleted);
+			return;
+		}
 
 		// Delete a batch of random chunks
 		// This reduces the chance of too many nodes deleting the same chunk
@@ -393,6 +480,48 @@ public class ArbitraryDataCleanupManager extends Thread {
 		}
 
 		// FUTURE: consider reducing the expiry time of the reader cache
+	}
+
+	private boolean deleteOneIndexedFile(ArbitraryTransactionData transactionData, long now) {
+		byte[] signature = transactionData.getSignature();
+		LocalQdnContentJournal.SignatureLease cleanupLease =
+				LocalQdnContentJournal.getInstance().tryAcquireCleanupLease(signature);
+		if (cleanupLease == null) {
+			LocalQdnContentJournal.getInstance().recordFilesystemChange(signature);
+			return false;
+		}
+		try (LocalQdnContentJournal.SignatureLease ignored = cleanupLease) {
+		Path directory = QdnPathResolver.resolveTransactionDirectory(signature);
+		if (directory == null)
+			return false;
+		if (Files.exists(directory.resolve(".original")))
+			return false;
+
+		String metadataHash58 = transactionData.getMetadataHash() == null
+				? null : Base58.encode(transactionData.getMetadataHash());
+		File[] files = directory.toFile().listFiles(file -> file.isFile()
+				&& !file.getName().equals(".original")
+				&& !file.getName().equals(metadataHash58)
+				&& !FilesystemUtils.isFileRecent(file.toPath(), now, STALE_FILE_TIMEOUT));
+		if (files == null || files.length == 0) {
+			LocalQdnContentJournal.getInstance().recordFilesystemChange(signature);
+			return false;
+		}
+
+		File selected = files[RANDOM.nextInt(files.length)];
+		try {
+			LocalQdnContentJournal.getInstance().recordFilesystemChange(signature);
+			long diskUsage = FilesystemUtils.getDiskUsage(selected);
+			if (!selected.delete())
+				return false;
+			ArbitraryDataFolderSizeEstimator.getInstance().subtract(diskUsage);
+			FilesystemUtils.safeDeleteEmptyParentDirectories(selected.toPath().getParent());
+			return true;
+		} catch (IOException e) {
+			LOGGER.debug("Unable to delete indexed QDN file {}", selected, e);
+			return false;
+		}
+		}
 	}
 
 	/**
@@ -419,6 +548,9 @@ public class ArbitraryDataCleanupManager extends Thread {
 			}
 
 			File randomItem = contentsList[random.nextInt(contentsList.length)];
+			if (LocalQdnContentJournal.getInstance().ownsPath(randomItem.toPath())) {
+				return false;
+			}
 
 			// Skip anything relating to the temp directory
 			if (FilesystemUtils.isChild(randomItem.toPath(), tempDataPath)) {
@@ -450,10 +582,12 @@ public class ArbitraryDataCleanupManager extends Thread {
 
 				long diskUsage = FilesystemUtils.getDiskUsage(randomItem);
 
+				LocalQdnContentJournal.getInstance().recordPathChange(randomItem.toPath());
 				boolean success = randomItem.delete();
 				if (success) {
 
 					ArbitraryDataFolderSizeEstimator.getInstance().subtract(diskUsage);
+					LocalQdnContentJournal.getInstance().recordPathChange(randomItem.toPath());
 					try {
 						FilesystemUtils.safeDeleteEmptyParentDirectories(randomItem.toPath().getParent());
 					} catch (IOException e) {
@@ -632,7 +766,9 @@ public class ArbitraryDataCleanupManager extends Thread {
 	private boolean safeDeleteDirectory(File directory, String reason) {
 		LOGGER.debug("Deleting directory {} due to reason: {}", directory, reason);
 		try {
+			LocalQdnContentJournal.getInstance().recordPathChange(directory.toPath());
 			FilesystemUtils.safeDeleteDirectory(directory.toPath(), true);
+			LocalQdnContentJournal.getInstance().recordPathChange(directory.toPath());
 			return true;
 		} catch (IOException e) {
 			LOGGER.debug("Unable to delete directory: {}", directory);
@@ -644,6 +780,7 @@ public class ArbitraryDataCleanupManager extends Thread {
 	public void shutdown() {
 		isStopping = true;
 		this.interrupt();
+		LocalQdnContentJournal.getInstance().compact();
 	}
 
 }

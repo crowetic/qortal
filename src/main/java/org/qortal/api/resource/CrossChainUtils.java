@@ -821,7 +821,9 @@ public class CrossChainUtils {
                     atData.getCreatorPublicKey(),
                     atData.getCreation(),
                     atStateData,
-                    OptionalLong.of(balanceByAtAddress.get(atStateData.getATAddress()))
+                    // Missing AccountBalances rows represent a zero balance. This is common for
+                    // completed legacy offers and must not prevent a bulk offer-index rebuild.
+                    OptionalLong.of(balanceByAtAddress.getOrDefault(atStateData.getATAddress(), 0L))
                 )
             );
         }

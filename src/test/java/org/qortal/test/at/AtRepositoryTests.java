@@ -15,6 +15,9 @@ import org.qortal.test.common.Common;
 import org.qortal.transaction.DeployAtTransaction;
 
 import java.util.List;
+import java.util.Collections;
+
+import org.qortal.utils.ByteArray;
 
 import static org.junit.Assert.*;
 
@@ -23,6 +26,28 @@ public class AtRepositoryTests extends Common {
 	@Before
 	public void beforeTest() throws DataException {
 		Common.useDefaultSettings();
+	}
+
+	@Test
+	public void testGetATsByFunctionalitySinceCurrentHead() throws DataException {
+		byte[] creationBytes = AtUtils.buildSimpleAT();
+
+		try (final Repository repository = RepositoryManager.getRepository()) {
+			PrivateKeyAccount deployer = Common.getTestAccount(repository, "alice");
+			DeployAtTransaction deployment = AtUtils.doDeployAT(repository, deployer, creationBytes, 1_00000000L);
+			BlockUtils.mintBlock(repository);
+
+			ATData deployed = repository.getATRepository().fromATAddress(deployment.getATAccount().getAddress());
+			int currentHeight = repository.getBlockRepository().getBlockchainHeight();
+
+			List<ATData> atCurrentHeight = repository.getATRepository().getAllATsByFunctionalitySince(
+					Collections.singleton(ByteArray.wrap(deployed.getCodeHash())), null, currentHeight);
+			assertTrue(atCurrentHeight.stream().anyMatch(data -> data.getATAddress().equals(deployed.getATAddress())));
+
+			List<ATData> beyondCurrentHeight = repository.getATRepository().getAllATsByFunctionalitySince(
+					Collections.singleton(ByteArray.wrap(deployed.getCodeHash())), null, currentHeight + 1);
+			assertTrue(beyondCurrentHeight.isEmpty());
+		}
 	}
 
 	@Test
@@ -36,7 +61,6 @@ public class AtRepositoryTests extends Common {
 			DeployAtTransaction deployAtTransaction = AtUtils.doDeployAT(repository, deployer, creationBytes, fundingAmount);
 			String atAddress = deployAtTransaction.getATAccount().getAddress();
 
-			// Mint a few blocks
 			for (int i = 0; i < 10; ++i)
 				BlockUtils.mintBlock(repository);
 
@@ -45,35 +69,7 @@ public class AtRepositoryTests extends Common {
 
 			assertEquals(testHeight, atStateData.getHeight());
 			assertNotNull(atStateData.getStateData());
-		}
-	}
-
-	@Test
-	public void testGetATStateAtHeightWithoutData() throws DataException {
-		byte[] creationBytes = AtUtils.buildSimpleAT();
-
-		try (final Repository repository = RepositoryManager.getRepository()) {
-			PrivateKeyAccount deployer = Common.getTestAccount(repository, "alice");
-
-			long fundingAmount = 1_00000000L;
-			DeployAtTransaction deployAtTransaction = AtUtils.doDeployAT(repository, deployer, creationBytes, fundingAmount);
-			String atAddress = deployAtTransaction.getATAccount().getAddress();
-
-			// Mint a few blocks
-			for (int i = 0; i < 10; ++i)
-				BlockUtils.mintBlock(repository);
-
-			int maxHeight = 8;
-			Integer testHeight = maxHeight - 2;
-
-			// Trim AT state data
-			repository.getATRepository().rebuildLatestAtStates(maxHeight);
-			repository.getATRepository().trimAtStates(2, maxHeight, 1000);
-
-			ATStateData atStateData = repository.getATRepository().getATStateAtHeight(atAddress, testHeight);
-
-			assertEquals(testHeight, atStateData.getHeight());
-			assertNull(atStateData.getStateData());
+			repository.discardChanges();
 		}
 	}
 
@@ -88,7 +84,6 @@ public class AtRepositoryTests extends Common {
 			DeployAtTransaction deployAtTransaction = AtUtils.doDeployAT(repository, deployer, creationBytes, fundingAmount);
 			String atAddress = deployAtTransaction.getATAccount().getAddress();
 
-			// Mint a few blocks
 			for (int i = 0; i < 10; ++i)
 				BlockUtils.mintBlock(repository);
 			int blockchainHeight = repository.getBlockRepository().getBlockchainHeight();
@@ -98,92 +93,7 @@ public class AtRepositoryTests extends Common {
 
 			assertEquals(testHeight, atStateData.getHeight());
 			assertNotNull(atStateData.getStateData());
-		}
-	}
-
-	@Test
-	public void testGetLatestATStatePostTrimming() throws DataException {
-		byte[] creationBytes = AtUtils.buildSimpleAT();
-
-		try (final Repository repository = RepositoryManager.getRepository()) {
-			PrivateKeyAccount deployer = Common.getTestAccount(repository, "alice");
-
-			long fundingAmount = 1_00000000L;
-			DeployAtTransaction deployAtTransaction = AtUtils.doDeployAT(repository, deployer, creationBytes, fundingAmount);
-			String atAddress = deployAtTransaction.getATAccount().getAddress();
-
-			// Mint a few blocks
-			for (int i = 0; i < 10; ++i)
-				BlockUtils.mintBlock(repository);
-			int blockchainHeight = repository.getBlockRepository().getBlockchainHeight();
-
-			int maxHeight = blockchainHeight + 100; // more than latest block height
-			Integer testHeight = blockchainHeight;
-
-			// Trim AT state data
-			repository.getATRepository().rebuildLatestAtStates(maxHeight);
-			// COMMIT to check latest AT states persist / TEMPORARY table interaction
-			repository.saveChanges();
-
-			repository.getATRepository().trimAtStates(2, maxHeight, 1000);
-
-			ATStateData atStateData = repository.getATRepository().getLatestATState(atAddress);
-
-			assertEquals(testHeight, atStateData.getHeight());
-			// We should always have the latest AT state data available
-			assertNotNull(atStateData.getStateData());
-		}
-	}
-
-	@Test
-	public void testOrphanTrimmedATStates() throws DataException {
-		byte[] creationBytes = AtUtils.buildSimpleAT();
-
-		try (final Repository repository = RepositoryManager.getRepository()) {
-			PrivateKeyAccount deployer = Common.getTestAccount(repository, "alice");
-
-			long fundingAmount = 1_00000000L;
-			DeployAtTransaction deployAtTransaction = AtUtils.doDeployAT(repository, deployer, creationBytes, fundingAmount);
-			String atAddress = deployAtTransaction.getATAccount().getAddress();
-
-			// Mint a few blocks
-			for (int i = 0; i < 10; ++i)
-				BlockUtils.mintBlock(repository);
-
-			int blockchainHeight = repository.getBlockRepository().getBlockchainHeight();
-			int maxTrimHeight = blockchainHeight - 4;
-			Integer testHeight = maxTrimHeight + 1;
-
-			// Trim AT state data (using a max height of maxTrimHeight + 1, so it is beyond the trimmed range)
-			repository.getATRepository().rebuildLatestAtStates(maxTrimHeight + 1);
-			repository.saveChanges();
-			repository.getATRepository().trimAtStates(2, maxTrimHeight, 1000);
-
-			// Orphan 3 blocks
-			// This leaves one more untrimmed block, so the latest AT state should be available
-			BlockUtils.orphanBlocks(repository, 3);
-
-			ATStateData atStateData = repository.getATRepository().getLatestATState(atAddress);
-			assertEquals(testHeight, atStateData.getHeight());
-
-			// We should always have the latest AT state data available
-			assertNotNull(atStateData.getStateData());
-
-			// Orphan 1 more block
-			Exception exception = null;
-			try {
-				BlockUtils.orphanBlocks(repository, 1);
-			} catch (DataException e) {
-				exception = e;
-			}
-
-			// Ensure that a DataException is thrown because there is no more AT states data available
-			assertNotNull(exception);
-			assertEquals(DataException.class, exception.getClass());
-			assertEquals(String.format("Can't find previous AT state data for %s", atAddress), exception.getMessage());
-
-			// FUTURE: we may be able to retain unique AT states when trimming, to avoid this exception
-			// and allow orphaning back through blocks with trimmed AT states.
+			repository.discardChanges();
 		}
 	}
 
@@ -198,7 +108,6 @@ public class AtRepositoryTests extends Common {
 			DeployAtTransaction deployAtTransaction = AtUtils.doDeployAT(repository, deployer, creationBytes, fundingAmount);
 			String atAddress = deployAtTransaction.getATAccount().getAddress();
 
-			// Mint a few blocks
 			for (int i = 0; i < 10; ++i)
 				BlockUtils.mintBlock(repository);
 			int blockchainHeight = repository.getBlockRepository().getBlockchainHeight();
@@ -246,7 +155,6 @@ public class AtRepositoryTests extends Common {
 			DeployAtTransaction deployAtTransaction = AtUtils.doDeployAT(repository, deployer, creationBytes, fundingAmount);
 			String atAddress = deployAtTransaction.getATAccount().getAddress();
 
-			// Mint a few blocks
 			for (int i = 0; i < 10; ++i)
 				BlockUtils.mintBlock(repository);
 			int blockchainHeight = repository.getBlockRepository().getBlockchainHeight();
@@ -293,7 +201,6 @@ public class AtRepositoryTests extends Common {
 			long fundingAmount = 1_00000000L;
 			AtUtils.doDeployAT(repository, deployer, creationBytes, fundingAmount);
 
-			// Mint a few blocks
 			for (int i = 0; i < 10; ++i)
 				BlockUtils.mintBlock(repository);
 
@@ -305,111 +212,8 @@ public class AtRepositoryTests extends Common {
 
 			ATStateData atStateData = atStates.get(0);
 			assertEquals(testHeight, atStateData.getHeight());
-			// getBlockATStatesAtHeight never returns actual AT state data anyway
 			assertNull(atStateData.getStateData());
 		}
 	}
 
-	@Test
-	public void testGetBlockATStatesAtHeightWithoutData() throws DataException {
-		byte[] creationBytes = AtUtils.buildSimpleAT();
-
-		try (final Repository repository = RepositoryManager.getRepository()) {
-			PrivateKeyAccount deployer = Common.getTestAccount(repository, "alice");
-
-			long fundingAmount = 1_00000000L;
-			AtUtils.doDeployAT(repository, deployer, creationBytes, fundingAmount);
-
-			// Mint a few blocks
-			for (int i = 0; i < 10; ++i)
-				BlockUtils.mintBlock(repository);
-
-			int maxHeight = 8;
-			Integer testHeight = maxHeight - 2;
-
-			// Trim AT state data
-			repository.getATRepository().rebuildLatestAtStates(maxHeight);
-			repository.getATRepository().trimAtStates(2, maxHeight, 1000);
-
-			List<ATStateData> atStates = repository.getATRepository().getBlockATStatesAtHeight(testHeight);
-
-			assertEquals(false, atStates.isEmpty());
-			assertEquals(1, atStates.size());
-
-			ATStateData atStateData = atStates.get(0);
-			assertEquals(testHeight, atStateData.getHeight());
-			// getBlockATStatesAtHeight never returns actual AT state data anyway
-			assertNull(atStateData.getStateData());
-		}
-	}
-
-	@Test
-	public void testSaveATStateWithData() throws DataException {
-		byte[] creationBytes = AtUtils.buildSimpleAT();
-
-		try (final Repository repository = RepositoryManager.getRepository()) {
-			PrivateKeyAccount deployer = Common.getTestAccount(repository, "alice");
-
-			long fundingAmount = 1_00000000L;
-			DeployAtTransaction deployAtTransaction = AtUtils.doDeployAT(repository, deployer, creationBytes, fundingAmount);
-			String atAddress = deployAtTransaction.getATAccount().getAddress();
-
-			// Mint a few blocks
-			for (int i = 0; i < 10; ++i)
-				BlockUtils.mintBlock(repository);
-			int blockchainHeight = repository.getBlockRepository().getBlockchainHeight();
-
-			Integer testHeight = blockchainHeight - 2;
-			ATStateData atStateData = repository.getATRepository().getATStateAtHeight(atAddress, testHeight);
-
-			assertEquals(testHeight, atStateData.getHeight());
-			assertNotNull(atStateData.getStateData());
-
-			repository.getATRepository().save(atStateData);
-
-			atStateData = repository.getATRepository().getATStateAtHeight(atAddress, testHeight);
-
-			assertEquals(testHeight, atStateData.getHeight());
-			assertNotNull(atStateData.getStateData());
-		}
-	}
-
-	@Test
-	public void testSaveATStateWithoutData() throws DataException {
-		byte[] creationBytes = AtUtils.buildSimpleAT();
-
-		try (final Repository repository = RepositoryManager.getRepository()) {
-			PrivateKeyAccount deployer = Common.getTestAccount(repository, "alice");
-
-			long fundingAmount = 1_00000000L;
-			DeployAtTransaction deployAtTransaction = AtUtils.doDeployAT(repository, deployer, creationBytes, fundingAmount);
-			String atAddress = deployAtTransaction.getATAccount().getAddress();
-
-			// Mint a few blocks
-			for (int i = 0; i < 10; ++i)
-				BlockUtils.mintBlock(repository);
-			int blockchainHeight = repository.getBlockRepository().getBlockchainHeight();
-
-			Integer testHeight = blockchainHeight - 2;
-			ATStateData atStateData = repository.getATRepository().getATStateAtHeight(atAddress, testHeight);
-
-			assertEquals(testHeight, atStateData.getHeight());
-			assertNotNull(atStateData.getStateData());
-
-			// Clear data
-			ATStateData newAtStateData = new ATStateData(atStateData.getATAddress(),
-					atStateData.getHeight(),
-					/*StateData*/ null,
-					atStateData.getStateHash(),
-					atStateData.getFees(),
-					atStateData.isInitial(),
-					atStateData.getSleepUntilMessageTimestamp());
-			repository.getATRepository().save(newAtStateData);
-
-			atStateData = repository.getATRepository().getATStateAtHeight(atAddress, testHeight);
-
-			assertEquals(testHeight, atStateData.getHeight());
-			assertNull(atStateData.getStateData());
-		}
-	}
 }

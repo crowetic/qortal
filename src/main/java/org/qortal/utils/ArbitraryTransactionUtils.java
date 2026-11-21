@@ -8,6 +8,7 @@ import org.qortal.arbitrary.ArbitraryDataFileChunk;
 import org.qortal.arbitrary.ArbitraryDataReader;
 import org.qortal.arbitrary.ArbitraryDataResource;
 import org.qortal.arbitrary.misc.Service;
+import org.qortal.controller.arbitrary.LocalQdnContentJournal;
 import org.qortal.data.arbitrary.ArbitraryResourceStatus;
 import org.qortal.data.transaction.ArbitraryTransactionData;
 import org.qortal.data.transaction.TransactionData;
@@ -376,14 +377,16 @@ public class ArbitraryTransactionUtils {
      */
     public static int checkAndRelocateMiscFiles(ArbitraryTransactionData arbitraryTransactionData) {
         int filesRelocatedCount = 0;
+        byte[] signature = arbitraryTransactionData.getSignature();
 
-        try {
+        try (LocalQdnContentJournal.SignatureLease ignored =
+                     LocalQdnContentJournal.getInstance().acquireMutationLease(signature)) {
             // Load hashes
             byte[] digest = arbitraryTransactionData.getData();
             byte[] metadataHash = arbitraryTransactionData.getMetadataHash();
 
             // Load signature
-            byte[] signature = arbitraryTransactionData.getSignature();
+            LocalQdnContentJournal.getInstance().recordFilesystemChange(signature);
 
             // Check if any files for this transaction exist in the misc folder
             ArbitraryDataFile arbitraryDataFile = ArbitraryDataFile.fromHash(digest, null);
@@ -454,6 +457,8 @@ public class ArbitraryTransactionUtils {
                     File file = Paths.get(parentDirectory.toString(), ".original").toFile();
                     file.createNewFile();
                 }
+
+                LocalQdnContentJournal.getInstance().recordFilesystemChange(signature);
             }
         } catch (DataException | IOException e) {
             LOGGER.trace("Unable to check and relocate all files for signature {}: {}",

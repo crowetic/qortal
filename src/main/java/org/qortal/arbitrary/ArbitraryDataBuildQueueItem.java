@@ -3,7 +3,10 @@ package org.qortal.arbitrary;
 import org.qortal.arbitrary.ArbitraryDataFile.ResourceIdType;
 import org.qortal.arbitrary.exception.MissingDataException;
 import org.qortal.arbitrary.misc.Service;
+import org.qortal.data.transaction.ArbitraryTransactionData;
 import org.qortal.repository.DataException;
+import org.qortal.repository.Repository;
+import org.qortal.repository.RepositoryManager;
 import org.qortal.utils.ArbitraryTransactionUtils;
 import org.qortal.utils.NTP;
 
@@ -11,60 +14,72 @@ import java.io.IOException;
 
 public class ArbitraryDataBuildQueueItem extends ArbitraryDataResource {
 
-    private final Long creationTimestamp;
-    private Long buildStartTimestamp = null;
-    private Long buildEndTimestamp = null;
-    private Integer priority = 0;
-    private boolean failed = false;
-    // Track if we've already recalculated priority with chunk counts to avoid repeated calculations
-    private boolean priorityRecalculatedWithChunks = false;
+    private final long creationTimestamp;
+    private volatile Long buildStartTimestamp;
+    private volatile Long failureTimestamp;
+    private int priority;
+    private int sizePriority;
+    private Long dataSize;
 
-    private static int HIGH_PRIORITY_THRESHOLD = 5;
-    
-    // Threshold for considering a file "large" (in chunks, where each chunk = 512KB)
-    // Files with > 200 chunks (~100MB) are considered large
-    private static int LARGE_FILE_CHUNK_THRESHOLD = 200;
-    
-    // Priority aging: boost priority by 1 every 10 seconds to prevent starvation
-    private static long PRIORITY_AGING_INTERVAL_MS = 10 * 1000L; // 10 seconds
+    private static final int HIGH_PRIORITY_THRESHOLD = 5;
+    private static final long LARGE_FILE_SIZE = 200L * ArbitraryDataFile.CHUNK_SIZE;
+    private static final long PRIORITY_AGING_INTERVAL_MS = 10_000L;
 
-    /* The maximum amount of time to spend on a single build */
-    // TODO: interrupt an in-progress build
-    public static long BUILD_TIMEOUT = 60*1000L; // 60 seconds
-    /* The amount of time to remember that a build has failed, to avoid retries */
-    public static long FAILURE_TIMEOUT = 5*60*1000L; // 5 minutes
+    /* Failed builds can be retried after five minutes. Live builds are never evicted by age. */
+    public static long FAILURE_TIMEOUT = 5 * 60 * 1000L;
 
     public ArbitraryDataBuildQueueItem(String resourceId, ResourceIdType resourceIdType, Service service, String identifier) {
         super(resourceId, resourceIdType, service, identifier);
+        Long now = NTP.getTime();
+        this.creationTimestamp = now != null ? now : System.currentTimeMillis();
+    }
 
-        this.creationTimestamp = NTP.getTime();
-        // Calculate initial priority based on file size
+    /**
+     * Read scheduling metadata once, before insertion and outside the queue monitor.
+     * Transaction size is available even before the file/chunk metadata has been downloaded.
+     * Unknown sizes remain eligible for the regular workers.
+     */
+    public void initializeSchedulingMetadata() {
+        try {
+            this.dataSize = this.fetchDataSize();
+        } catch (DataException e) {
+            this.dataSize = null;
+        }
         this.calculatePriority();
     }
 
+    protected Long fetchDataSize() throws DataException {
+        if (this.resourceIdType != ResourceIdType.NAME)
+            return null;
+        try (Repository repository = RepositoryManager.getRepository()) {
+            byte[] signature = repository.getArbitraryRepository()
+                    .getLatestSignature(this.service, this.resourceId, this.identifier);
+            if (signature == null)
+                return null;
+            ArbitraryTransactionData transaction = repository.getArbitraryRepository()
+                    .getSingleTransactionBySignature(signature);
+            return transaction != null ? (long) transaction.getSize() : null;
+        }
+    }
+
     public void prepareForBuild() {
-        this.buildStartTimestamp = NTP.getTime();
+        Long now = NTP.getTime();
+        this.prepareForBuild(now != null ? now : System.currentTimeMillis());
+    }
+
+    public void prepareForBuild(long now) {
+        this.buildStartTimestamp = now;
     }
 
     public void build() throws IOException, DataException, MissingDataException {
-        Long now = NTP.getTime();
-        if (now == null) {
-            this.buildStartTimestamp = null;
+        if (NTP.getTime() == null)
             throw new DataException("NTP time hasn't synced yet");
-        }
 
-        if (this.buildStartTimestamp == null) {
-            this.buildStartTimestamp = now;
-        }
-        ArbitraryDataReader arbitraryDataReader =
-                new ArbitraryDataReader(this.resourceId, this.resourceIdType, this.service, this.identifier);
-
+        ArbitraryDataReader reader = new ArbitraryDataReader(
+                this.resourceId, this.resourceIdType, this.service, this.identifier);
         try {
-            arbitraryDataReader.loadSynchronously(true);
+            reader.loadSynchronously(true, 0L);
         } finally {
-            this.buildEndTimestamp = NTP.getTime();
-
-            // Update status after build
             ArbitraryTransactionUtils.getStatus(service, resourceId, identifier, false, true);
         }
     }
@@ -77,117 +92,58 @@ public class ArbitraryDataBuildQueueItem extends ArbitraryDataResource {
         return this.buildStartTimestamp == null;
     }
 
-    public boolean hasReachedBuildTimeout(Long now) {
-        if (now == null || this.creationTimestamp == null) {
-            return true;
-        }
-        return now - this.creationTimestamp > BUILD_TIMEOUT;
-    }
-
     public boolean hasReachedFailureTimeout(Long now) {
-        if (now == null || this.buildStartTimestamp == null) {
-            return true;
-        }
-        return now - this.buildStartTimestamp > FAILURE_TIMEOUT;
+        return now != null && this.failureTimestamp != null && now - this.failureTimestamp > FAILURE_TIMEOUT;
     }
 
     public Long getBuildStartTimestamp() {
         return this.buildStartTimestamp;
     }
 
-    /**
-     * Calculate priority based on file size (chunk count).
-     * Smaller files get higher priority (lower number) to improve responsiveness.
-     */
+    /** Size is an additive scheduling preference; explicit caller priority is preserved. */
     public void calculatePriority() {
-        Integer totalChunks = this.getTotalChunkCount();
-        
-        if (totalChunks == null) {
-            // If we don't know size yet, use default priority
-            this.priority = 0;
-            return;
-        }
-        
-        // Smaller files get higher priority (lower number)
-        if (totalChunks <= 5) {
-            // Very small: < 2.5MB - highest priority
-            this.priority = 10;
-        } else if (totalChunks <= 20) {
-            // Small: < 10MB - high priority
-            this.priority = 5;
-        } else if (totalChunks <= 100) {
-            // Medium: < 50MB - normal priority
-            this.priority = 0;
+        if (this.dataSize == null || this.dataSize < 0) {
+            this.sizePriority = 0;
+        } else if (this.dataSize <= 5L * ArbitraryDataFile.CHUNK_SIZE) {
+            this.sizePriority = 10;
+        } else if (this.dataSize <= 20L * ArbitraryDataFile.CHUNK_SIZE) {
+            this.sizePriority = 5;
+        } else if (this.dataSize <= 100L * ArbitraryDataFile.CHUNK_SIZE) {
+            this.sizePriority = 0;
         } else {
-            // Large: > 50MB - lower priority
-            this.priority = -5;
+            this.sizePriority = -5;
         }
     }
 
-    /**
-     * Get effective priority with aging applied.
-     * Priority increases (number decreases) over time to prevent starvation.
-     * Also recalculates priority ONCE if chunk counts have become available since creation.
-     * 
-     * @return effective priority (lower number = higher priority)
-     */
-    public Integer getEffectivePriority() {
-        // Only recalculate priority ONCE when chunk counts become available
-        // Don't recalculate on every call (this was causing high CPU usage during polling)
-        if (!priorityRecalculatedWithChunks) {
-            Integer totalChunks = this.getTotalChunkCount();
-            if (totalChunks != null) {
-                // Chunk count is now available - recalculate priority once
-                this.calculatePriority();
-                this.priorityRecalculatedWithChunks = true;
-            }
-        }
-        
+    public long getEffectivePriority() {
         Long now = NTP.getTime();
-        if (now == null || this.creationTimestamp == null) {
-            return this.getPriority();
-        }
-        
-        // Calculate age in milliseconds
-        long ageMs = now - this.creationTimestamp;
-        
-        // Boost priority by 1 every 10 seconds (prevents starvation)
-        // Lower number = higher priority, so we subtract the boost
-        int ageBoost = (int) (ageMs / PRIORITY_AGING_INTERVAL_MS);
-        
-        return this.getPriority() - ageBoost;
+        return this.getEffectivePriority(now != null ? now : System.currentTimeMillis());
     }
 
-    public Integer getPriority() {
-        if (this.priority != null) {
-            return this.priority;
-        }
-        return 0;
+    /** Higher scores win. Evaluate every candidate using the same time snapshot. */
+    public long getEffectivePriority(long now) {
+        long ageBoost = Math.max(0L, now - this.creationTimestamp) / PRIORITY_AGING_INTERVAL_MS;
+        return (long) this.priority + this.sizePriority + ageBoost;
+    }
+
+    public int getPriority() {
+        return this.priority;
     }
 
     public void setPriority(Integer priority) {
-        this.priority = priority;
+        this.priority = priority != null ? priority : 0;
     }
 
     public boolean isHighPriority() {
         return this.priority >= HIGH_PRIORITY_THRESHOLD;
     }
-    
-    /**
-     * Check if this is a large file based on chunk count.
-     * Large files should use the reserved thread to prevent blocking small files.
-     * 
-     * @return true if file has more than LARGE_FILE_CHUNK_THRESHOLD chunks
-     */
+
     public boolean isLargeFile() {
-        Integer totalChunks = this.getTotalChunkCount();
-        if (totalChunks == null) {
-            return false; // Unknown size, treat as not large
-        }
-        return totalChunks > LARGE_FILE_CHUNK_THRESHOLD;
+        return this.dataSize != null && this.dataSize > LARGE_FILE_SIZE;
     }
 
     public void setFailed(boolean failed) {
-        this.failed = failed;
+        Long now = NTP.getTime();
+        this.failureTimestamp = failed ? (now != null ? now : System.currentTimeMillis()) : null;
     }
 }

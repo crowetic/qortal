@@ -1109,20 +1109,32 @@ public class BlockChain {
 
 				while (height > targetHeight) {
 					if (Controller.isStopping()) {
+						repository.discardChanges();
 						return false;
 					}
 					LOGGER.info(String.format("Forcably orphaning block %d", height));
 
-					Block block = new Block(repository, orphanBlockData);
-					block.orphan();
+					try {
+						Block block = new Block(repository, orphanBlockData);
+						block.orphan();
 
-					repository.saveChanges();
+						repository.saveChanges();
+					} catch (DataException e) {
+						LOGGER.error(String.format("DataException orphaning block %d: %s", height, e.getMessage()));
+						repository.discardChanges();
+						throw e;
+					}
 
 					--height;
-					orphanBlockData = repository.getBlockRepository().fromHeight(height);
+					try {
+						orphanBlockData = repository.getBlockRepository().fromHeight(height);
 
-					repository.discardChanges(); // clear transaction status to prevent deadlocks
-					Controller.getInstance().onOrphanedBlock(orphanBlockData);
+						repository.discardChanges(); // clear transaction status to prevent deadlocks
+						Controller.getInstance().onOrphanedBlock(orphanBlockData);
+					} catch (DataException e) {
+						LOGGER.error(String.format("DataException fetching block %d for orphan: %s", height, e.getMessage()));
+						throw e;
+					}
 				}
 
 				return true;

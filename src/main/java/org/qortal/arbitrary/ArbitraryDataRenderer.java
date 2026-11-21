@@ -18,7 +18,6 @@ import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
 
 import java.io.File;
-import java.io.FileInputStream;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.net.URL;
@@ -92,26 +91,34 @@ public class ArbitraryDataRenderer {
                     return this.getLoadingResponse(service, resourceId, identifier, theme);
                 }
 
-                // Otherwise, loop until we have data
+                long started = System.nanoTime();
                 int attempts = 0;
                 while (!Controller.isStopping()) {
-                    attempts++;
-                    if (!arbitraryDataReader.isBuilding()) {
-                        try {
-                            arbitraryDataReader.loadSynchronously(false);
-                            break;
-                        } catch (MissingDataException e) {
-                            if (attempts > 5) {
-                                // Give up after 5 attempts
-                                return ArbitraryDataRenderer.getResponse(response, 404, "Data unavailable. Please try again later.");
-                            }
-                        }
+                    long remaining = 60_000L - java.util.concurrent.TimeUnit.NANOSECONDS
+                            .toMillis(System.nanoTime() - started);
+                    if (remaining <= 0)
+                        return this.unavailableResponse();
+                    try {
+                        arbitraryDataReader.loadSynchronouslyWhenReady(false, Controller::isStopping, remaining);
+                        break;
+                    } catch (MissingDataException e) {
+                        if (attempts++ >= 5)
+                            return ArbitraryDataRenderer.getResponse(response, 404, "Data unavailable. Please try again later.");
+                        long retryWait = 60_000L - java.util.concurrent.TimeUnit.NANOSECONDS
+                                .toMillis(System.nanoTime() - started);
+                        if (retryWait > 0) Thread.sleep(Math.min(3000L, retryWait));
                     }
-                    Thread.sleep(3000L);
                 }
+                if (Controller.isStopping())
+                    return this.unavailableResponse();
             }
 
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return this.unavailableResponse();
         } catch (Exception e) {
+            if (e.getCause() instanceof java.util.concurrent.TimeoutException || Thread.currentThread().isInterrupted())
+                return this.unavailableResponse();
             LOGGER.info(String.format("Unable to load %s %s: %s", service, resourceId, e.getMessage()));
             return ArbitraryDataRenderer.getResponse(response, 500, "Error 500: Internal Server Error");
         }
@@ -196,18 +203,11 @@ public class ArbitraryDataRenderer {
             }
             else {
                 // Regular file - can be streamed directly
-                File file = filePath.toFile();
-                FileInputStream inputStream = new FileInputStream(file);
                 response.addHeader("Content-Security-Policy", "default-src 'self'");
                 response.setContentType(context.getMimeType(filename));
-                int bytesRead, length = 0;
-                byte[] buffer = new byte[10240];
-                while ((bytesRead = inputStream.read(buffer)) != -1) {
-                    response.getOutputStream().write(buffer, 0, bytesRead);
-                    length += bytesRead;
-                }
-                response.setContentLength(length);
-                inputStream.close();
+                // Set the long length before committing any bytes, including files over 2 GiB.
+                response.setContentLengthLong(Files.size(filePath));
+                Files.copy(filePath, response.getOutputStream());
             }
             return response;
         } catch (FileNotFoundException | NoSuchFileException e) {
@@ -217,6 +217,11 @@ public class ArbitraryDataRenderer {
         }
 
         return ArbitraryDataRenderer.getResponse(response, 404, "Error 404: File Not Found");
+    }
+
+    private HttpServletResponse unavailableResponse() {
+        response.setHeader("Retry-After", "2");
+        return ArbitraryDataRenderer.getResponse(response, 503, "QDN data is still being prepared. Please retry.");
     }
 
     private String getFilename(String directory, String userPath) {
@@ -253,7 +258,7 @@ public class ArbitraryDataRenderer {
 
     public static HttpServletResponse getResponse(HttpServletResponse response, int responseCode, String responseString) {
         try {
-            byte[] responseData = responseString.getBytes();
+            byte[] responseData = responseString.getBytes(java.nio.charset.StandardCharsets.UTF_8);
             response.setStatus(responseCode);
             response.setContentLength(responseData.length);
             response.getOutputStream().write(responseData);

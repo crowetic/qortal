@@ -9,9 +9,11 @@ import org.qortal.arbitrary.misc.Service;
 import org.qortal.controller.arbitrary.ArbitraryDataBuildManager;
 import org.qortal.controller.arbitrary.ArbitraryDataManager;
 import org.qortal.controller.arbitrary.ArbitraryDataStorageManager;
+import org.qortal.controller.arbitrary.ArbitraryResourceStateRegistry;
 import org.qortal.data.arbitrary.ArbitraryResourceData;
 import org.qortal.data.arbitrary.ArbitraryResourceStatus;
 import org.qortal.data.transaction.ArbitraryTransactionData;
+import org.qortal.data.transaction.ArbitraryTransactionData.DataType;
 import org.qortal.repository.DataException;
 import org.qortal.repository.Repository;
 import org.qortal.repository.RepositoryManager;
@@ -20,18 +22,28 @@ import org.qortal.utils.FilesystemUtils;
 import org.qortal.utils.ListUtils;
 import org.qortal.utils.NTP;
 import org.qortal.utils.StringUtils;
+import org.qortal.utils.ByteArray;
 
 import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
+import java.util.Objects;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
 
 import static org.qortal.data.arbitrary.ArbitraryResourceStatus.Status;
 
 public class ArbitraryDataResource {
 
     private static final Logger LOGGER = LogManager.getLogger(ArbitraryDataResource.class);
+
+    private static final int MAX_PERSISTED_STATUS_KEYS = 4_096;
+    private static final ConcurrentHashMap<PersistedStatusKey, PersistedStatus> PERSISTED_STATUSES = new ConcurrentHashMap<>();
+    private static final ConcurrentLinkedQueue<PersistedStatusKey> PERSISTED_STATUS_ORDER = new ConcurrentLinkedQueue<>();
 
     protected final String resourceId;
     protected final ResourceIdType resourceIdType;
@@ -60,25 +72,118 @@ public class ArbitraryDataResource {
     }
 
     public ArbitraryResourceStatus getStatusAndUpdateCache(boolean updateCache) {
-        ArbitraryResourceStatus arbitraryResourceStatus = null;
-
-        try (final Repository repository = RepositoryManager.getRepository()) {
-            arbitraryResourceStatus = this.getStatus(repository);
-
-            if (updateCache) {
-                 // Update cache if possible
-                 ArbitraryResourceStatus.Status status = arbitraryResourceStatus != null ? arbitraryResourceStatus.getStatus() : null;
-                 ArbitraryResourceData arbitraryResourceData = new ArbitraryResourceData(this.service, this.resourceId, this.identifier);
-                 repository.discardChanges();
-                 repository.getArbitraryRepository().setStatus(arbitraryResourceData, status);
-                 repository.saveChanges();
- 
-            }
-        } catch (DataException e) {
+        try {
+            ArbitraryResourceStateRegistry registry = ArbitraryResourceStateRegistry.getInstance();
+            ArbitraryResourceStatus resourceStatus = registry.getOrReconcile(
+                    this.service, this.resourceId, this.identifier, null, () -> {
+                        try (final Repository repository = RepositoryManager.getRepository()) {
+                            ArbitraryResourceStatus calculatedStatus = this.getStatus(repository);
+                            if (updateCache) {
+                                Status status = calculatedStatus != null ? calculatedStatus.getStatus() : null;
+                                this.persistStatusIfChanged(repository, status);
+                            }
+                            return calculatedStatus;
+                        }
+                    });
+            if (this.transaction != null && this.transaction.getSignature() != null)
+                registry.associateSignature(this.service, this.resourceId, this.identifier,
+                        this.transaction.getSignature());
+            return resourceStatus;
+        } catch (Exception e) {
             LOGGER.info("Unable to update status cache for resource {}: {}", this.toString(), e.getMessage());
+            return null;
+        }
+    }
+
+    private void persistStatusIfChanged(Repository repository, Status status) throws DataException {
+        if (status == null || this.transaction == null || this.transaction.getSignature() == null)
+            return;
+
+        PersistedStatusKey lookupKey = new PersistedStatusKey(this.service, this.resourceId, this.identifier,
+                this.transaction.getSignature(), false);
+        PersistedStatus state = PERSISTED_STATUSES.get(lookupKey);
+        if (state == null) {
+            PersistedStatusKey storedKey = new PersistedStatusKey(this.service, this.resourceId, this.identifier,
+                    this.transaction.getSignature(), true);
+            PersistedStatus newState = new PersistedStatus();
+            PersistedStatus existing = PERSISTED_STATUSES.putIfAbsent(storedKey, newState);
+            state = existing != null ? existing : newState;
+            if (existing == null) {
+                PERSISTED_STATUS_ORDER.offer(storedKey);
+                trimPersistedStatuses();
+            }
         }
 
-        return arbitraryResourceStatus;
+        synchronized (state) {
+            if (state.status == status)
+                return;
+
+            ArbitraryResourceData resourceData = new ArbitraryResourceData(this.service, this.resourceId, this.identifier);
+            resourceData.latestSignature = this.transaction.getSignature();
+
+            // End the read transaction before the small independent cache update.
+            repository.discardChanges();
+            boolean changed = repository.getArbitraryRepository().setStatus(resourceData, status);
+            repository.saveChanges();
+
+            if (changed) {
+                state.status = status;
+                return;
+            }
+
+            // A zero-row conditional update can mean either "already current" or "cache row absent".
+            // Only remember the result when the row exists with the requested value, so a resource
+            // inserted by the dirty queue later will still receive its status on the next poll.
+            ArbitraryResourceData stored = repository.getArbitraryRepository()
+                    .getArbitraryResource(this.service, this.resourceId, this.identifier);
+            if (stored != null && stored.status != null && stored.status.getStatus() == status)
+                state.status = status;
+        }
+    }
+
+    private static void trimPersistedStatuses() {
+        while (PERSISTED_STATUSES.size() > MAX_PERSISTED_STATUS_KEYS) {
+            PersistedStatusKey oldest = PERSISTED_STATUS_ORDER.poll();
+            if (oldest == null)
+                return;
+            PERSISTED_STATUSES.remove(oldest);
+        }
+    }
+
+    private static final class PersistedStatus {
+        private Status status;
+    }
+
+    private static final class PersistedStatusKey {
+        private final int service;
+        private final String name;
+        private final String identifier;
+        private final ByteArray signature;
+        private final int hashCode;
+
+        private PersistedStatusKey(Service service, String name, String identifier, byte[] signature, boolean copy) {
+            this.service = service.value;
+            this.name = name.toLowerCase(Locale.ROOT);
+            this.identifier = identifier != null ? identifier : "default";
+            this.signature = copy ? ByteArray.copyOf(signature) : ByteArray.wrap(signature);
+            this.hashCode = Objects.hash(this.service, this.name, this.identifier, this.signature);
+        }
+
+        @Override
+        public boolean equals(Object other) {
+            if (this == other)
+                return true;
+            if (!(other instanceof PersistedStatusKey))
+                return false;
+            PersistedStatusKey key = (PersistedStatusKey) other;
+            return this.service == key.service && this.name.equals(key.name)
+                    && this.identifier.equals(key.identifier) && this.signature.equals(key.signature);
+        }
+
+        @Override
+        public int hashCode() {
+            return this.hashCode;
+        }
     }
 
     /**
@@ -230,6 +335,16 @@ public class ArbitraryDataResource {
                 return false;
             }
 
+            if (this.transaction.getDataType() == DataType.DATA_HASH) {
+                Path dataPath = QdnPathResolver.resolve(
+                        QdnPathResolver.encode(this.transaction.getData()), this.transaction.getSignature());
+                if (Files.exists(dataPath))
+                    return true;
+
+                QdnFileManifestCache.Manifest manifest = QdnFileManifestCache.get(this.transaction);
+                return manifest != null && manifest.allFilesExist();
+            }
+
             // Optimized: Create ArbitraryDataFile once per transaction instead of twice
             ArbitraryDataFile arbitraryDataFile = ArbitraryDataFile.fromTransactionData(this.transaction);
             if (arbitraryDataFile == null || !arbitraryDataFile.allFilesExist()) {
@@ -264,6 +379,38 @@ public class ArbitraryDataResource {
 
             int localChunkCount = 0;
             int totalChunkCount = 0;
+
+            if (this.transaction.getDataType() == DataType.DATA_HASH) {
+                Path dataPath = QdnPathResolver.resolve(
+                        QdnPathResolver.encode(this.transaction.getData()), this.transaction.getSignature());
+                QdnFileManifestCache.Manifest manifest = QdnFileManifestCache.get(this.transaction);
+                int chunkCount = manifest != null ? manifest.chunkCount() : 0;
+
+                Path parentPath = dataPath.getParent();
+                String[] files = parentPath.toFile().list();
+                if (files != null) {
+                    int count = files.length;
+                    for (String file : files) {
+                        if (file.equals(".original")) {
+                            count--;
+                            break;
+                        }
+                    }
+
+                    if (chunkCount > 0 && Files.exists(dataPath))
+                        count--;
+                    localChunkCount = count;
+                }
+
+                if (this.transaction.getMetadataHash() == null)
+                    totalChunkCount = 1;
+                else
+                    totalChunkCount = manifest != null ? manifest.expectedFileCount() : 2;
+
+                this.localChunkCount = localChunkCount;
+                this.totalChunkCount = totalChunkCount;
+                return;
+            }
 
             // Create ArbitraryDataFile once and reuse it for both counts
             ArbitraryDataFile arbitraryDataFile = ArbitraryDataFile.fromTransactionData(this.transaction);

@@ -1,5 +1,12 @@
 # QDN cache performance testing
 
+For the separate experimental `optimize-data-Nov-2027` branch, use
+[its schema-57 testing and recovery guide](optimize-data-Nov-2027.md).
+
+The following cache-only scope describes the initial November 18 snapshot. Later
+wallet recovery work on qdn-performance requires schema 55; see
+[the recovery guide](htlc-fee-recovery.md) for that compatibility boundary.
+
 `qdn-performance` starts from `xmr-support` commit
 `1b99eedc5e746171064722e7eb2460aa3370c21a` and retains its ARRR/XMR changes.
 This branch introduces **no database migration, schema version change, persisted

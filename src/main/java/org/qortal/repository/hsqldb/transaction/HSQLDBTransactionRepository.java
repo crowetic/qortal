@@ -1939,6 +1939,7 @@ public class HSQLDBTransactionRepository implements TransactionRepository {
 
 		try {
 			saver.execute(repository);
+            ((org.qortal.repository.hsqldb.HSQLDBATRepository) repository.getATRepository()).refreshRecipient(signature);
 		} catch (SQLException e) {
 			throw new DataException("Unable to update transaction's block height in repository", e);
 		}
@@ -1952,10 +1953,32 @@ public class HSQLDBTransactionRepository implements TransactionRepository {
 
 		try {
 			saver.execute(repository);
+            ((org.qortal.repository.hsqldb.HSQLDBATRepository) repository.getATRepository()).refreshRecipient(signature);
 		} catch (SQLException e) {
 			throw new DataException("Unable to update transaction's block sequence in repository", e);
 		}
 	}
+
+    @Override
+    public void updateBlockPositions(List<TransactionData> transactions, int height) throws DataException {
+        List<Object[]> positions = new java.util.ArrayList<>(transactions.size());
+        for (int i = 0; i < transactions.size(); ++i) positions.add(new Object[]{height,i,transactions.get(i).getSignature()});
+        try {
+            repository.executeCheckedBatchUpdate("UPDATE Transactions SET block_height=?,block_sequence=? WHERE signature=?",positions);
+            ((org.qortal.repository.hsqldb.HSQLDBATRepository) repository.getATRepository()).refreshRecipients(transactions,height);
+        } catch (SQLException e) { throw new DataException("Unable to batch block positions",e); }
+    }
+
+    @Override
+    public void updateBlockPosition(TransactionData transactionData, Integer height, Integer sequence) throws DataException {
+        byte[] signature = transactionData.getSignature();
+        try {
+            new HSQLDBSaver("Transactions").bind("signature", signature).bind("block_height", height)
+                    .bind("block_sequence", sequence).execute(repository);
+            if (transactionData.getType() == TransactionType.PAYMENT || transactionData.getType() == TransactionType.MESSAGE || transactionData.getType() == TransactionType.AT)
+                ((org.qortal.repository.hsqldb.HSQLDBATRepository) repository.getATRepository()).refreshRecipient(signature);
+        } catch (SQLException e) { throw new DataException("Unable to update transaction position", e); }
+    }
 
 	@Override
 	public void updateApprovalHeight(byte[] signature, Integer approvalHeight) throws DataException {
@@ -2021,6 +2044,8 @@ public class HSQLDBTransactionRepository implements TransactionRepository {
 
 	@Override
 	public void delete(TransactionData transactionData) throws DataException {
+        // Remove eligibility before deleting the source row (AT transactions are deleted directly on orphan).
+        updateBlockHeight(transactionData.getSignature(), null);
 		// NOTE: The corresponding row in sub-table is deleted automatically by the database thanks to "ON DELETE CASCADE" in the sub-table's FOREIGN KEY
 		// definition.
 		try {

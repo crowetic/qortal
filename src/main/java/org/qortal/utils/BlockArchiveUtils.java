@@ -76,7 +76,7 @@ public class BlockArchiveUtils {
                 if (blockInfo.getAtStates() != null) {
                     for (ATStateData atStateData : blockInfo.getAtStates()) {
                         atStateData.setHeight(blockInfo.getBlockData().getHeight());
-                        repository.getATRepository().save(atStateData);
+						repository.getATRepository().saveArchivedStateSummary(atStateData);
                     }
                 }
                 else {
