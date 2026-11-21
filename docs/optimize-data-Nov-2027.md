@@ -77,8 +77,9 @@ Observed evidence:
   evidence of the original long-uptime failure. The same startup logged a 31.161 s
   oldest-QDN query, addressed by the integrated indexed startup check.
 
-No production source/configuration, database, wallet or service was changed by
-this investigation. No permanent cure for the long-uptime symptom is claimed;
+No production source/configuration, wallet operations, database migrations or
+service changes were performed by this investigation. Ordinary GET/status probes
+can perform Core's normal derived-cache bookkeeping. No permanent cure for the long-uptime symptom is claimed;
 controlled sustained gateway testing is still required.
 
 ## Qualification
@@ -103,6 +104,9 @@ Other migration tests exercise interruption, corrupt state rejection and resumab
 payload conversion. See `tools/at-performance/README.md` for separate offline
 replay, synthetic soak and abrupt-exit qualification. Synthetic performance and
 recovery checks are not historical mainnet replay.
+
+Measured results and artifact identity are recorded in the
+[verification receipt](optimize-data-Nov-2027-verification.md).
 
 ## Owner-operated test rollout and recovery
 
