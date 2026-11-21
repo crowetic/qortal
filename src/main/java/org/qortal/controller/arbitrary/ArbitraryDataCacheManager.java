@@ -530,25 +530,7 @@ public class ArbitraryDataCacheManager extends Thread {
     }
 
     public boolean needsArbitraryResourcesCacheRebuild(Repository repository) throws DataException {
-        // Check if we have an entry in the cache for the oldest ARBITRARY transaction with a name
-        List<ArbitraryTransactionData> oldestCacheableTransactions = repository.getArbitraryRepository().getArbitraryTransactions(true, 1, 0, false);
-        if (oldestCacheableTransactions == null || oldestCacheableTransactions.isEmpty()) {
-            // No relevant arbitrary transactions yet on this chain
-            LOGGER.debug("No relevant arbitrary transactions exist to build cache from");
-            return false;
-        }
-        // We have an arbitrary transaction, so check if it's in the cache
-        ArbitraryTransactionData txn = oldestCacheableTransactions.get(0);
-        ArbitraryResourceData cachedResource = repository.getArbitraryRepository().getArbitraryResource(txn.getService(), txn.getName(), txn.getIdentifier());
-        if (cachedResource != null) {
-            // Earliest resource exists in the cache, so assume it has been built.
-            // We avoid checkpointing and prevent the node from starting up in the case of a rebuild failure, so
-            // we shouldn't ever be left in a partially rebuilt state.
-            LOGGER.debug("Arbitrary resources cache already built");
-            return false;
-        }
-
-        return true;
+        return repository.getArbitraryRepository().isOldestNamedResourceMissingFromCache();
     }
 
     public boolean buildArbitraryResourcesCache(Repository repository, boolean forceRebuild) throws DataException {

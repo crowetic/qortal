@@ -1,6 +1,5 @@
 package org.qortal.network;
 
-import com.dosse.upnp.UPnP;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.bouncycastle.crypto.params.Ed25519PrivateKeyParameters;
@@ -265,10 +264,12 @@ public class Network {
     private final Object peerListsLock = new Object();
 
     private List<String> ourExternalIpAddressHistory = new ArrayList<>();
-    private String ourExternalIpAddress = Settings.getInstance().getOurExternalIpAddress();
+    private boolean peerAddressConfirmed; // guarded by this
+    private volatile String ourExternalIpAddress = Settings.getInstance().getOurExternalIpAddress();
  
     private int ourExternalPort = Settings.getInstance().getListenPort();
 
+    static final UpnpPortMapper portMapper = new UpnpPortMapper();
     private volatile boolean isShuttingDown = false;
 
     // Constructors
@@ -355,22 +356,6 @@ public class Network {
             LOGGER.debug("starting with {} known peers", this.allKnownPeers.size());
         }
 
-        // Attempt to set up UPnP for P2P. All errors are ignored.
-        int networkPort = Settings.getInstance().getListenPort();
-        if (Settings.getInstance().isUPnPEnabled()) {
-            UPnP.openPortTCP(networkPort);
-            if (UPnP.isMappedTCP(networkPort)){
-                this.ourExternalIpAddress = UPnP.getExternalAddress();
-                LOGGER.info("UPnP Mapped for P2P, port: {}", networkPort);
-            }
-                
-            else
-                LOGGER.warn("Unable to map P2P port: {} with UPnP, port in use?", networkPort);
-        }
-        else {
-            UPnP.closePortTCP(networkPort);
-        }
-
         // Start dedicated I/O thread (select/read/write only) and scheduler (feeds worker pool)
         this.ioThread = new Thread(this::runIOLoop, "Network-IO");
         this.ioThread.setDaemon(false);
@@ -378,6 +363,9 @@ public class Network {
         this.schedulerThread = new Thread(this::runSchedulerLoop, "Network-Scheduler");
         this.schedulerThread.setDaemon(false);
         this.schedulerThread.start();
+
+        if (serverSelectionKey != null && serverSelectionKey.isValid())
+            Network.portMapper.configure(listenPort, Settings.getInstance().isUPnPEnabled(), this::useRouterAddress);
 
         // Completed Setup for Network, Time to launch NetworkData for non-priority tasks
         LOGGER.info("Starting second network (QDN) on port {}", Settings.getInstance().getQDNListenPort());
@@ -2551,6 +2539,7 @@ public class Network {
             // Last 10 readings were the same - i.e. more than one peer agreed on the new IP address...
             String ip = ipAddressHistory.get(size - 1);
             if (ip != null && !Objects.equals(ip, "null")) {
+                this.peerAddressConfirmed = true;
                 if (!Objects.equals(ip, this.ourExternalIpAddress)) {
                     // ... and the readings were different to our current recorded value, so
                     // update our external IP address value
@@ -2563,6 +2552,12 @@ public class Network {
 
     public void onExternalIpUpdate(String ipAddress) {
         LOGGER.info("External IP address updated to {}", ipAddress);
+    }
+
+    private synchronized void useRouterAddress(String address) {
+        // A single early peer report is provisional. Preserve an address already confirmed by peer history.
+        if (!this.peerAddressConfirmed)
+            this.ourExternalIpAddress = address;
     }
 
     public String getOurExternalIpAddress() {
@@ -2882,6 +2877,7 @@ public class Network {
 
     public void shutdown() {
         this.isShuttingDown = true;
+        portMapper.shutdown();
 
         // Close listen socket to prevent more incoming connections
         if (this.serverChannel != null && this.serverChannel.isOpen()) {
@@ -2953,12 +2949,6 @@ public class Network {
             LOGGER.error(e.getMessage(), e);
         }
 
-        // Release uPnP if it was enabled
-        try {
-            UPnP.closePortTCP(Settings.getInstance().getListenPort());
-        } catch (Exception e) {
-            // do nothing
-        }
         // Close all peer connections
         for (Peer peer : this.getImmutableConnectedPeers()) {
             peer.shutdown();

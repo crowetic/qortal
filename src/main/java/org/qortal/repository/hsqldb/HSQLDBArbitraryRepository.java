@@ -630,6 +630,49 @@ public class HSQLDBArbitraryRepository implements ArbitraryRepository {
 		return this.getSingleTransaction(name, service, method, identifier, false);
 	}
 
+	@Override
+	public boolean isOldestNamedResourceMissingFromCache() throws DataException {
+		// Use the timestamp index to stop at the first named transaction. Only read resource keys at that timestamp.
+		String sql = "SELECT DISTINCT service, name, identifier FROM ArbitraryTransactions "
+				+ "WHERE name IS NOT NULL AND created_when = (SELECT created_when FROM ArbitraryTransactions "
+				+ "WHERE name IS NOT NULL ORDER BY created_when LIMIT 1 USING INDEX)";
+
+		try (ResultSet rows = this.repository.checkedExecute(sql)) {
+			if (rows == null)
+				return false;
+
+			Boolean firstMissing = null;
+			do {
+				Service service = Service.valueOf(rows.getInt(1));
+				String name = rows.getString(2);
+				String identifier = rows.getString(3);
+				// Let the transaction decoder handle historical values that need its original interpretation.
+				if (service == null || (identifier != null && identifier.isEmpty()))
+					return isLegacyOldestNamedResourceMissing();
+
+				boolean missing = getArbitraryResource(service, name, identifier) == null;
+				if (firstMissing != null && firstMissing != missing)
+					// The original query orders by timestamp alone. Preserve its choice when the tie matters.
+					return isLegacyOldestNamedResourceMissing();
+
+				firstMissing = missing;
+			} while (rows.next());
+
+			return firstMissing;
+		} catch (SQLException e) {
+			throw new DataException("Unable to check the oldest named arbitrary resource", e);
+		}
+	}
+
+	private boolean isLegacyOldestNamedResourceMissing() throws DataException {
+		List<ArbitraryTransactionData> transactions = getArbitraryTransactions(true, 1, 0, false);
+		if (transactions == null || transactions.isEmpty())
+			return false;
+
+		ArbitraryTransactionData oldest = transactions.get(0);
+		return getArbitraryResource(oldest.getService(), oldest.getName(), oldest.getIdentifier()) == null;
+	}
+
 	public List<ArbitraryTransactionData> getArbitraryTransactions(boolean requireName, Integer limit, Integer offset, Boolean reverse) throws DataException {
 		StringBuilder sql = new StringBuilder(512);
 		sql.append("SELECT type, reference, signature, creator, Transactions.created_when, fee, " +

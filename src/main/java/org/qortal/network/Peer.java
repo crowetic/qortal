@@ -300,6 +300,12 @@ public class Peer {
     public int getPeerType () {
         return this.peerType;
     }
+
+    /** Older QDN peers parse the source address even for replies served over the existing connection. */
+    public boolean canReceiveQdnFileList(String sourceAddress) {
+        return sourceAddress != null || Boolean.TRUE.equals(getPeerCapability(PeerCapabilities.QDN_OPTIONAL_SOURCE_ADDRESS));
+    }
+
     public Object getPeerCapability(String capName) {
         return peerCapabilities == null ? null : peerCapabilities.getCapability(capName);
     }

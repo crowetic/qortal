@@ -49,6 +49,9 @@ public interface ArbitraryRepository {
 
 	public List<ArbitraryTransactionData> getArbitraryTransactions(boolean requireName, Integer limit, Integer offset, Boolean reverse) throws DataException;
 
+	/** Whether the oldest named arbitrary transaction refers to a resource missing from the cache. */
+	boolean isOldestNamedResourceMissingFromCache() throws DataException;
+
 	// Durable resource-cache work queue
 	public void markResourceDirty(ArbitraryTransactionData transactionData, int flags) throws DataException;
 	public List<ArbitraryResourceDirtyData> getDirtyResources(int limit, long now) throws DataException;

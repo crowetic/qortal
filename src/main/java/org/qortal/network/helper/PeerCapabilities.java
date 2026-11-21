@@ -21,6 +21,8 @@ import java.util.stream.Collectors;
 @XmlAccessorType(XmlAccessType.FIELD)
 public class PeerCapabilities {
 
+    public static final String QDN_OPTIONAL_SOURCE_ADDRESS = "QDN_OPTIONAL_SOURCE_ADDRESS";
+
     // Empty Set of Peer Capabilities
     private Map<String, Object> capabilities;
 

@@ -1,6 +1,5 @@
 package org.qortal.network;
 
-import com.dosse.upnp.UPnP;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.bouncycastle.crypto.params.Ed25519PrivateKeyParameters;
@@ -235,7 +234,8 @@ public class NetworkData {
     private final Object peerListsLock = new Object();
 
     private final List<String> ourExternalIpAddressHistory = new ArrayList<>();
-    private String ourExternalIpAddress = null;
+    private boolean peerAddressConfirmed; // guarded by this
+    private volatile String ourExternalIpAddress = null;
     private int ourExternalPort = Settings.getInstance().getQDNListenPort();
     private boolean canAcceptInbound = false; 
     private volatile boolean isShuttingDown = false;
@@ -304,27 +304,15 @@ public class NetworkData {
             }
         }
 
-        // Attempt to set up UPnP for QDN. All errors are ignored.
-        int qdnPort = Settings.getInstance().getQDNListenPort();
-        if (Settings.getInstance().isUPnPEnabled()) {
-            UPnP.openPortTCP(qdnPort);
-            if (UPnP.isMappedTCP(qdnPort)) {
-                this.ourExternalIpAddress = UPnP.getExternalAddress();
-                LOGGER.info("UPnP Mapped for QDN, port: {}", qdnPort);
-            } else {
-                LOGGER.warn("Unable to map QDN port: {} with UPnP, port in use?", qdnPort);
-            }
-        }
-        else {
-            UPnP.closePortTCP(qdnPort);
-        }
-
         this.ioThread = new Thread(this::runIOLoop, "NetworkData-IO");
         this.ioThread.setDaemon(false);
         this.ioThread.start();
         this.schedulerThread = new Thread(this::runSchedulerLoop, "NetworkData-Scheduler");
         this.schedulerThread.setDaemon(false);
         this.schedulerThread.start();
+
+        if (serverSelectionKey != null && serverSelectionKey.isValid())
+            Network.portMapper.configure(listenPort, Settings.getInstance().isUPnPEnabled(), this::useRouterAddress);
     }
 
     // Getters / setters
@@ -2223,6 +2211,7 @@ public class NetworkData {
             // Last 10 readings were the same - i.e. more than one peer agreed on the new IP address...
             String ip = ipAddressHistory.get(size - 1);
             if (ip != null && !Objects.equals(ip, "null")) {
+                this.peerAddressConfirmed = true;
                 if (!Objects.equals(ip, this.ourExternalIpAddress)) {
                     // ... and the readings were different to our current recorded value, so
                     // update our external IP address value
@@ -2230,6 +2219,12 @@ public class NetworkData {
                 }
             }
         }
+    }
+
+    private synchronized void useRouterAddress(String address) {
+        // A single early peer report is provisional. Preserve an address already confirmed by peer history.
+        if (!this.peerAddressConfirmed)
+            this.ourExternalIpAddress = address;
     }
 
     public String getOurExternalIpAddress() {
@@ -2639,11 +2634,6 @@ public class NetworkData {
             this.networkDataWorkerPool.shutdownNow();
         }
 
-        try {  // DeMap QDN uPnP so other nodes can use it when we are done
-            UPnP.closePortTCP(Settings.getInstance().getQDNListenPort());
-        } catch (Exception e) {
-            // do nothing
-        }
         // Close all peer connections
         for (Peer peer : this.getImmutableConnectedPeers()) {
             peer.shutdown();

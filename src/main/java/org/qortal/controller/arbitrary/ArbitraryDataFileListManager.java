@@ -21,6 +21,7 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
+import com.google.common.net.HostAndPort;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.qortal.arbitrary.ArbitraryDataFile;
@@ -100,8 +101,18 @@ public class ArbitraryDataFileListManager {
 
  
 
-    private Boolean getIsDirectConnectable() {
-        return NetworkData.getInstance().canAcceptInbound();
+    private String getQdnContactAddress() {
+        String address = Network.getInstance().getOurExternalIpAddress();
+        if (address == null || address.isBlank())
+            address = NetworkData.getInstance().getOurExternalIpAddress();
+        if (address == null || address.isBlank() || "null".equalsIgnoreCase(address))
+            return null;
+        try {
+            return HostAndPort.fromParts(address, Settings.getInstance().getQDNListenPort()).toString();
+        } catch (IllegalArgumentException e) {
+            LOGGER.debug("Invalid external host for QDN contact address: {}", address);
+            return null;
+        }
     }
 
     public static ArbitraryDataFileListManager getInstance() {
@@ -408,8 +419,7 @@ public class ArbitraryDataFileListManager {
         LOGGER.trace(String.format("Sending data file list request for signature %s with %d hashes to %d peers...", signature58, hashCount, handshakedPeers.size()));
 
         // Send our address as requestingPeer, to allow for potential direct connections with seeds/peers
-        //String requestingPeer = NetworkData.getInstance().getOurExternalIpAddressAndPort();
-        String requestingPeer = Network.getInstance().getOurExternalIpAddress() + ":" + Settings.getInstance().getQDNListenPort();
+        String requestingPeer = getQdnContactAddress();
 
         // Build request
         Message getArbitraryDataFileListMessage = new GetArbitraryDataFileListMessage(signature, missingHashes, now, 0, requestingPeer);
@@ -663,8 +673,12 @@ public class ArbitraryDataFileListManager {
                 // Determine how many peers to process based on request type
                 List<PeerMessage> peersToProcess;
                 if (isRelayRequest != null && isRelayRequest && this.isRelayAvailable) {
-                    // For relay requests, only process first peer to avoid duplicate forwards
-                    peersToProcess = Collections.singletonList(peerMessages.get(0));
+                    // Forward one reply the original requester can consume.
+                    Peer requester = requestBySignature58.get(signature58).getB();
+                    peersToProcess = peerMessages.stream()
+                            .filter(candidate -> requester.canReceiveQdnFileList(
+                                    ((ArbitraryDataFileListMessage) candidate.getMessage()).getPeerAddress()))
+                            .limit(1).collect(Collectors.toList());
                    
                 } else {
                     // For direct requests, process all peers to maximize download speed
@@ -727,14 +741,14 @@ public class ArbitraryDataFileListManager {
                             int requestHops = arbitraryDataFileListMessage.getRequestHops() != null ? arbitraryDataFileListMessage.getRequestHops() : 100;
 
                             String peerWithFilesString = arbitraryDataFileListMessage.getPeerAddress();
-                            PeerAddress pa = PeerAddress.fromString(peerWithFilesString); // HOST:PORT
-                            PeerData pd = new PeerData(pa,now, "INIT");
-                            Peer peerWithFiles = new Peer(pd, Peer.NETWORKDATA);
                             String nodeId = arbitraryDataFileListMessage.getNodeId();
                             // Update Response based on Content Holder being able to access direct connect
                             ArbitraryFileListResponseInfo responseInfo;
 
-                            if(arbitraryDataFileListMessage.isDirectConnectable()) {
+                            if (peerWithFilesString != null && arbitraryDataFileListMessage.isDirectConnectable()) {
+                                PeerAddress pa = PeerAddress.fromString(peerWithFilesString); // HOST:PORT
+                                PeerData pd = new PeerData(pa,now, "INIT");
+                                Peer peerWithFiles = new Peer(pd, Peer.NETWORKDATA);
                                 responseInfo = new ArbitraryFileListResponseInfo(hash58, signature58,
                                         peerWithFiles, nodeId, now, arbitraryDataFileListMessage.getRequestTime(), requestHops, true);
                                 LOGGER.debug("Adding QDN Direct Connect responseInfo to ArbDataFileManager peer: {} FileHash: {}", peerWithFilesString, hash58);
@@ -1018,7 +1032,11 @@ public class ArbitraryDataFileListManager {
                 // We should only respond if we have at least one hash
                 String requestingPeer = requestingPeerBySignature58.get(signature58);
                 LOGGER.trace("Preparing our response to GetArbitraryDataFileList, {}", signature58);
-                if (!hashes.isEmpty()) {
+                String ourAddress = getQdnContactAddress();
+                if (!hashes.isEmpty() && !peer.canReceiveQdnFileList(ourAddress)) {
+                    // A legacy peer needs an address. Keep the original request eligible for relay.
+                    missingRequestedHashes = null;
+                } else if (!hashes.isEmpty()) {
 
                     // Firstly we should keep track of the requesting peer, to allow for potential direct connections later
                     ArbitraryDataFileManager.getInstance().addRecentDataRequest(requestingPeer);
@@ -1030,15 +1048,14 @@ public class ArbitraryDataFileListManager {
                         arbitraryDataFileListRequests.put(message.getId(), newEntry);
                     }
 
-                    String ourAddress = Network.getInstance().getOurExternalIpAddress() + ":" + Settings.getInstance().getQDNListenPort();
-                    LOGGER.trace("We Think our external address is: {}", Network.getInstance().getOurExternalIpAddress());
+                    LOGGER.trace("Advertising QDN contact address {}", ourAddress);
                     ArbitraryDataFileListMessage arbitraryDataFileListMessage;
 
                     Collections.shuffle(hashes.subList(1, hashes.size()));
 
                     String nodeId = NetworkData.getInstance().getOurNodeId();
                     arbitraryDataFileListMessage = new ArbitraryDataFileListMessage(signature,
-                        hashes, NTP.getTime(), 0, ourAddress, nodeId, this.isRelayAvailable, this.getIsDirectConnectable());
+                        hashes, NTP.getTime(), 0, ourAddress, nodeId, this.isRelayAvailable, ourAddress != null && NetworkData.getInstance().canAcceptInbound());
 
                     arbitraryDataFileListMessage.setId(message.getId());
 
