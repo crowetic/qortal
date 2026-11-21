@@ -1230,7 +1230,12 @@ public class Synchronizer extends Thread {
 				.collect(Collectors.toCollection(ArrayList::new));
 		List<Block> blocks = new ArrayList<>();
 		int retryCount = 0;
-		int maxRetries = Settings.getInstance().getMaxRetries();
+		Settings settings = Settings.getInstance();
+		int maxRetries = settings.getMaxRetries();
+		int batchLimit = Math.min(settings.getMaxBlocksPerRequest(), Network.MAX_BLOCKS_PER_REPLY);
+		Long peerVersion = peer.getPeersVersion();
+		boolean useBatches = settings.isFastSyncEnabled() && settings.isFastSyncEnabledWhenResolvingFork()
+				&& peerVersion != null && peerVersion >= PEER_VERSION_550 && batchLimit > 1;
 
 		while (height < maximumHeight) {
 			if (Controller.isStopping())
@@ -1244,28 +1249,70 @@ public class Synchronizer extends Thread {
 			if (this.containsInvalidBlockSignature(signatures))
 				return BlockFetchPlan.failure(SynchronizationResult.INVALID_DATA);
 
-			byte[] requestedSignature = signatures.get(0);
-			Block block = this.fetchBlock(repository, peer, requestedSignature);
-			if (block == null) {
-				if (retryCount++ >= maxRetries)
-					return BlockFetchPlan.failure(SynchronizationResult.NO_REPLY);
-				signatures.clear();
-				continue;
+			int count = Math.min(signatures.size(), maximumHeight - height);
+			List<Block> received;
+			if (useBatches && count > 1) {
+				int requested = Math.min(count, batchLimit);
+				received = this.fetchBlocks(repository, peer, latestSignature, requested);
+				if (received == null || received.isEmpty()) {
+					useBatches = false;
+					continue;
+				}
+				if (received.size() > requested)
+					return BlockFetchPlan.failure(SynchronizationResult.INVALID_DATA);
+			} else {
+				byte[] requestedSignature = signatures.get(0);
+				Block block = this.fetchBlock(repository, peer, requestedSignature);
+				if (block == null) {
+					if (retryCount++ >= maxRetries || peer.isStopping())
+						return BlockFetchPlan.failure(SynchronizationResult.NO_REPLY);
+					// Recheck the peer's fork before a retry, keeping the selected signatures pinned.
+					List<byte[]> successors = this.getBlockSignatures(peer, latestSignature, 1);
+					if (successors == null || successors.isEmpty())
+						return BlockFetchPlan.failure(SynchronizationResult.NO_REPLY);
+					if (!Arrays.equals(successors.get(0), requestedSignature))
+						return BlockFetchPlan.failure(SynchronizationResult.NOTHING_TO_DO);
+					continue;
+				}
+				received = Collections.singletonList(block);
 			}
-			if (!Arrays.equals(requestedSignature, block.getSignature()) || !block.isSignatureValid())
-				return BlockFetchPlan.failure(SynchronizationResult.INVALID_DATA);
 
+			for (int i = 0; i < received.size(); ++i) {
+				if (Controller.isStopping())
+					return BlockFetchPlan.failure(SynchronizationResult.SHUTTING_DOWN);
+				Block block = received.get(i);
+				if (block == null || !Objects.equals(block.getBlockData().getHeight(), height + 1)
+						|| !Arrays.equals(block.getBlockData().getReference(), latestSignature)
+						|| !Arrays.equals(block.getSignature(), signatures.get(i)))
+					return BlockFetchPlan.failure(SynchronizationResult.INVALID_DATA);
+				// Where a summary was used for fork choice, bind its weight inputs to the body too.
+				if (blocks.size() < peerBlockSummaries.size()) {
+					BlockSummaryData summary = peerBlockSummaries.get(blocks.size());
+					if (summary.getHeight() != height + 1
+							|| !Arrays.equals(summary.getMinterPublicKey(), block.getBlockData().getMinterPublicKey())
+							|| !Objects.equals(summary.getOnlineAccountsCount(), block.getBlockData().getOnlineAccountsCount()))
+						return BlockFetchPlan.failure(SynchronizationResult.INVALID_DATA);
+				}
+				// BLOCKS replies are decoded without a repository. Match the single-block
+				// validation context before verifying transactions and setting approval status.
+				block.setRepository(repository);
+				if (!block.isSignatureValid())
+					return BlockFetchPlan.failure(SynchronizationResult.INVALID_DATA);
+				for (Transaction transaction : block.getTransactions())
+					transaction.setInitialApprovalStatus();
+				blocks.add(block);
+				latestSignature = block.getSignature();
+				++height;
+			}
+			signatures.subList(0, received.size()).clear();
 			retryCount = 0;
-			for (Transaction transaction : block.getTransactions())
-				transaction.setInitialApprovalStatus();
-			blocks.add(block);
-			latestSignature = requestedSignature;
-			signatures.remove(0);
-			++height;
 		}
-		if (peer.getChainTipData() != null) {
+		BlockSummaryData currentPeerTip = peer.getChainTipData();
+		if (currentPeerTip != null) {
+			if (currentPeerTip.getHeight() == height && !Arrays.equals(currentPeerTip.getSignature(), latestSignature))
+				return BlockFetchPlan.failure(SynchronizationResult.NOTHING_TO_DO);
 			Long minimumTimestamp = Controller.getMinimumLatestBlockTimestamp();
-			Long peerTimestamp = peer.getChainTipData().getTimestamp();
+			Long peerTimestamp = currentPeerTip.getTimestamp();
 			if (minimumTimestamp != null && (peerTimestamp == null || peerTimestamp < minimumTimestamp))
 				return BlockFetchPlan.failure(SynchronizationResult.CHAIN_TIP_TOO_OLD);
 		}
