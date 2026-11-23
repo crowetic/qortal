@@ -22,6 +22,12 @@ public class NodeStatus {
 
 	public final int numberOfDataConnections;
 
+	// Connected peers can remain in the lists after a fatal networking thread failure.
+	public final boolean networkIoThreadAlive;
+	public final boolean networkSchedulerThreadAlive;
+	public final boolean dataNetworkIoThreadAlive;
+	public final boolean dataNetworkSchedulerThreadAlive;
+
 	public final int height;
 
 	public NodeStatus() {
@@ -33,6 +39,11 @@ public class NodeStatus {
 		this.numberOfConnections = Network.getInstance().getImmutableHandshakedPeers().size();
 
 		this.numberOfDataConnections = NetworkData.getInstance().getImmutableHandshakedPeers().size();
+
+		this.networkIoThreadAlive = Network.getInstance().isIoThreadAlive();
+		this.networkSchedulerThreadAlive = Network.getInstance().isSchedulerThreadAlive();
+		this.dataNetworkIoThreadAlive = NetworkData.getInstance().isIoThreadAlive();
+		this.dataNetworkSchedulerThreadAlive = NetworkData.getInstance().isSchedulerThreadAlive();
 
 		this.height = Controller.getInstance().getChainHeight();
 	}

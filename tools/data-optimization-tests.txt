@@ -7,6 +7,7 @@ org.qortal.api.websocket.ApiWebSocketSerializationTests
 org.qortal.arbitrary.ArbitraryDataBuildPlacementTests
 org.qortal.arbitrary.ArbitraryDataReaderConcurrencyTests
 org.qortal.arbitrary.QdnFileManifestCacheTests
+org.qortal.controller.BlockSummaryBatchTests
 org.qortal.controller.CrossChainOfferIndexTests
 org.qortal.controller.PirateChainWalletControllerTests
 org.qortal.controller.PirateWalletSessionTests
@@ -43,6 +44,9 @@ org.qortal.crosschain.PirateWalletMigrationTests
 org.qortal.crosschain.monero.MoneroAddressTests
 org.qortal.crosschain.monero.MoneroAmountsTests
 org.qortal.crosschain.monero.MoneroNetworkSelectionTests
+org.qortal.network.NetworkLoopIsolationTests
+org.qortal.network.PeerBufferTests
+org.qortal.network.PeerSendManagerBoundsTests
 org.qortal.network.QdnFileListAddressTests
 org.qortal.network.UpnpPortMapperTests
 org.qortal.repository.hsqldb.ATCommitFailureTests

@@ -25,6 +25,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -108,6 +109,14 @@ public class Peer {
     private final UUID peerConnectionId = UUID.randomUUID();
     private final Object byteBufferLock = new Object();
     private ByteBuffer byteBuffer;
+    // Most peer traffic is small. Grow for fragmented large frames, then retain only 8 KiB.
+    static final int RECEIVE_BUFFER_SIZE = 8 * 1024;
+    static final long MAX_QUEUED_SERIALIZED_BYTES = 4 * 1024 * 1024L;
+    static final long MAX_GLOBAL_QUEUED_SERIALIZED_BYTES = Math.min(64 * 1024 * 1024L,
+            Math.max(MAX_QUEUED_SERIALIZED_BYTES, Runtime.getRuntime().maxMemory() / 16));
+    private static final AtomicLong globalQueuedSerializedBytes = new AtomicLong();
+    private final Object sendQueueLock = new Object();
+    private long queuedSerializedBytes;
     private Map<Integer, BlockingQueue<Message>> replyQueues;
     private LinkedBlockingQueue<Message> pendingMessages;
 
@@ -776,7 +785,7 @@ public class Peer {
      */
     public void readChannel() throws IOException {
         synchronized (this.byteBufferLock) {
-            while (true) {
+            while (!this.isStopping) {
                 if (!this.socketChannel.isOpen() ) {
                     return;
                 }
@@ -786,7 +795,7 @@ public class Peer {
 
                 // Do we need to allocate byteBuffer?
                 if (this.byteBuffer == null) {
-                    this.byteBuffer = ByteBuffer.allocate(Network.getInstance().getMaxMessageSize());
+                    this.byteBuffer = ByteBuffer.allocate(RECEIVE_BUFFER_SIZE);
                 }
 
                 final int priorPosition = this.byteBuffer.position();
@@ -840,21 +849,21 @@ public class Peer {
                         return;
                     }
 
-                if (message == null && bytesRead == 0) {
-                    // No complete message and no bytes available right now.
-                    // Return so selector can re-arm OP_READ without busy looping.
-                    // Keep the receive buffer for the lifetime of the peer. Discarding an empty
-                    // maximum-message-sized buffer here causes it to be allocated again on the
-                    // next selector wake-up. Under QDN traffic this can allocate tens of gigabytes
-                    // of short-lived arrays in minutes and force repeated old-generation GCs.
-                    // The peer itself bounds the retained memory and releases it on disconnect.
-                    return;
-                }
-
-                if (message == null) {
-                    // No complete message in buffer, but maybe more bytes to read from socket
-                    break;
-                }
+                    if (message == null) {
+                        if (!this.byteBuffer.hasRemaining()) {
+                            // Incomplete frame filled the buffer. Never spin on a full buffer.
+                            int maximum = Network.getInstance().getMaxMessageSize();
+                            if (this.byteBuffer.capacity() >= maximum)
+                                throw new IOException("Incomplete message exceeds receive buffer limit");
+                            ByteBuffer larger = ByteBuffer.allocate(Math.min(maximum, this.byteBuffer.capacity() * 2));
+                            this.byteBuffer.flip();
+                            larger.put(this.byteBuffer);
+                            this.byteBuffer = larger;
+                        }
+                        if (bytesRead == 0)
+                            return;
+                        break;
+                    }
 
                     LOGGER.trace("[{}] Received {} message with ID {} from peer {}", this.peerConnectionId,
                             message.getType().name(), message.getId(), this);
@@ -867,6 +876,8 @@ public class Peer {
                     // Copy bytes after read message to front of buffer,
                     // adjusting position accordingly, reset limit to capacity
                     this.byteBuffer.compact();
+                    if (this.byteBuffer.position() == 0 && this.byteBuffer.capacity() > RECEIVE_BUFFER_SIZE)
+                        this.byteBuffer = ByteBuffer.allocate(RECEIVE_BUFFER_SIZE);
 
                     // Record message stats
                     MessageStats messageStats = this.receivedMessageStats.computeIfAbsent(message.getType(), k -> new MessageStats());
@@ -916,6 +927,14 @@ public class Peer {
      * @return true if more data is pending to be sent
      */
     public boolean writeChannel() throws IOException {
+        synchronized (this.sendQueueLock) {
+            if (this.isStopping)
+                return false;
+            return writeChannelLocked();
+        }
+    }
+
+    private boolean writeChannelLocked() throws IOException {
         // It is the responsibility of ChannelWriteTask's producer to produce only one call to writeChannel() at a time
 
         while (true) {
@@ -928,6 +947,7 @@ public class Peer {
             while (this.outputBuffer == null) {
                 // Simple poll from bounded queue
                 Message message = this.sendQueue.poll();
+                releaseSerializedBytes(message);
 
                 // No message? No work to do - safe to clear OP_WRITE
                 // OP_WRITE will be re-armed by sendMessageWithTimeout() when new messages arrive
@@ -1118,7 +1138,10 @@ public class Peer {
             
             // Simple bounded queue - always enqueue, let TCP handle backpressure
             // For bulk streaming workloads, we need deep buffering, not producer-side backpressure
-            boolean offered = this.sendQueue.offer(message);
+            boolean offered;
+            synchronized (this.sendQueueLock) {
+                offered = !this.isStopping && this.sendQueue.offer(message);
+            }
             if (!offered) {
                 
                 return false; // Queue full - peer truly overloaded
@@ -1415,6 +1438,16 @@ public class Peer {
             }
         }
 
+        synchronized (this.sendQueueLock) {
+            Message message;
+            while ((message = this.sendQueue.poll()) != null)
+                releaseSerializedBytes(message);
+            this.outputBuffer = null;
+        }
+        synchronized (this.byteBufferLock) {
+            this.byteBuffer = null;
+        }
+
         if (logStats && !this.receivedMessageStats.isEmpty()) {
             StringBuilder statsBuilder = new StringBuilder(1024);
             statsBuilder.append("peer ").append(this).append(" message stats:\n=received=");
@@ -1605,9 +1638,21 @@ public class Peer {
                         this.peerConnectionId, messageType.name(), messageId, this);
             
             // Enqueue FIRST, then set OP_WRITE (critical ordering)
-            boolean offered = this.sendQueue.offer(wrapper);
-            if (!offered) {
-                return false; // Queue full
+            synchronized (this.sendQueueLock) {
+                int length = serializedBytes.length;
+                if (this.isStopping || length > MAX_QUEUED_SERIALIZED_BYTES - this.queuedSerializedBytes)
+                    return false;
+                long total;
+                do {
+                    total = globalQueuedSerializedBytes.get();
+                    if (length > MAX_GLOBAL_QUEUED_SERIALIZED_BYTES - total)
+                        return false;
+                } while (!globalQueuedSerializedBytes.compareAndSet(total, total + length));
+                this.queuedSerializedBytes += length;
+                if (!this.sendQueue.offer(wrapper)) {
+                    releaseSerializedBytes(wrapper);
+                    return false;
+                }
             }
 
             // NOW set OP_WRITE - message is guaranteed to be in queue
@@ -1627,6 +1672,16 @@ public class Peer {
         }
     }
     
+    // Called under sendQueueLock when a frame leaves the queue, including disconnect cleanup.
+    // The current output frame is bounded separately by the protocol's maximum message size.
+    private void releaseSerializedBytes(Message message) {
+        if (message instanceof PreSerializedMessageWrapper) {
+            int length = ((PreSerializedMessageWrapper) message).preSerializedBytes.length;
+            this.queuedSerializedBytes -= length;
+            globalQueuedSerializedBytes.addAndGet(-length);
+        }
+    }
+
     /**
      * Internal wrapper class for pre-serialized messages.
      * 

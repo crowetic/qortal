@@ -118,9 +118,9 @@ public abstract class Message {
 
 			int dataSize = readOnlyBuffer.getInt();
 
-			if (dataSize > MAX_DATA_SIZE)
-				// Too large
-				throw new MessageException(String.format("Declared data length %d larger than max allowed %d", dataSize, MAX_DATA_SIZE));
+			if (dataSize < 0 || dataSize > MAX_DATA_SIZE)
+				// Invalid payload length
+				throw new MessageException(String.format("Invalid data length %d (maximum %d)", dataSize, MAX_DATA_SIZE));
 
 			// Don't have all the data yet?
 			if (dataSize > 0 && dataSize + CHECKSUM_LENGTH > readOnlyBuffer.remaining())

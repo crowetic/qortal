@@ -30,9 +30,11 @@ public class PeerSendManager {
     private static final int PREFETCH_QUEUE_SIZE = 8; // 4MB memory overhead (8 × 500KB chunks) - balanced for single peer
     private static final int SENDER_THREAD_COUNT = 2; // Number of parallel sender threads per peer
 
+    static final int MAX_PENDING_MESSAGES = 2000;
+    private volatile boolean shuttingDown;
     private final Peer peer;
     private final int diskIOThreadCount;
-    private final BlockingQueue<TimedMessage> queue = new PriorityBlockingQueue<>(2000); // Thread-safe priority queue for lazy loading
+    private final BlockingQueue<TimedMessage> queue = new PriorityBlockingQueue<>(); // Capacity is enforced under queue monitor on admission
     private final BlockingQueue<PreloadedMessage> preloadedQueue = new LinkedBlockingQueue<>(PREFETCH_QUEUE_SIZE); // Queue of pre-loaded chunks ready to send
     private final ExecutorService diskIOExecutor; // Stage 1: Parallel disk I/O
     private final ExecutorService executor; // Stage 2: Network send (non-blocking)
@@ -482,10 +484,9 @@ public class PeerSendManager {
      * @author Ice
      */
     public void queueMessageWithPriority(int priority, Message message, String hash58) throws MessageException {
-        // Wrap the message in a factory that just returns it
-        int messageSize = message.toBytes().length;
-        MessageFactory factory = () -> message;
-        queueMessageFactoryWithPriority(priority, factory, messageSize, hash58);
+        // Validate without defeating lazy loading or allocating a duplicate serialized frame.
+        message.checkValidOutgoing();
+        queueMessageFactoryWithPriority(priority, () -> message, 0, hash58);
     }
     
     /**
@@ -506,28 +507,14 @@ public class PeerSendManager {
      * @author Ice
      */
     public void queueMessageFactoryWithPriority(int priority, MessageFactory messageFactory, int estimatedSize, String hash58) throws MessageException {
-        lastUsed = System.currentTimeMillis();
-        
-        // No artificial delay - let pipeline handle natural backpressure through bounded queues
-        // Messages are ordered by priority first, then FIFO within same priority
-        TimedMessage newTimedMessage = new TimedMessage(
-                messageFactory,
-                priority,
-                hash58);  // Pass hash for tracking (null if not applicable)
-        
-        // Track hash if provided (INSTANT - no disk I/O, just map insert)
-        if (hash58 != null) {
-            queuedHashes.put(hash58, System.currentTimeMillis());
-            LOGGER.trace("Tracking hash {} in PeerSendManager for peer {}", hash58, peer);
-        }
-        
-        // Simply offer to queue - PriorityBlockingQueue handles all ordering thread-safely
-        if (!queue.offer(newTimedMessage)) {
-            LOGGER.warn("Queue full ({} messages) for peer {}, dropping message", queue.size(), peer);
-            // Remove from tracking if we couldn't queue
-            if (hash58 != null) {
-                queuedHashes.remove(hash58);
-            }
+        synchronized (queue) {
+            // PriorityBlockingQueue's constructor capacity is only an initial allocation.
+            if (shuttingDown || queue.size() >= MAX_PENDING_MESSAGES)
+                throw new MessageException("Peer sender queue is full or stopped");
+            lastUsed = System.currentTimeMillis();
+            if (hash58 != null)
+                queuedHashes.put(hash58, lastUsed);
+            queue.offer(new TimedMessage(messageFactory, priority, hash58));
         }
     }
 
@@ -653,7 +640,10 @@ public class PeerSendManager {
      * @updated v5.0.8 - Now shuts down both disk I/O and sender thread pools
      */
     public void shutdown() {
-        queue.clear();
+        synchronized (queue) {
+            shuttingDown = true;
+            queue.clear();
+        }
         preloadedQueue.clear();
         queuedHashes.clear();  // Clear hash tracking
         diskIOExecutor.shutdownNow();

@@ -921,6 +921,13 @@ public class Controller extends Thread {
 						LOGGER.warn(String.format("Repository issue when trying to prune peers: %s", e.getMessage()));
 					}
 					
+					if (!Network.getInstance().isIoThreadAlive() || !Network.getInstance().isSchedulerThreadAlive()
+					        || !NetworkData.getInstance().isIoThreadAlive() || !NetworkData.getInstance().isSchedulerThreadAlive()) {
+					    LOGGER.error("CRITICAL: networking thread stopped: Network I/O={}, scheduler={}; data I/O={}, scheduler={}. Operator recovery required",
+					            Network.getInstance().isIoThreadAlive(), Network.getInstance().isSchedulerThreadAlive(),
+					            NetworkData.getInstance().isIoThreadAlive(), NetworkData.getInstance().isSchedulerThreadAlive());
+					}
+
 					// Check worker pool health to detect critical thread issues
 					// Note: After refactor to dedicated I/O threads, 0 active threads means "idle worker pool"
 					// not "dead system". The I/O threads run independently and always service sockets.
@@ -2200,7 +2207,7 @@ public class Controller extends Thread {
 
 						if (responseMessage == null || !peer.sendMessage(responseMessage)) {
 							peer.disconnect("failed to send our chain tip info");
-							return;
+							continue;
 						}
 					}
 				}
@@ -2213,7 +2220,7 @@ public class Controller extends Thread {
 					 * Hence, these are NOT simple "here's my chain tip" broadcasts from other peers.
 					 */
 					LOGGER.debug("Discarding late {} message with ID {} from {}", message.getType().name(), message.getId(), peer);
-					return;
+					continue;
 				}
 
 				// Update peer chain tip data

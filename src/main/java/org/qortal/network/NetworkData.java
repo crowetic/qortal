@@ -191,9 +191,9 @@ public class NetworkData {
     private String bindAddress = null;
 
     /** Dedicated I/O: select/read/write only. Never runs message handling. */
-    private Thread ioThread;
+    private volatile Thread ioThread;
     /** Produces Connect tasks and submits to worker pool. */
-    private Thread schedulerThread;
+    private volatile Thread schedulerThread;
     /** Message handling only (MessageTask, ConnectTask). Never does I/O. */
     private ExecutorService networkDataWorkerPool;
     /** Scheduler state: when to try next connect. */
@@ -306,9 +306,13 @@ public class NetworkData {
 
         this.ioThread = new Thread(this::runIOLoop, "NetworkData-IO");
         this.ioThread.setDaemon(false);
+        this.ioThread.setUncaughtExceptionHandler((thread, failure) ->
+                LOGGER.error("CRITICAL: {} terminated; network service requires operator recovery", thread.getName(), failure));
         this.ioThread.start();
         this.schedulerThread = new Thread(this::runSchedulerLoop, "NetworkData-Scheduler");
         this.schedulerThread.setDaemon(false);
+        this.schedulerThread.setUncaughtExceptionHandler((thread, failure) ->
+                LOGGER.error("CRITICAL: {} terminated; network service requires operator recovery", thread.getName(), failure));
         this.schedulerThread.start();
 
         if (serverSelectionKey != null && serverSelectionKey.isValid())
@@ -843,6 +847,14 @@ public class NetworkData {
     //     }
     // };
 
+    public boolean isIoThreadAlive() {
+        return this.ioThread != null && this.ioThread.isAlive();
+    }
+
+    public boolean isSchedulerThreadAlive() {
+        return this.schedulerThread != null && this.schedulerThread.isAlive();
+    }
+
     /**
      * Dedicated I/O loop: select(), then read/write/accept for all ready channels.
      * Never runs message handling; after each read, drains peer's pending messages to worker pool.
@@ -930,6 +942,10 @@ public class NetworkData {
                             setInterestOps(serverSelectionKey.channel(), SelectionKey.OP_ACCEPT);
                         }
                     } catch (CancelledKeyException e) {
+                    } catch (RuntimeException e) {
+                        LOGGER.warn("Invalid peer I/O operation on {}", socketChannel, e);
+                        if (key.attachment() instanceof Peer)
+                            ((Peer) key.attachment()).disconnect("Invalid peer I/O operation");
                     }
                 }
             }
@@ -1003,6 +1019,14 @@ public class NetworkData {
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 break;
+            } catch (RuntimeException e) {
+                LOGGER.error("Network scheduler iteration failed", e);
+                try {
+                    Thread.sleep(1000);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
             }
         }
         LOGGER.debug("NetworkData scheduler loop exiting");
