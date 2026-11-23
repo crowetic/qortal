@@ -33,7 +33,9 @@ installed remote runtime has no `jcmd`. No kernel OOM entry was available.
 This supports a persistent networking failure following heap exhaustion, rather
 than proof of a database deadlock. The precise cause of each terminated thread
 cannot be reconstructed from periodic dumps alone. Raw evidence remains outside
-Git in the owner's private workstation report directory.
+Git in the owner's private workstation report directory. The incident JVM was
+Java 25.0.5.1; local qualification uses OpenJDK 11. Production-JVM and sustained
+load qualification remain separate acceptance work.
 
 ## Changes
 
@@ -85,6 +87,37 @@ and advancing height, gateway app/assets, memory and thread counts before return
 traffic. Observe sustained load and multiple cache refreshes; a short smoke test
 does not establish long-term stability. A later failure needs full dumps plus
 GC/allocation evidence before the process is replaced.
+
+The inspected qortal.link scripts are `/home/crowetic/qortal/stop.sh` and
+`start.sh`, owned by `crowetic`. `start.sh` rejects root and currently uses
+`-XX:MaxRAMPercentage=75 -XX:+UseG1GC -Xss512k`. After removing this backend
+from traffic and uploading/hash-verifying the candidate, an operator can run:
+
+```sh
+# SSH session on qlink, as root; these are rollout instructions, not executed here.
+runuser -u crowetic -- sh -c 'cd /home/crowetic/qortal && ./stop.sh'
+pgrep -u crowetic -af '[j]ava .*qortal.jar'  # Must show no remaining Core process.
+# Only after exit; candidate is the hash-verified new JAR staged by the operator.
+install -o crowetic -g crowetic -m 0644 /home/crowetic/qortal/experimental-candidate.jar /home/crowetic/qortal/qortal.jar
+rm /home/crowetic/qortal/experimental-candidate.jar
+runuser -u crowetic -- sh -c 'cd /home/crowetic/qortal && ./start.sh'
+curl --max-time 10 -sS http://127.0.0.1:12391/admin/info
+curl --max-time 10 -sS http://127.0.0.1:12391/admin/status
+```
+
+To identify a future heap exhaustion precisely, an operator can append bounded
+GC logging and a private OOM dump to the existing JVM arguments on the next
+approved test start, retaining the current memory/collector/stack arguments:
+
+```text
+-Xlog:gc*:file=gc.log:time,uptime,level,tags:filecount=3,filesize=20m
+-XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=heapdump.hprof
+```
+
+Allow disk space for a dump near the maximum heap size. Keep heap dumps private;
+transfer diagnostic evidence to the workstation and remove the host dump after
+analysis. Do not enable a different commented memory preset just to add logging.
+No JVM arguments were changed by this investigation.
 
 This follow-up adds **no database migration beyond schema 57**. For executable
 recovery, use the previous verified schema-57 experimental JAR with compatible
