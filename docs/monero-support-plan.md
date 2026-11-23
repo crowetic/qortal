@@ -1,6 +1,6 @@
 # Monero (XMR) support plan
 
-Updated: 2026-11-20 (foundation began 2026-11-17). Scope: Qortal Core foundations,
+Updated: 2026-11-23 (foundation began 2026-11-17). Scope: Qortal Core foundations,
 device-local wallets owned by Qortal Hub with Q-Wallets as their interface, and
 eventual direct QORT/XMR trading in Q-Trade. The matching desktop testing builds
 now scan, display balances/history and send Monero stagenet payments; the owner
@@ -37,6 +37,14 @@ desktop engine permits stagenet only. See [the Hub client contract](monero-hub-c
 The [`tools/xmr-hub-client`](../tools/xmr-hub-client/README.md) browser feasibility
 probe is now legacy and optional, outside product build/runtime dependencies;
 its historical network selector predates the override.
+
+The owner has selected [Core-managed daemon transport](monero-crosschain-trades.md#planned-core-managed-daemon-transport)
+as future work on `feat/xmr-trading`: Core will manage daemon discovery/loading,
+health, load distribution and failover, and Hub will access XMR networks through
+Core while retaining local keys/scanning/signing. This is a planning update only;
+the currently tested direct STAGENET connection and pre-release builds remain
+unchanged. The transport work is independent of the trade-protocol feasibility
+gate and does not enable mainnet wallets or trading.
 
 ## Repository findings
 
@@ -132,7 +140,7 @@ These are ordered deliverables, not calendar promises. Wallet and protocol resea
 | XMR-001 | Evidence, architecture and roadmap (Core docs) | Repository review | Explicit custody, precision, direct-trade and release gates | Complete for this increment |
 | XMR-002 | Amount/network/address primitives (Core) | XMR-001 | Offline independent vectors, overflow and network rejection | Complete: 18 tests pass |
 | XMR-003 | Backend, key derivation and backup ADR (Core/Hub) | XMR-001 | A second device restores the same development wallet; documented Hub/Q-App/daemon boundaries | Hub `xmr-support` implements keys/backup/public addresses; independent and Monero-engine vectors pass; clean-profile manual acceptance described in [test guide](arrr-xmr-testing.md) |
-| XMR-004 | Bounded read-only daemon/wallet adapters (Core/Hub) | XMR-002, 003 | Typed errors, exact uint64 parsing, network/version/sync checks; local wallet ownership; fixture and local-process tests | Desktop stagenet adapter implemented in Hub; broader platform/failover acceptance remains |
+| XMR-004 | Bounded daemon transport and local wallet adapters (Core/Hub) | XMR-002, 003 | Typed errors, exact uint64 parsing, network/version/sync checks; local wallet ownership; bounded pool/failover and ambiguous-relay handling; fixture and real-worker tests | Desktop direct stagenet adapter implemented in Hub; [Core-managed daemon pool and exclusive Hub-through-Core transport](monero-crosschain-trades.md#planned-core-managed-daemon-transport) planned on `feat/xmr-trading`; current pre-release unchanged |
 | XMR-005 | Receive, scan, balances and history (Hub/Q-Wallets) | XMR-004 | Account/subaddress allocation, restore-height recovery, key-image spent status, reorg reconciliation; no false zero balance | Desktop stagenet scanning/balance/history implemented; owner received funds; full matrix remains |
 | XMR-006 | Prepare, local signing and broadcast (Hub/local wallet) | XMR-005 | Independent destination/amount/change/fee/network confirmation; restart-safe intent; ambiguous submission recovery; verified wallet receipt | Desktop stagenet sends and pending journal implemented; local-chain regression exists; owner reports payment success; broader acceptance remains |
 | XMR-007 | Direct-trade specification and feasibility experiment (Core/AT research) | XMR-001 | All six protocol requirements above, executable adversarial model and independent review | Started on `feat/xmr-trading`: AT gate characterization and four executable counterexamples; cryptographic construction/review still required |

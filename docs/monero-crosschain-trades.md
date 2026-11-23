@@ -1,6 +1,6 @@
 # QORT / XMR trades: protocol and Core integration work
 
-Status: research in progress, 2026-11-20. `feat/xmr-trading` starts from the
+Status: research in progress; transport plan updated 2026-11-23. `feat/xmr-trading` starts from the
 verified `qdn-performance` tip `09bc1a39325219d010bb059a096cc690e9169373`.
 The matching Hub/Q-Wallets testing builds already support local Monero stagenet
 scanning/payments, and the owner has reported a successful payment. That wallet
@@ -189,6 +189,80 @@ after selecting a construction whose recovery argument survives the modeled
 failures. The final AT hash and network activation come after that evidence.
 This initial branch needs no new JAR or service restart: production behavior,
 the current AT list and database schema are unchanged.
+
+## Planned Core-managed daemon transport
+
+Owner decision, 2026-11-23: keep this work on `feat/xmr-trading` for a future
+increment. This is a plan, not an implemented connector. Leave the already-tested
+`qdn-performance` and matching Hub STAGENET pre-release code, configuration and
+binaries unchanged. Direct STAGENET daemon access remains the current testing
+path until a separate, compatible Core/Hub candidate passes the gates below.
+
+The target connection path is:
+
+```text
+Q-App -> trusted Hub wallet/worker -> selected Qortal Core -> Monero daemon pool
+```
+
+Core owns daemon connections, candidate discovery/loading, network validation,
+health checks, selection, load distribution and failover. Hub connects only to
+the selected Core for XMR network operations, with no direct-daemon fallback.
+Hub continues to derive keys, scan locally, prepare/sign payments, obtain
+approvals and preserve encrypted caches and pending-payment journals. Core
+receives public chain requests and locally signed transaction bytes, never root
+seeds, private spend/view keys, wallet files or wallet-RPC signing requests.
+This transport work does not enable mainnet wallets or cross-chain trading.
+
+Implementation work packages:
+
+1. **Transport contract.** Trace the pinned Hub worker's actual daemon calls,
+   including binary scan traffic and transaction relay. Define a versioned,
+   capability-advertised Core API with an explicit network and typed errors.
+   Preserve exact integer and binary payloads. Allow only the required daemon
+   operations; do not expose arbitrary URLs, unrestricted RPC or daemon admin
+   methods. Select the authentication, hosted-node access and cancellation
+   contract before implementing the adapter. A transport change must not move
+   wallet cryptography into Core.
+2. **Pool and discovery.** Load operator-configured seeds into separate pools for
+   each supported Monero network. Define and verify a discovery source against
+   the pinned daemon protocol before accepting discovered candidates; a peer
+   address alone does not establish a usable RPC endpoint. Bound candidate
+   counts, discovery frequency and probes. Validate endpoint, DNS and redirect
+   policy, with explicitly configured local daemons supported. Q-Apps cannot
+   add endpoints. Do not mix networks or silently enable a broader wallet mode.
+3. **Health and load distribution.** Validate network/genesis, supported protocol,
+   sync status, tip freshness and lag before serving a wallet. Track latency,
+   failures and in-flight work; distribute load among healthy candidates while
+   retaining a stable daemon for a bounded scan session. Apply cooldown/backoff
+   to unhealthy nodes and bounded reselection after failure. Define how
+   conflicting tips, all-unavailable pools and recovery are reported; never
+   return an unavailable wallet as a zero balance. Health checks do not make a
+   remote daemon's data trusted.
+4. **Bounded forwarding and failure semantics.** Limit request/response sizes,
+   concurrent scans, queues and connect/read/total deadlines so daemon work
+   cannot exhaust Core's gateway threads or heap. Retry safe reads within one
+   overall deadline. A relay timeout has an unknown submission outcome: retain
+   the transaction hash and Hub journal, reconcile by hash, and do not blindly
+   replay a state-changing call on another daemon or construct another payment.
+   Return useful pool health/reason codes without logging private wallet data,
+   credentials or full transaction bodies.
+5. **Hub integration and compatibility.** Route both the service's daemon probes
+   and the real wallet worker through Core, bound to the selected account, node
+   and network. Invalidate stale requests on node/account switches. Require the
+   new Core capability; an older Core must produce an upgrade/unavailable result
+   rather than trigger direct Internet access. Preserve the frozen account
+   derivation, ordinary Qortal backup recovery, permission flow and local signer.
+
+Acceptance requires mock-daemon fault injection for discovery admission, wrong
+networks, stale/busy nodes, malformed/oversized payloads, timeouts, concurrent
+scans, pool exhaustion, failover and recovery. Use the actual pinned wallet
+worker on local chains to verify scan/balance/history, reorg handling and lost
+relay replies. Deny Hub outbound daemon access while allowing its selected Core
+connection and demonstrate the complete wallet flow through Core. Check that
+keys remain local and existing QDN/ARRR/other-wallet behavior is preserved under
+load. Record a Core/Hub compatibility matrix and operator pool configuration
+before a separate owner-authorized rollout. No runtime tests or builds are
+claimed for this documentation update.
 
 ## Verification of this milestone
 

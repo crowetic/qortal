@@ -1,6 +1,6 @@
 # XMR client: Hub ownership and unified recovery
 
-Decision date: 2026-11-17; status reviewed 2026-11-20. Hub's `xmr-support` branch
+Decision date: 2026-11-17; transport plan updated 2026-11-23. Hub's `xmr-support` branch
 now implements account/backup recovery and a desktop stagenet wallet with local
 scanning, balances/history and approved sends. The owner has reported a successful
 stagenet payment. Core supplies network metadata and contains no Hub wallet
@@ -19,6 +19,8 @@ measurements, separate from the integrated desktop worker.
 
 The owner requires all wallet cryptography to run locally inside Qortal Hub. XMR key creation belongs in the same account lifecycle as the existing coin wallets. One Qortal backup must recover them all.
 
+Current STAGENET pre-release transport, unchanged by this planning update:
+
 ```text
 Q-Wallets / another Q-App
   | approved wallet requests; public results
@@ -26,14 +28,24 @@ Q-Wallets / another Q-App
 Trusted Qortal Hub account service and Monero worker
   | public chain queries / locally signed transaction bytes
   v
-Monero daemon (direct transport or bounded Qortal Core connector)
+Monero stagenet daemon (direct Hub transport)
 ```
 
 Hub owns root-seed access, XMR spend/view keys, scanning, subaddresses, transaction preparation, confirmation, signing, encrypted cache storage and account-lock cleanup. Load the engine from Hub's own pinned assets. A Q-App must not supply executable wallet code, daemon URLs, worker URLs or a private-key destination. Never copy an unlocked account into a QDN iframe/webview.
 
 The Q-App displays receive addresses, sync state, balances, history and send requests. Hub authenticates the requesting app, obtains wallet permissions and displays its own transaction confirmation before signing. Root spend/view keys, mnemonic, seed, wallet blobs and raw signing internals do not cross the app bridge. The daemon receives no private view key: scanning remains local. A light-wallet server that requires that key does not meet this boundary.
 
-Core stays a source of Qortal mode and approved daemon connection information, with a restricted transport adapter only if needed. It does not create wallets or perform wallet cryptography. The Monero daemon still needs a full or pruned chain database. Public daemon hosts/domains are not selected and no server rollout is part of this increment.
+Core currently supplies network metadata; it does not create wallets or perform
+wallet cryptography. The Monero daemon still needs a full or pruned chain database.
+
+For future work on `feat/xmr-trading`, the owner selected Core-managed daemon
+discovery, health checks, load distribution and failover. The intended path is
+`Hub worker -> selected Core -> Monero daemon pool`; Hub will use Core exclusively
+for XMR network requests while keeping keys, scanning and signing local. Both
+service-level probes and worker traffic must use that path. This supersedes the
+earlier optional-connector proposal, not the currently tested STAGENET runtime.
+See the [transport work packages and acceptance gates](monero-crosschain-trades.md#planned-core-managed-daemon-transport).
+Implementation, compatible Core/Hub releases and any rollout are separate work.
 
 ## Existing Hub backup contract
 
