@@ -478,6 +478,8 @@ public class ATStoreMigrationTests {
                     CrashMigration.class.getName(),url).redirectErrorStream(true).redirectOutput(directory.resolve("child.log").toFile()).start();
             assertTrue("crash fixture timed out",child.waitFor(45,java.util.concurrent.TimeUnit.SECONDS));
             assertEquals(83,child.exitValue());
+            // The exited child leaves a heartbeat lock; allow its normal expiry before reopen.
+            Thread.sleep(11_000L);
             try (Connection c = DriverManager.getConnection(url+";ifexists=true")) {
                 HSQLDBATStoreMigration.migrate(c);
                 assertMigrated(c,4100);
